@@ -173,11 +173,17 @@ public:
     }
 
     bool load() {
-        std::lock_guard<std::mutex> lock(fileMutex);
         if (!std::filesystem::exists(configPath)) {
-            config = AppConfig();
+            std::cerr << "Config file not found, creating default configuration: " << configPath << std::endl;
+            AppConfig defaultConfig;
+            {
+                std::lock_guard<std::mutex> lock(fileMutex);
+                config = defaultConfig;
+            }
             return save();
         }
+
+        std::lock_guard<std::mutex> lock(fileMutex);
         std::ifstream input(configPath);
         if (!input.is_open()) {
             return false;
@@ -198,6 +204,7 @@ public:
         std::lock_guard<std::mutex> lock(fileMutex);
         std::ofstream output(configPath);
         if (!output.is_open()) {
+            std::cerr << "Unable to open config file for writing: " << configPath << std::endl;
             return false;
         }
         Json::StreamWriterBuilder writer;
@@ -261,8 +268,8 @@ struct StreamState {
 class StreamManager {
 public:
     StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
-        : configManager(cfg), telegramNotifier(notifier) {
-        gst_init(nullptr, nullptr);
+        : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(false) {
+        std::cerr << "StreamManager constructed" << std::endl;
     }
 
     ~StreamManager() {
@@ -273,6 +280,11 @@ public:
         std::lock_guard<std::mutex> lock(managerMutex);
         if (streams.count(streamConfig.id)) {
             return false;
+        }
+
+        if (!gstreamerInitialized) {
+            gst_init(nullptr, nullptr);
+            gstreamerInitialized = true;
         }
 
         std::string pipelineDescription = buildPipelineDescription(streamConfig);
@@ -368,6 +380,8 @@ public:
     }
 
 private:
+    bool gstreamerInitialized;
+
     std::string buildPipelineDescription(const StreamConfig& cfg) {
         std::ostringstream desc;
         std::string src;
@@ -613,23 +627,23 @@ private:
 <title>TVStreamer5</title>
 <style>
 body{font-family:Arial,Helvetica,sans-serif;background:#121212;color:#EEE;margin:0;padding:0}
-header{display:flex;align-items:center;justify-content:space-between;padding:16px;background:#1F1F1F}
-button{padding:10px 16px;margin:0 6px;border:none;border-radius:8px;color:#FFF;background:#3A3A3A;cursor:pointer}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px;background:#1F1F1F;flex-wrap:wrap}
+button{padding:8px 12px;margin:0 4px 8px 0;border:none;border-radius:8px;color:#FFF;background:#3A3A3A;cursor:pointer;font-size:0.95rem}
 button:hover{background:#505050}
-.container{padding:16px}
-.stats{display:flex;gap:12px;margin-bottom:16px}
-.tile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
-.tile{background:#202020;padding:16px;border-radius:14px;border:1px solid #333;display:flex;flex-direction:column;gap:12px}
+.container{padding:12px}
+.stats{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.tile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.tile{background:#202020;padding:12px;border-radius:12px;border:1px solid #333;display:flex;flex-direction:column;gap:10px;min-height:150px}
 .tile.active{border-color:#2E7D32;background:#24321D}
 .tile.error{border-color:#B71C1C;background:#3D1F1F}
-.tile h2{margin:0 0 10px;font-size:1.2rem}
-.tile .item{display:flex;justify-content:space-between}
-.modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center}
+.tile h2{margin:0 0 8px;font-size:1rem}
+.tile .item{display:flex;justify-content:space-between;font-size:0.88rem}
+.modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center;padding:10px}
 .modal.active{display:flex}
-.modal-content{background:#181818;padding:24px;border-radius:16px;width:min(760px,95%);max-height:90%;overflow:auto}
-.modal-content h2{margin-top:0}
-input,select{width:100%;padding:10px;margin-top:6px;margin-bottom:14px;background:#111;border:1px solid #333;border-radius:8px;color:#EEE}
-textarea{width:100%;padding:10px;background:#111;border:1px solid #333;border-radius:8px;color:#EEE}
+.modal-content{background:#181818;padding:16px;border-radius:14px;width:min(600px,100%);max-height:90%;overflow:auto}
+.modal-content h2{margin-top:0;font-size:1.1rem}
+input,select{width:100%;padding:8px;margin-top:6px;margin-bottom:12px;background:#111;border:1px solid #333;border-radius:8px;color:#EEE;font-size:0.95rem}
+textarea{width:100%;padding:8px;background:#111;border:1px solid #333;border-radius:8px;color:#EEE;font-size:0.95rem}
 </style>
 </head>
 <body>
@@ -807,11 +821,14 @@ window.onclick = e => { if (e.target.id === 'modal') closeModal(); };
 };
 
 int main() {
+    std::cerr << "main() entered" << std::endl;
     ConfigManager configManager;
     if (!configManager.load()) {
         std::cerr << "Unable to load or create configuration." << std::endl;
         return 1;
     }
+
+    std::cerr << "Config loaded: http_port=" << configManager.config.httpPort << " login=" << configManager.config.login << std::endl;
 
     TelegramNotifier notifier(configManager);
     StreamManager streamManager(configManager, notifier);
@@ -819,10 +836,13 @@ int main() {
     boost::asio::io_context ioc;
     HttpServer server(ioc, configManager, streamManager);
     if (!server.start()) {
+        std::cerr << "HTTP server start failed" << std::endl;
         return 1;
     }
 
+    std::cerr << "HTTP server started" << std::endl;
     std::cout << "TVStreamer5 running on port " << configManager.config.httpPort << std::endl;
+    std::cerr << "Calling ioc.run()" << std::endl;
 
     ioc.run();
     return 0;
