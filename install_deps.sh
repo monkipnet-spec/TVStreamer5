@@ -12,8 +12,8 @@ sudo apt-get install -y \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-good1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
-    libgstreamer-plugins-ugly1.0-dev \
-    libgstreamer-rtsp-server-1.0-dev \
+    gstreamer1.0-plugins-ugly \
+    libgstrtspserver-1.0-dev \
     libcurl4-openssl-dev \
     libjsoncpp-dev \
     libboost-system-dev \
