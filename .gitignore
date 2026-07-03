@@ -1,0 +1,8 @@
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+tvstreamer5-config.json
+.vscode/
+*.log

@@ -29,6 +29,11 @@ link_directories(
 
 add_executable(TVStreamer
     src/main.cpp
+    src/utils.cpp
+    src/ConfigManager.cpp
+    src/TelegramNotifier.cpp
+    src/StreamManager.cpp
+    src/HttpServer.cpp
 )
 
 target_link_libraries(TVStreamer
