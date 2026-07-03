@@ -23,6 +23,8 @@ struct StreamState {
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;
+    std::atomic<uint64_t> currentBitrate{0};
+    std::atomic<uint64_t> currentJitterMs{0};
 };
 
 class StreamManager {
@@ -40,6 +42,7 @@ private:
     bool gstreamerInitialized;
     std::string buildPipelineDescription(const StreamConfig& cfg);
     void monitorBus(const std::string& id);
+    uint64_t queryPipelineBitrate(GstElement* pipeline);
 
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;

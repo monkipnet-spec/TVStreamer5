@@ -110,9 +110,27 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     std::lock_guard<std::mutex> lock(managerMutex);
     std::map<std::string, StreamState*> result;
     for (auto& [id, statePtr] : streams) {
+        if (statePtr->pipeline) {
+            statePtr->currentBitrate = queryPipelineBitrate(statePtr->pipeline);
+        }
         result[id] = statePtr.get();
     }
     return result;
+}
+
+uint64_t StreamManager::queryPipelineBitrate(GstElement* pipeline) {
+    if (!pipeline) {
+        return 0;
+    }
+    GstQuery* query = gst_query_new_bitrate();
+    if (!gst_element_query(pipeline, query)) {
+        gst_query_unref(query);
+        return 0;
+    }
+    guint nominal_bitrate = 0;
+    gst_query_parse_bitrate(query, &nominal_bitrate);
+    gst_query_unref(query);
+    return static_cast<uint64_t>(nominal_bitrate);
 }
 
 std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
@@ -209,6 +227,15 @@ void StreamManager::monitorBus(const std::string& id) {
                 telegramNotifier.sendMessage("Stream ended: " + found->first);
                 gst_message_unref(msg);
                 return;
+            case GST_MESSAGE_QOS: {
+                gint64 jitter = 0;
+                gdouble proportion = 0.0;
+                gint quality = 0;
+                gst_message_parse_qos_values(msg, &jitter, &proportion, &quality);
+                state->currentJitterMs = static_cast<uint64_t>(std::max<gint64>(0, jitter) / GST_MSECOND);
+                gst_message_unref(msg);
+                break;
+            }
             default:
                 gst_message_unref(msg);
                 break;

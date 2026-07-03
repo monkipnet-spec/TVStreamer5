@@ -117,9 +117,13 @@ std::string HttpServer::currentState() {
         if (snap.count(cfg.id)) {
             item["active"] = true;
             item["status"] = snap.at(cfg.id)->statusMessage;
+            item["bitrate_in_kbps"] = Json::UInt64(snap.at(cfg.id)->currentBitrate.load() / 1000);
+            item["jitter_ms"] = Json::UInt64(snap.at(cfg.id)->currentJitterMs.load());
         } else {
             item["active"] = false;
             item["status"] = "stopped";
+            item["bitrate_in_kbps"] = Json::UInt64(0);
+            item["jitter_ms"] = Json::UInt64(0);
         }
         item["vlc_link"] = "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
         streams.append(item);
@@ -290,6 +294,8 @@ function render() {
         <div class="info-row"><strong>Вход</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>Резерв</strong><span>${stream.backup_input_uri || '—'}</span></div>
         <div class="info-row"><strong>SID</strong><span>${stream.service_id || '—'}</span></div>
+        <div class="info-row"><strong>Битрейт</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
+        <div class="info-row"><strong>Jitter</strong><span>${stream.jitter_ms ? stream.jitter_ms + ' ms' : '—'}</span></div>
         <div class="info-row"><strong>Статус</strong><span>${stream.status}</span></div>
         <div class="info-row"><strong>VLC</strong><span>${stream.vlc_link}</span></div>
       </div>
@@ -347,29 +353,37 @@ function openStreamModal() {
   });
 }
 function openStreamForm(stream) {
-  const ifaceOptions = state.interfaces || [];
-  const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
-  openModal(`
-    <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
-    <div class="form-grid">
-      <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-      <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087" /></div>
-      <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
-      <div class="form-row full"><label>Интерфейс вывода (UDP)</label><select class="compact" id="streamInterface"><option value=""></option>${options}</select></div>
-      <div class="form-row"><label>Мультикаст IP</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
-      <div class="form-row"><label>Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
-      <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
-      <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
-      <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
-      <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
-      <div class="form-row full"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
-    </div>
-    <div class="modal-actions">
-      <button class="button-secondary" onclick="closeModal()">Отмена</button>
-      <button class="button-primary" onclick="saveStream('${stream.id}')">Сохранить</button>
-    </div>
-  `);
-  document.getElementById('streamCbr').checked = stream.cbr;
+  const renderStreamForm = () => {
+    const ifaceOptions = state.interfaces || [];
+    const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
+    openModal(`
+      <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
+      <div class="form-grid">
+        <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
+        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087" /></div>
+        <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
+        <div class="form-row full"><label>Интерфейс вывода (UDP)</label><select class="compact" id="streamInterface"><option value=""></option>${options}</select></div>
+        <div class="form-row"><label>Мультикаст IP</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
+        <div class="form-row"><label>Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
+        <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
+        <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
+        <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
+        <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
+        <div class="form-row full"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
+      </div>
+      <div class="modal-actions">
+        <button class="button-secondary" onclick="closeModal()">Отмена</button>
+        <button class="button-primary" onclick="saveStream('${stream.id}')">Сохранить</button>
+      </div>
+    `);
+    document.getElementById('streamCbr').checked = stream.cbr;
+  };
+
+  if (!state.interfaces || !state.interfaces.length) {
+    loadInterfaces().then(renderStreamForm);
+  } else {
+    renderStreamForm();
+  }
 }
 function saveSettings() {
   const payload = {
@@ -421,7 +435,10 @@ function copyLink(text) {
   navigator.clipboard.writeText(text);
 }
 function loadInterfaces() {
-  fetch('/api/interfaces').then(r=>r.json()).then(data=>{state.interfaces=data;});
+  return fetch('/api/interfaces')
+    .then(r=>r.json())
+    .then(data=>{ state.interfaces=data; return data; })
+    .catch(() => { state.interfaces=[]; return []; });
 }
 window.onload = () => { fetchState(); loadInterfaces(); };
 window.onclick = e => { if (e.target.id === 'modal') closeModal(); };
