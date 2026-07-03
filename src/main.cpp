@@ -626,41 +626,75 @@ private:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TVStreamer5</title>
 <style>
-body{font-family:Arial,Helvetica,sans-serif;background:#121212;color:#EEE;margin:0;padding:0}
-header{display:flex;align-items:center;justify-content:space-between;padding:12px;background:#1F1F1F;flex-wrap:wrap}
-button{padding:8px 12px;margin:0 4px 8px 0;border:none;border-radius:8px;color:#FFF;background:#3A3A3A;cursor:pointer;font-size:0.95rem}
-button:hover{background:#505050}
-.container{padding:12px}
-.stats{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}
-.tile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
-.tile{background:#202020;padding:12px;border-radius:12px;border:1px solid #333;display:flex;flex-direction:column;gap:10px;min-height:150px}
-.tile.active{border-color:#2E7D32;background:#24321D}
-.tile.error{border-color:#B71C1C;background:#3D1F1F}
-.tile h2{margin:0 0 8px;font-size:1rem}
-.tile .item{display:flex;justify-content:space-between;font-size:0.88rem}
-.modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.75);display:none;align-items:center;justify-content:center;padding:10px}
+body{font-family:Arial,Helvetica,sans-serif;background:#0f1218;color:#EEE;margin:0;padding:0;min-height:100vh}
+body:before{content:'';position:fixed;inset:0;background:radial-gradient(circle at top left,rgba(40,160,255,.18),transparent 28%),radial-gradient(circle at top right,rgba(120,90,255,.15),transparent 22%),linear-gradient(180deg,#10131a 0%,#090c12 100%);pointer-events:none;z-index:-1}
+header{display:flex;align-items:center;justify-content:space-between;padding:18px 24px;background:rgba(19,23,31,.95);backdrop-filter:blur(12px);border-bottom:1px solid rgba(255,255,255,.06);gap:20px;flex-wrap:wrap}
+.header-left{display:flex;align-items:flex-start;gap:14px}
+.header-left .title{font-size:1.35rem;font-weight:800;letter-spacing:.03em;color:#fff}
+.header-left .subtitle{font-size:.92rem;color:#9aa3b1;margin-top:4px}
+.header-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.button-primary{padding:11px 18px;border:none;border-radius:999px;color:#FFF;background:#1f8bff;cursor:pointer;font-size:0.95rem;transition:background .2s ease}
+.button-secondary{padding:10px 16px;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:#EEE;background:rgba(255,255,255,.05);cursor:pointer;font-size:0.9rem;transition:background .2s ease,border-color .2s ease}
+.button-primary:hover{background:#0f7ce7}
+.button-secondary:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
+.container{padding:22px 24px 28px;max-width:1240px;margin:0 auto}
+.stats-panel{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:12px;margin-bottom:18px;padding:18px 20px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:18px}
+.stats-panel .status{display:flex;flex-direction:column;gap:6px;font-size:.96rem;color:#d1d9ed}
+.stats-panel .status strong{color:#fff;font-size:0.92rem}
+.stats-panel .status span{font-size:1.25rem;font-weight:700;color:#fff}
+.tile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+.tile{background:rgba(22,27,37,.94);padding:18px;border-radius:20px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:14px;min-height:210px;box-shadow:0 24px 60px rgba(0,0,0,.16);transition:transform .2s ease,border-color .2s ease}
+.tile:hover{transform:translateY(-2px);border-color:rgba(31,136,255,.4)}
+.tile.active{border-color:#17c261}
+.tile.error{border-color:#fb5f5f}
+.tile .top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.tile .title{font-size:1.08rem;font-weight:800;line-height:1.25;color:#fff}
+.tile .badge{padding:6px 10px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}
+.tile .status-pill{padding:6px 10px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}
+.tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
+.tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
+.tile .info{display:grid;grid-template-columns:1fr;gap:8px;font-size:.82rem;color:#b3b8c6}
+.tile .info-row{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.tile .info-row strong{color:#fff;font-size:.82rem}
+.tile .info-row span{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.tile .controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.tile .controls button{padding:10px 12px;border:none;border-radius:12px;background:rgba(255,255,255,.06);color:#EEE;font-size:.82rem;cursor:pointer;transition:background .2s ease}
+.tile .controls button:hover{background:rgba(255,255,255,.14)}
+.modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(8,10,15,.78);display:none;align-items:center;justify-content:center;padding:16px;z-index:20}
 .modal.active{display:flex}
-.modal-content{background:#181818;padding:16px;border-radius:14px;width:min(600px,100%);max-height:90%;overflow:auto}
-.modal-content h2{margin-top:0;font-size:1.1rem}
-input,select{width:100%;padding:8px;margin-top:6px;margin-bottom:12px;background:#111;border:1px solid #333;border-radius:8px;color:#EEE;font-size:0.95rem}
-textarea{width:100%;padding:8px;background:#111;border:1px solid #333;border-radius:8px;color:#EEE;font-size:0.95rem}
+.modal-content{background:rgba(11,15,22,.985);padding:26px 30px;border-radius:28px;width:min(720px,100%);max-height:92%;overflow:auto;box-shadow:0 32px 90px rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.08)}
+.modal-content h2{margin-top:0;font-size:1.45rem;margin-bottom:16px;color:#fff}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.form-grid.full{grid-template-columns:1fr}
+.form-row{display:flex;flex-direction:column;gap:8px}
+.form-row label{font-size:.88rem;color:#9aa3b1}
+.form-row input,.form-row select{width:100%;padding:12px 14px;background:#121825;border:1px solid rgba(255,255,255,.08);border-radius:12px;color:#EEE;font-size:.95rem}
+.form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
+.form-row .checkbox-inline input{width:18px;height:18px}
+.modal-actions{display:flex;justify-content:flex-end;gap:12px;margin-top:20px}
+.modal-actions button{min-width:120px;padding:10px 14px}
 </style>
 </head>
 <body>
 <header>
+<div class="header-left">
 <div>
-<button onclick="openLoginModal()">Login/Password</button>
-<button onclick="openTelegramModal()">Telegram</button>
-<button onclick="openStreamModal()">New Stream</button>
+<div class="title">Control Panel</div>
+<div class="subtitle">Мониторинг трансляций и управление потоками</div>
 </div>
-<div>
-<span id="totalCount">Streams: 0</span>
-<span id="activeCount" style="margin-left:16px">Active: 0</span>
+</div>
+<div class="header-right">
+<button class="button-secondary" onclick="openLoginModal()">Пользователь</button>
+<button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
+<button class="button-primary" onclick="openStreamModal()">+ Добавить поток</button>
 </div>
 </header>
 <div class="container">
-<div id="tiles" class="tile-grid"></div>
+<div class="stats-panel">
+<div class="status"><strong>Всего:</strong> <span id="totalCount">0</span></div>
+<div class="status"><strong>Активно:</strong> <span id="activeCount">0</span></div>
 </div>
+<div id="tiles" class="tile-grid"></div>
 <div id="modal" class="modal">
 <div class="modal-content" id="modalContent"></div>
 </div>
@@ -677,23 +711,31 @@ function openModal(html) {
 }
 function closeModal() { document.getElementById('modal').classList.remove('active'); }
 function render() {
-  document.getElementById('totalCount').textContent = 'Streams: ' + state.stream_count;
-  document.getElementById('activeCount').textContent = 'Active: ' + state.active_count;
+  document.getElementById('totalCount').textContent = state.stream_count;
+  document.getElementById('activeCount').textContent = state.active_count;
   const tiles = document.getElementById('tiles');
   tiles.innerHTML = '';
   state.streams.forEach(stream => {
     const tile = document.createElement('div');
     tile.className = 'tile' + (stream.active ? ' active' : '');
     tile.innerHTML = `
-      <h2>${stream.name || stream.id}</h2>
-      <div class="item"><strong>Status:</strong><span>${stream.status}</span></div>
-      <div class="item"><strong>Input:</strong><span>${stream.input_uri}</span></div>
-      <div class="item"><strong>Output:</strong><span>${stream.output_host}:${stream.output_port}</span></div>
-      <div class="item"><strong>VLC:</strong><span>${stream.vlc_link}</span></div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <button onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Stop' : 'Start'}</button>
-        <button onclick="editStream('${stream.id}')">Edit</button>
-        <button onclick="copyLink('${stream.vlc_link}')">Copy Link</button>
+      <div class="top">
+        <div>
+          <div class="title">${stream.name || stream.id}</div>
+          <div class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? 'Online' : 'Offline'}</div>
+        </div>
+        <div class="badge">${stream.cbr ? 'CBR' : 'VBR'}</div>
+      </div>
+      <div class="info">
+        <div class="info-row"><strong>Вывод</strong><span>${stream.output_host}:${stream.output_port}</span></div>
+        <div class="info-row"><strong>Вход</strong><span>${stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>Статус</strong><span>${stream.status}</span></div>
+        <div class="info-row"><strong>VLC</strong><span>${stream.vlc_link}</span></div>
+      </div>
+      <div class="controls">
+        <button onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Стоп' : 'Старт'}</button>
+        <button onclick="editStream('${stream.id}')">Редакт.</button>
+        <button onclick="copyLink('${stream.vlc_link}')">Скопировать</button>
       </div>`;
     tiles.appendChild(tile);
   });
@@ -711,20 +753,28 @@ function editStream(id) {
 }
 function openLoginModal() {
   openModal(`
-    <h2>Login / Password</h2>
-    <label>Login<input id="login" value="${state.login||''}" /></label>
-    <label>Password<input id="password" type="password" value="${state.password||''}" /></label>
-    <button onclick="saveSettings()">Save</button>
-    <button onclick="closeModal()">Cancel</button>
+    <h2>Пользователь</h2>
+    <div class="form-grid full">
+      <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
+      <div class="form-row"><label>Password</label><input id="password" type="password" value="${state.password||''}" /></div>
+    </div>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="closeModal()">Отмена</button>
+      <button class="button-primary" onclick="saveSettings()">Сохранить</button>
+    </div>
   `);
 }
 function openTelegramModal() {
   openModal(`
-    <h2>Telegram Settings</h2>
-    <label>Token<input id="telegramToken" value="${state.telegram_token||''}" /></label>
-    <label>Chat ID<input id="telegramChatId" value="${state.telegram_chat_id||''}" /></label>
-    <button onclick="saveSettings()">Save</button>
-    <button onclick="closeModal()">Cancel</button>
+    <h2>Telegram API</h2>
+    <div class="form-grid full">
+      <div class="form-row"><label>Token</label><input id="telegramToken" value="${state.telegram_token||''}" /></div>
+      <div class="form-row"><label>Chat ID</label><input id="telegramChatId" value="${state.telegram_chat_id||''}" /></div>
+    </div>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="closeModal()">Отмена</button>
+      <button class="button-primary" onclick="saveSettings()">Сохранить</button>
+    </div>
   `);
 }
 function openStreamModal() {
@@ -739,22 +789,26 @@ function openStreamForm(stream) {
   const ifaceOptions = state.interfaces || [];
   const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
   openModal(`
-    <h2>${stream.name ? 'Edit Stream' : 'New Stream'}</h2>
-    <label>Name<input id="streamName" value="${stream.name||''}" /></label>
-    <label>Input URI<input id="streamInput" value="${stream.input_uri||''}" /></label>
-    <label>Output host<input id="streamOutputHost" value="${stream.output_host||'127.0.0.1'}" /></label>
-    <label>Output port<input id="streamOutputPort" type="number" value="${stream.output_port||1234}" /></label>
-    <label>Interface<select id="streamInterface"><option value=""></option>${options}</select></label>
-    <label>CBR<select id="streamCbr"><option value="true">CBR</option><option value="false">VBR</option></select></label>
-    <label>Target Bitrate<input id="streamBitrate" type="number" value="${stream.target_bitrate||2000000}" /></label>
-    <label>Audio PID<input id="streamAudioPid" type="number" value="${stream.audio_pid||0}" /></label>
-    <label>Video PID<input id="streamVideoPid" type="number" value="${stream.video_pid||0}" /></label>
-    <label>Service Name<input id="streamServiceName" value="${stream.service_name||''}" /></label>
-    <label>Service Provider<input id="streamProvider" value="${stream.service_provider||''}" /></label>
-    <button onclick="saveStream('${stream.id}')">Save</button>
-    <button onclick="closeModal()">Cancel</button>
+    <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
+    <div class="form-grid full">
+      <div class="form-row"><label>Имя плитки</label><input id="streamName" value="${stream.name||''}" /></div>
+      <div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" /></div>
+      <div class="form-row"><label>Интерфейс вывода (UDP)</label><select id="streamInterface"><option value=""></option>${options}</select></div>
+      <div class="form-row"><label>Мультикаст IP</label><input id="streamOutputHost" value="${stream.output_host||'127.0.0.1'}" /></div>
+      <div class="form-row"><label>Порт</label><input id="streamOutputPort" type="number" value="${stream.output_port||1234}" /></div>
+      <div class="form-row"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
+      <div class="form-row"><label>Target bitrate</label><input id="streamBitrate" type="number" value="${stream.target_bitrate||2000000}" /></div>
+      <div class="form-row"><label>V-PID</label><input id="streamAudioPid" type="number" value="${stream.audio_pid||0}" /></div>
+      <div class="form-row"><label>A-PID</label><input id="streamVideoPid" type="number" value="${stream.video_pid||0}" /></div>
+      <div class="form-row"><label>Имя Канала (SDT)</label><input id="streamServiceName" value="${stream.service_name||''}" /></div>
+      <div class="form-row"><label>Провайдер (SDT)</label><input id="streamProvider" value="${stream.service_provider||''}" /></div>
+    </div>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="closeModal()">Отмена</button>
+      <button class="button-primary" onclick="saveStream('${stream.id}')">Сохранить</button>
+    </div>
   `);
-  document.getElementById('streamCbr').value = stream.cbr ? 'true' : 'false';
+  document.getElementById('streamCbr').checked = stream.cbr;
 }
 function saveSettings() {
   const payload = {
@@ -776,7 +830,7 @@ function saveStream(id) {
     output_host: document.getElementById('streamOutputHost').value,
     output_port: Number(document.getElementById('streamOutputPort').value),
     interface_address: document.getElementById('streamInterface').value,
-    cbr: document.getElementById('streamCbr').value === 'true',
+    cbr: document.getElementById('streamCbr').checked,
     target_bitrate: Number(document.getElementById('streamBitrate').value),
     audio_pid: Number(document.getElementById('streamAudioPid').value),
     video_pid: Number(document.getElementById('streamVideoPid').value),
