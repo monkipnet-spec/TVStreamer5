@@ -56,6 +56,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (req.target() == "/api/state") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = currentState();
+            } else if (req.target() == "/health") {
+                res.set(http::field::content_type, "text/plain");
+                res.body() = "Healthy";
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -117,13 +120,13 @@ std::string HttpServer::currentState() {
         if (snap.count(cfg.id)) {
             item["active"] = true;
             item["status"] = snap.at(cfg.id)->statusMessage;
-            item["bitrate_in_kbps"] = Json::UInt64(snap.at(cfg.id)->currentBitrate.load() / 1000);
-            item["jitter_ms"] = Json::UInt64(snap.at(cfg.id)->currentJitterMs.load());
+            item["bitrate_in_kbps"] = Json::UInt64(snap.at(cfg.id)->inputBitrate.load() / 1000);
+            item["bitrate_out_kbps"] = Json::UInt64(snap.at(cfg.id)->outputBitrate.load() / 1000);
         } else {
             item["active"] = false;
             item["status"] = "stopped";
             item["bitrate_in_kbps"] = Json::UInt64(0);
-            item["jitter_ms"] = Json::UInt64(0);
+            item["bitrate_out_kbps"] = Json::UInt64(0);
         }
         item["vlc_link"] = "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
         streams.append(item);
@@ -171,6 +174,13 @@ void HttpServer::handleStopStream(const std::string& body) {
     std::string id = root.get("id", "").asString();
     streamManager.stopStream(id);
 }
+
+void HttpServer::addEndpoint(const std::string& path, std::function<void(const boost::asio::ip::tcp::socket&)> handler) {
+    // Store endpoint handler for future use
+    // This is a simple implementation - in a real server you'd want proper routing
+    endpointHandlers[path] = handler;
+}
+
 
 std::string HttpServer::renderIndexPage() {
     static const std::string html = R"HTML(
@@ -294,8 +304,8 @@ function render() {
         <div class="info-row"><strong>Вход</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>Резерв</strong><span>${stream.backup_input_uri || '—'}</span></div>
         <div class="info-row"><strong>SID</strong><span>${stream.service_id || '—'}</span></div>
-        <div class="info-row"><strong>Битрейт</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>Jitter</strong><span>${stream.jitter_ms ? stream.jitter_ms + ' ms' : '—'}</span></div>
+        <div class="info-row"><strong>Bitrate In</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
+        <div class="info-row"><strong>Bitrate Out</strong><span>${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>Статус</strong><span>${stream.status}</span></div>
         <div class="info-row"><strong>VLC</strong><span>${stream.vlc_link}</span></div>
       </div>

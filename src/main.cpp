@@ -23,6 +23,7 @@ int main() {
 
     boost::asio::io_context ioc;
     HttpServer server(ioc, configManager, streamManager);
+
     if (!server.start()) {
         std::cerr << "HTTP server start failed" << std::endl;
         return 1;

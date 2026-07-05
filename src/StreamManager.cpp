@@ -38,6 +38,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
+    state->outputBitrate = streamConfig.targetBitrate;
     state->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -111,7 +112,8 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     std::map<std::string, StreamState*> result;
     for (auto& [id, statePtr] : streams) {
         if (statePtr->pipeline) {
-            statePtr->currentBitrate = queryPipelineBitrate(statePtr->pipeline);
+            statePtr->inputBitrate = queryPipelineBitrate(statePtr->pipeline);
+            statePtr->outputBitrate = statePtr->config.cbr ? statePtr->config.targetBitrate : statePtr->inputBitrate.load();
         }
         result[id] = statePtr.get();
     }
@@ -227,15 +229,6 @@ void StreamManager::monitorBus(const std::string& id) {
                 telegramNotifier.sendMessage("Stream ended: " + found->first);
                 gst_message_unref(msg);
                 return;
-            case GST_MESSAGE_QOS: {
-                gint64 jitter = 0;
-                gdouble proportion = 0.0;
-                gint quality = 0;
-                gst_message_parse_qos_values(msg, &jitter, &proportion, &quality);
-                state->currentJitterMs = static_cast<uint64_t>(std::max<gint64>(0, jitter) / GST_MSECOND);
-                gst_message_unref(msg);
-                break;
-            }
             default:
                 gst_message_unref(msg);
                 break;

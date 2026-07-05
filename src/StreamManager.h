@@ -1,7 +1,7 @@
 #pragma once
 
 #include <gst/gst.h>
-#include <json/json.h>
+#include <jsoncpp/json/json.h>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -23,8 +23,8 @@ struct StreamState {
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;
-    std::atomic<uint64_t> currentBitrate{0};
-    std::atomic<uint64_t> currentJitterMs{0};
+    std::atomic<uint64_t> inputBitrate{0};
+    std::atomic<uint64_t> outputBitrate{0};
 };
 
 class StreamManager {

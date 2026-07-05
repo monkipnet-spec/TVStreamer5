@@ -2,8 +2,10 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast/http.hpp>
-#include <json/json.h>
+#include <jsoncpp/json/json.h>
 #include <string>
+#include <functional>
+#include <unordered_map>
 
 #include "ConfigManager.h"
 #include "StreamManager.h"
@@ -15,6 +17,7 @@ class HttpServer {
 public:
     HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamManager& sm);
     bool start();
+    void addEndpoint(const std::string& path, std::function<void(const boost::asio::ip::tcp::socket&)> handler);
 
 private:
     void doAccept();
@@ -29,4 +32,5 @@ private:
     tcp::acceptor acceptor;
     ConfigManager& configManager;
     StreamManager& streamManager;
+    std::unordered_map<std::string, std::function<void(const boost::asio::ip::tcp::socket&)>> endpointHandlers;
 };
