@@ -27,6 +27,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     }
 
     std::string pipelineDescription = buildPipelineDescription(streamConfig);
+    std::cerr << "Pipeline for stream '" << streamConfig.name << "': " << pipelineDescription << std::endl;
     GError* error = nullptr;
     GstElement* pipeline = gst_parse_launch(pipelineDescription.c_str(), &error);
     if (!pipeline) {
@@ -43,7 +44,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->active = true;
     state->statusMessage = "starting";
     state->outputBitrate = streamConfig.targetBitrate;
-    state->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
@@ -58,6 +58,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
 
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
     streams[streamConfig.id] = std::move(state);
+    attachBitrateProbes(streams[streamConfig.id].get());
+    streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
     telegramNotifier.sendMessage("Stream started: " + streamConfig.name);
     return true;
 }
@@ -127,9 +129,14 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     std::map<std::string, StreamState*> result;
     for (auto& [id, statePtr] : streams) {
         if (statePtr->pipeline) {
+            updateBitrateEstimates(statePtr.get());
             uint64_t measured = queryPipelineBitrate(statePtr->pipeline);
-            statePtr->inputBitrate = measured;
-            statePtr->outputBitrate = statePtr->config.cbr ? statePtr->config.targetBitrate : measured;
+            if (statePtr->inputBitrate.load() == 0 && measured > 0) {
+                statePtr->inputBitrate = measured;
+            }
+            if (statePtr->outputBitrate.load() == 0) {
+                statePtr->outputBitrate = statePtr->config.cbr ? statePtr->config.targetBitrate : statePtr->inputBitrate.load();
+            }
             if (statePtr->outputBitrate.load() == 0 && statePtr->config.targetBitrate > 0) {
                 statePtr->outputBitrate = statePtr->config.targetBitrate;
             }
@@ -173,45 +180,33 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 
     if (inputLower.rfind("srt://", 0) == 0) {
         desc << "srtsrc uri=" << gstQuote(input)
-             << " latency=120 wait-for-connection=true ! tsparse ! queue ! "
-             << "mpegtsmux name=mux alignment=7 ";
+             << " latency=120 wait-for-connection=true ! queue ! tsparse ! queue ";
     } else if (inputLower.rfind("http://", 0) == 0 || inputLower.rfind("https://", 0) == 0) {
         desc << "souphttpsrc location=" << gstQuote(input)
-             << " is-live=true do-timestamp=true ! queue ! tsparse ! queue ! "
-             << "mpegtsmux name=mux alignment=7 ";
+             << " is-live=true do-timestamp=true ! queue ! tsparse ! queue ";
     } else if (inputLower.rfind("udp://", 0) == 0) {
         std::string host;
         int port = 0;
         if (!extractHostPort(input, "udp", host, port)) {
             return "";
         }
-        desc << "udpsrc address=" << gstQuote(host)
-             << " port=" << port
+        desc << "udpsrc port=" << port
+             << " address=" << gstQuote(host)
              << " multicast-iface=" << gstQuote(bindAddress)
-             << " auto-multicast=true buffer-size=2097152 ! queue ! tsparse ! queue ! "
-             << "mpegtsmux name=mux alignment=7 ";
+             << " auto-multicast=true buffer-size=2097152 ! queue ! tsparse ! queue ";
     } else if (inputLower.rfind("rtp://", 0) == 0) {
         std::string host;
         int port = 0;
         if (!extractHostPort(input, "rtp", host, port)) {
             return "";
         }
-        desc << "udpsrc address=" << gstQuote(host)
-             << " port=" << port
+        desc << "udpsrc port=" << port
+             << " address=" << gstQuote(host)
              << " multicast-iface=" << gstQuote(bindAddress)
              << " caps=\"application/x-rtp,media=video,encoding-name=MP2T,clock-rate=90000\" ! "
-             << "rtpmp2tdepay ! queue ! tsparse ! queue ! mpegtsmux name=mux alignment=7 ";
+             << "rtpmp2tdepay ! queue ! tsparse ! queue ";
     } else {
-        desc << "filesrc location=" << gstQuote(input) << " ! queue ! tsparse ! queue ! mpegtsmux name=mux alignment=7 ";
-    }
-
-    desc << "bitrate=" << (cfg.cbr ? cfg.targetBitrate : 0) << " program-number=" << cfg.serviceId << " ";
-
-    if (!cfg.serviceName.empty()) {
-        desc << "service-name=" << gstQuote(cfg.serviceName) << " ";
-    }
-    if (!cfg.serviceProvider.empty()) {
-        desc << "service-provider=" << gstQuote(cfg.serviceProvider) << " ";
+        desc << "filesrc location=" << gstQuote(input) << " ! queue ! tsparse ! queue ";
     }
 
     desc << "! udpsink host=" << gstQuote(cfg.outputHost)
@@ -220,6 +215,108 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " async=false sync=false";
 
     return desc.str();
+}
+
+void StreamManager::attachBitrateProbes(StreamState* state) {
+    if (!state || !state->pipeline) {
+        return;
+    }
+
+    GstIterator* iterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
+    GValue item = G_VALUE_INIT;
+    gboolean inputAttached = FALSE;
+    gboolean outputAttached = FALSE;
+
+    while (gst_iterator_next(iterator, &item) == GST_ITERATOR_OK) {
+        GstElement* element = GST_ELEMENT(g_value_get_object(&item));
+        const gchar* factoryName = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(gst_element_get_factory(element)));
+
+        if (!inputAttached && factoryName &&
+            (g_strcmp0(factoryName, "srtsrc") == 0 ||
+             g_strcmp0(factoryName, "souphttpsrc") == 0 ||
+             g_strcmp0(factoryName, "udpsrc") == 0 ||
+             g_strcmp0(factoryName, "filesrc") == 0)) {
+            GstPad* srcPad = gst_element_get_static_pad(element, "src");
+            if (srcPad) {
+                gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER, inputPadProbe, state, nullptr);
+                gst_object_unref(srcPad);
+                inputAttached = TRUE;
+            }
+        }
+
+        if (!outputAttached && factoryName && g_strcmp0(factoryName, "udpsink") == 0) {
+            GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
+            if (sinkPad) {
+                gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
+                gst_object_unref(sinkPad);
+                outputAttached = TRUE;
+            }
+        }
+
+        g_value_unset(&item);
+        if (inputAttached && outputAttached) {
+            break;
+        }
+    }
+
+    gst_iterator_free(iterator);
+}
+
+void StreamManager::updateBitrateEstimates(StreamState* state) {
+    if (!state) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - state->lastBitrateSample).count();
+    if (elapsedMs < 1000) {
+        return;
+    }
+
+    uint64_t currentInputBytes = state->inputBytes.load();
+    uint64_t currentOutputBytes = state->outputBytes.load();
+    uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
+    uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
+    double seconds = static_cast<double>(elapsedMs) / 1000.0;
+
+    state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
+    state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
+
+    if (state->config.cbr && state->outputBitrate.load() == 0 && state->config.targetBitrate > 0) {
+        state->outputBitrate = state->config.targetBitrate;
+    }
+
+    state->lastInputBytesSample = currentInputBytes;
+    state->lastOutputBytesSample = currentOutputBytes;
+    state->lastBitrateSample = now;
+}
+
+GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
+    (void)pad;
+    auto* state = static_cast<StreamState*>(user_data);
+    if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+    state->inputBytes += gst_buffer_get_size(buffer);
+    return GST_PAD_PROBE_OK;
+}
+
+GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
+    (void)pad;
+    auto* state = static_cast<StreamState*>(user_data);
+    if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+    state->outputBytes += gst_buffer_get_size(buffer);
+    return GST_PAD_PROBE_OK;
 }
 
 void StreamManager::monitorBus(const std::string& id) {

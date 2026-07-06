@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <chrono>
 
 #include "ConfigManager.h"
 #include "TelegramNotifier.h"
@@ -25,6 +26,11 @@ struct StreamState {
     StreamConfig config;
     std::atomic<uint64_t> inputBitrate{0};
     std::atomic<uint64_t> outputBitrate{0};
+    std::atomic<uint64_t> inputBytes{0};
+    std::atomic<uint64_t> outputBytes{0};
+    std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
+    uint64_t lastInputBytesSample = 0;
+    uint64_t lastOutputBytesSample = 0;
 };
 
 class StreamManager {
@@ -43,6 +49,10 @@ private:
     std::string buildPipelineDescription(const StreamConfig& cfg);
     void monitorBus(const std::string& id);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
+    void attachBitrateProbes(StreamState* state);
+    void updateBitrateEstimates(StreamState* state);
+    static GstPadProbeReturn inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
+    static GstPadProbeReturn outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
 
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
