@@ -1,6 +1,10 @@
 #include "StreamManager.h"
 
 #include <iostream>
+#include <sstream>
+#include <regex>
+#include <chrono>
+#include <thread>
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
     : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(false) {
@@ -41,7 +45,18 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->outputBitrate = streamConfig.targetBitrate;
     state->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
 
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (stateChange == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "Failed to set pipeline to PLAYING for stream: " << streamConfig.name << std::endl;
+        if (state->bus) {
+            gst_object_unref(state->bus);
+            state->bus = nullptr;
+        }
+        gst_object_unref(pipeline);
+        return false;
+    }
+
+    state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
     streams[streamConfig.id] = std::move(state);
     telegramNotifier.sendMessage("Stream started: " + streamConfig.name);
     return true;
@@ -112,8 +127,12 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     std::map<std::string, StreamState*> result;
     for (auto& [id, statePtr] : streams) {
         if (statePtr->pipeline) {
-            statePtr->inputBitrate = queryPipelineBitrate(statePtr->pipeline);
-            statePtr->outputBitrate = statePtr->config.cbr ? statePtr->config.targetBitrate : statePtr->inputBitrate.load();
+            uint64_t measured = queryPipelineBitrate(statePtr->pipeline);
+            statePtr->inputBitrate = measured;
+            statePtr->outputBitrate = statePtr->config.cbr ? statePtr->config.targetBitrate : measured;
+            if (statePtr->outputBitrate.load() == 0 && statePtr->config.targetBitrate > 0) {
+                statePtr->outputBitrate = statePtr->config.targetBitrate;
+            }
         }
         result[id] = statePtr.get();
     }
@@ -137,18 +156,56 @@ uint64_t StreamManager::queryPipelineBitrate(GstElement* pipeline) {
 
 std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     std::ostringstream desc;
-    std::string absIntf = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
+    const std::string input = cfg.inputUri;
+    const std::string inputLower = toLower(input);
+    const std::string bindAddress = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
 
-    if (toLower(cfg.inputUri).rfind("http://", 0) == 0 ||
-        toLower(cfg.inputUri).rfind("https://", 0) == 0 ||
-        toLower(cfg.inputUri).rfind("srt://", 0) == 0 ||
-        toLower(cfg.inputUri).rfind("rtp://", 0) == 0 ||
-        toLower(cfg.inputUri).rfind("udp://", 0) == 0) {
-        desc << "urisourcebin uri=" << gstQuote(cfg.inputUri) << " name=src ! ";
+    auto extractHostPort = [](const std::string& uri, const std::string& scheme, std::string& host, int& port) -> bool {
+        std::regex re("^" + scheme + R"(://([^:/]+):(\d+).*$)", std::regex::icase);
+        std::smatch match;
+        if (!std::regex_match(uri, match, re) || match.size() < 3) {
+            return false;
+        }
+        host = match[1].str();
+        port = std::stoi(match[2].str());
+        return true;
+    };
+
+    if (inputLower.rfind("srt://", 0) == 0) {
+        desc << "srtsrc uri=" << gstQuote(input)
+             << " latency=120 wait-for-connection=true ! tsparse ! queue ! "
+             << "mpegtsmux name=mux alignment=7 ";
+    } else if (inputLower.rfind("http://", 0) == 0 || inputLower.rfind("https://", 0) == 0) {
+        desc << "souphttpsrc location=" << gstQuote(input)
+             << " is-live=true do-timestamp=true ! queue ! tsparse ! queue ! "
+             << "mpegtsmux name=mux alignment=7 ";
+    } else if (inputLower.rfind("udp://", 0) == 0) {
+        std::string host;
+        int port = 0;
+        if (!extractHostPort(input, "udp", host, port)) {
+            return "";
+        }
+        desc << "udpsrc address=" << gstQuote(host)
+             << " port=" << port
+             << " multicast-iface=" << gstQuote(bindAddress)
+             << " auto-multicast=true buffer-size=2097152 ! queue ! tsparse ! queue ! "
+             << "mpegtsmux name=mux alignment=7 ";
+    } else if (inputLower.rfind("rtp://", 0) == 0) {
+        std::string host;
+        int port = 0;
+        if (!extractHostPort(input, "rtp", host, port)) {
+            return "";
+        }
+        desc << "udpsrc address=" << gstQuote(host)
+             << " port=" << port
+             << " multicast-iface=" << gstQuote(bindAddress)
+             << " caps=\"application/x-rtp,media=video,encoding-name=MP2T,clock-rate=90000\" ! "
+             << "rtpmp2tdepay ! queue ! tsparse ! queue ! mpegtsmux name=mux alignment=7 ";
+    } else {
+        desc << "filesrc location=" << gstQuote(input) << " ! queue ! tsparse ! queue ! mpegtsmux name=mux alignment=7 ";
     }
 
-    desc << "tsdemux name=demux demux. ! queue ! h264parse ! mpegtsmux name=mux "
-         << "alignment=7 bitrate=" << (cfg.cbr ? cfg.targetBitrate : 0) << " ";
+    desc << "bitrate=" << (cfg.cbr ? cfg.targetBitrate : 0) << " program-number=" << cfg.serviceId << " ";
 
     if (!cfg.serviceName.empty()) {
         desc << "service-name=" << gstQuote(cfg.serviceName) << " ";
@@ -157,8 +214,10 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
         desc << "service-provider=" << gstQuote(cfg.serviceProvider) << " ";
     }
 
-    desc << "! udpsink host=" << gstQuote(cfg.outputHost) << " port=" << cfg.outputPort
-         << " bind-address=" << gstQuote(absIntf) << " async=false sync=false";
+    desc << "! udpsink host=" << gstQuote(cfg.outputHost)
+         << " port=" << cfg.outputPort
+         << " bind-address=" << gstQuote(bindAddress)
+         << " async=false sync=false";
 
     return desc.str();
 }

@@ -209,8 +209,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .stats-panel .status{display:flex;flex-direction:column;gap:3px;font-size:.78rem;color:#d1d9ed}
 .stats-panel .status strong{color:#fff;font-size:.78rem}
 .stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
-.tile-grid{display:grid;grid-template-columns:repeat(8,180px);gap:12px 1ch;justify-content:start}
-.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:130px;width:100%;max-width:180px;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease}
+.tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
+.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:130px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
