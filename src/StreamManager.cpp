@@ -251,11 +251,16 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
     const std::string input = cfg.inputUri;
     const std::string inputLower = toLower(input);
 
-    auto addQueue = [&](const char* name) -> GstElement* {
+    auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL) -> GstElement* {
         GstElement* queue = gst_element_factory_make("queue", name);
         if (!addElementOrFail(pipeline, queue)) {
             return nullptr;
         }
+        g_object_set(queue,
+            "max-size-buffers", 0,
+            "max-size-bytes", 0,
+            "max-size-time", maxSizeTime,
+            nullptr);
         return queue;
     };
 
@@ -277,7 +282,7 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
         if (std::string(factory) == "srtsrc") {
             g_object_set(src, "wait-for-connection", TRUE, nullptr);
         } else {
-            g_object_set(src, "latency", 120, nullptr);
+            g_object_set(src, "latency", 500, nullptr);
         }
 
         if (!gst_element_link(src, queue)) {
@@ -400,24 +405,33 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     if (!state || !state->remapContext) {
         return false;
     }
-    if (!hasElementFactory("tsdemux") || !hasElementFactory("mpegtsmux")) {
-        std::cerr << "missing remap elements: tsdemux or mpegtsmux" << std::endl;
+    if (!hasElementFactory("tsparse") || !hasElementFactory("tsdemux") || !hasElementFactory("mpegtsmux")) {
+        std::cerr << "missing remap elements: tsparse, tsdemux or mpegtsmux" << std::endl;
         return false;
     }
 
+    GstElement* tsparse = gst_element_factory_make("tsparse", "remap_tsparse");
+    GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
     GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
-    if (!demux || !mux || !sink) {
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !sink) {
         return false;
     }
 
-    if (!addElementOrFail(pipeline, demux) ||
+    if (!addElementOrFail(pipeline, tsparse) ||
+        !addElementOrFail(pipeline, preDemuxQueue) ||
+        !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
         !addElementOrFail(pipeline, sink)) {
         return false;
     }
 
+    g_object_set(preDemuxQueue,
+        "max-size-buffers", 0,
+        "max-size-bytes", 0,
+        "max-size-time", 3000000000ULL,
+        nullptr);
     g_object_set(mux, "alignment", 7, nullptr);
     g_object_set(sink,
         "host", state->config.outputHost.c_str(),
@@ -430,7 +444,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         g_object_set(sink, "bind-address", state->config.interfaceAddress.c_str(), nullptr);
     }
 
-    if (!gst_element_link(sourceTail, demux)) {
+    if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
     if (!gst_element_link(mux, sink)) {
@@ -486,6 +500,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
+    g_object_set(queue,
+        "max-size-buffers", 0,
+        "max-size-bytes", 0,
+        "max-size-time", 3000000000ULL,
+        nullptr);
     gst_element_sync_state_with_parent(queue);
 
     GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
