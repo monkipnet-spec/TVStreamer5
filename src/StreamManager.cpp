@@ -36,6 +36,31 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         return false;
     }
 
+    GstBus* parseBus = gst_element_get_bus(pipeline);
+    if (parseBus) {
+        while (GstMessage* msg = gst_bus_pop_filtered(parseBus, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING))) {
+            if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+                GError* err = nullptr;
+                gchar* dbg = nullptr;
+                gst_message_parse_error(msg, &err, &dbg);
+                std::cerr << "Pipeline setup error: " << (err ? err->message : "unknown")
+                          << " debug=" << (dbg ? dbg : "") << std::endl;
+                if (err) g_error_free(err);
+                g_free(dbg);
+            } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
+                GError* err = nullptr;
+                gchar* dbg = nullptr;
+                gst_message_parse_warning(msg, &err, &dbg);
+                std::cerr << "Pipeline setup warning: " << (err ? err->message : "unknown")
+                          << " debug=" << (dbg ? dbg : "") << std::endl;
+                if (err) g_error_free(err);
+                g_free(dbg);
+            }
+            gst_message_unref(msg);
+        }
+        gst_object_unref(parseBus);
+    }
+
     auto state = std::make_unique<StreamState>();
     state->config = streamConfig;
     state->pipeline = pipeline;
@@ -48,6 +73,28 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING for stream: " << streamConfig.name << std::endl;
+        GstMessage* msg = gst_bus_timed_pop_filtered(state->bus, 2 * GST_SECOND,
+            static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING | GST_MESSAGE_STATE_CHANGED));
+        if (msg) {
+            if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+                GError* err = nullptr;
+                gchar* dbg = nullptr;
+                gst_message_parse_error(msg, &err, &dbg);
+                std::cerr << "PLAYING error: " << (err ? err->message : "unknown")
+                          << " debug=" << (dbg ? dbg : "") << std::endl;
+                if (err) g_error_free(err);
+                g_free(dbg);
+            } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
+                GError* err = nullptr;
+                gchar* dbg = nullptr;
+                gst_message_parse_warning(msg, &err, &dbg);
+                std::cerr << "PLAYING warning: " << (err ? err->message : "unknown")
+                          << " debug=" << (dbg ? dbg : "") << std::endl;
+                if (err) g_error_free(err);
+                g_free(dbg);
+            }
+            gst_message_unref(msg);
+        }
         if (state->bus) {
             gst_object_unref(state->bus);
             state->bus = nullptr;
@@ -180,7 +227,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 
     if (inputLower.rfind("srt://", 0) == 0) {
         desc << "srtsrc uri=" << gstQuote(input)
-             << " latency=120 wait-for-connection=true ! queue ! tsparse ! queue ";
+             << " wait-for-connection=true ! queue ! tsparse ! queue ";
     } else if (inputLower.rfind("http://", 0) == 0 || inputLower.rfind("https://", 0) == 0) {
         desc << "souphttpsrc location=" << gstQuote(input)
              << " is-live=true do-timestamp=true ! queue ! tsparse ! queue ";
@@ -211,8 +258,8 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 
     desc << "! udpsink host=" << gstQuote(cfg.outputHost)
          << " port=" << cfg.outputPort
-         << " bind-address=" << gstQuote(bindAddress)
-         << " async=false sync=false";
+         << " multicast-iface=" << gstQuote(bindAddress)
+         << " auto-multicast=true async=false sync=false";
 
     return desc.str();
 }
