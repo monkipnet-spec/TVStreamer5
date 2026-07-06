@@ -358,7 +358,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', cbr:true, target_bitrate:2000000,
+    interface_address:'', input_mode:'auto', remap_enabled:false, cbr:true, target_bitrate:2000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:''
   });
 }
@@ -373,6 +373,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
         <div class="form-row full"><label>Интерфейс вывода (UDP)</label><select class="compact" id="streamInterface"><option value=""></option>${options}</select></div>
+        <div class="form-row"><label>Режим SRT/Input</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
         <div class="form-row"><label>Мультикаст IP</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
         <div class="form-row"><label>Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
         <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
@@ -380,6 +381,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
         <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
         <div class="form-row full"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
+        <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div></div>
       </div>
       <div class="modal-actions">
         <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -416,6 +418,8 @@ function saveStream(id) {
     output_port: Number(document.getElementById('streamOutputPort').value),
     backup_input_uri: document.getElementById('streamBackupInput').value,
     interface_address: document.getElementById('streamInterface').value,
+    input_mode: document.getElementById('streamInputMode').value,
+    remap_enabled: document.getElementById('streamRemapEnabled').checked,
     cbr: document.getElementById('streamCbr').checked,
     target_bitrate: Number(document.getElementById('streamBitrate').value) * 1000,
     audio_pid: Number(document.getElementById('streamAudioPid').value),

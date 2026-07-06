@@ -14,6 +14,14 @@
 #include "TelegramNotifier.h"
 #include "utils.h"
 
+struct RemapContext {
+    GstElement* mux = nullptr;
+    GstElement* sink = nullptr;
+    StreamConfig config;
+    bool videoLinked = false;
+    bool audioLinked = false;
+};
+
 struct StreamState {
     std::atomic<bool> active{false};
     std::atomic<bool> running{false};
@@ -31,6 +39,7 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
+    std::unique_ptr<RemapContext> remapContext;
 };
 
 class StreamManager {
@@ -47,6 +56,11 @@ public:
 private:
     bool gstreamerInitialized;
     std::string buildPipelineDescription(const StreamConfig& cfg);
+    GstElement* createPipeline(const StreamConfig& cfg);
+    GstElement* createSourceChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
+    bool buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail);
+    bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
+    static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
