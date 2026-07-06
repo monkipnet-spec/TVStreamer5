@@ -14,6 +14,8 @@ struct StreamConfig {
     std::string outputHost = "127.0.0.1";
     int outputPort = 1234;
     std::string interfaceAddress;
+    std::string inputMode = "auto";
+    bool remapEnabled = false;
     bool cbr = true;
     uint64_t targetBitrate = 2000000;
     uint32_t audioPid = 0;

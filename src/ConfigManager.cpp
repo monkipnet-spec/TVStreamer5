@@ -13,6 +13,8 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
     config.outputPort = root.get("output_port", 1234).asInt();
     config.interfaceAddress = root.get("interface_address", "").asString();
+    config.inputMode = root.get("input_mode", "auto").asString();
+    config.remapEnabled = root.get("remap_enabled", false).asBool();
     config.cbr = root.get("cbr", true).asBool();
     config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();
     config.audioPid = root.get("audio_pid", 0).asUInt();
@@ -32,6 +34,8 @@ Json::Value StreamConfig::toJson() const {
     root["output_host"] = outputHost;
     root["output_port"] = outputPort;
     root["interface_address"] = interfaceAddress;
+    root["input_mode"] = inputMode;
+    root["remap_enabled"] = remapEnabled;
     root["cbr"] = cbr;
     root["target_bitrate"] = Json::UInt64(targetBitrate);
     root["audio_pid"] = audioPid;
