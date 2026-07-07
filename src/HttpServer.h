@@ -3,6 +3,9 @@
 #include <boost/asio.hpp>
 #include <boost/beast/http.hpp>
 #include <jsoncpp/json/json.h>
+#include <chrono>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <functional>
 #include <unordered_map>
@@ -20,17 +23,32 @@ public:
     void addEndpoint(const std::string& path, std::function<void(const boost::asio::ip::tcp::socket&)> handler);
 
 private:
+    struct QualitySample {
+        int64_t timestamp = 0;
+        bool active = false;
+        uint64_t inputKbps = 0;
+        uint64_t outputKbps = 0;
+        uint64_t targetKbps = 0;
+        std::string status;
+        std::string level;
+        std::string message;
+    };
+
     void doAccept();
     void handleSession(tcp::socket socket);
     std::string listInterfaces();
     std::string currentState();
+    std::string qualityHistory(const std::string& target);
     void handleSaveConfig(const std::string& body);
     void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
     std::string renderIndexPage();
+    void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 
     tcp::acceptor acceptor;
     ConfigManager& configManager;
     StreamManager& streamManager;
+    std::mutex qualityMutex;
+    std::unordered_map<std::string, std::deque<QualitySample>> qualitySamples;
     std::unordered_map<std::string, std::function<void(const boost::asio::ip::tcp::socket&)>> endpointHandlers;
 };

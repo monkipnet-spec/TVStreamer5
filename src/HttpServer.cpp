@@ -6,8 +6,44 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/algorithm/string.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
+
+namespace {
+
+std::string queryValue(const std::string& target, const std::string& key) {
+    const auto queryPos = target.find('?');
+    if (queryPos == std::string::npos) {
+        return "";
+    }
+
+    std::string query = target.substr(queryPos + 1);
+    std::istringstream stream(query);
+    std::string part;
+    while (std::getline(stream, part, '&')) {
+        const auto eq = part.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        if (part.substr(0, eq) == key) {
+            return part.substr(eq + 1);
+        }
+    }
+    return "";
+}
+
+int64_t unixNowSeconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+} // namespace
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamManager& sm)
     : acceptor(ioc), configManager(cfg), streamManager(sm) {
@@ -47,16 +83,20 @@ void HttpServer::handleSession(tcp::socket socket) {
         res.set(http::field::content_type, "text/html; charset=UTF-8");
         res.keep_alive(req.keep_alive());
 
+        const std::string target(req.target());
         if (req.method() == http::verb::get) {
-            if (req.target() == "/" || req.target() == "/index.html") {
+            if (target == "/" || target == "/index.html") {
                 res.body() = renderIndexPage();
-            } else if (req.target() == "/api/interfaces") {
+            } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
-            } else if (req.target() == "/api/state") {
+            } else if (target == "/api/state") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = currentState();
-            } else if (req.target() == "/health") {
+            } else if (target.rfind("/api/quality-history", 0) == 0) {
+                res.set(http::field::content_type, "application/json");
+                res.body() = qualityHistory(target);
+            } else if (target == "/health") {
                 res.set(http::field::content_type, "text/plain");
                 res.body() = "Healthy";
             } else {
@@ -64,15 +104,15 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = "Not Found";
             }
         } else if (req.method() == http::verb::post) {
-            if (req.target() == "/api/save-config") {
+            if (target == "/api/save-config") {
                 handleSaveConfig(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
-            } else if (req.target() == "/api/start-stream") {
+            } else if (target == "/api/start-stream") {
                 handleStartStream(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
-            } else if (req.target() == "/api/stop-stream") {
+            } else if (target == "/api/stop-stream") {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
@@ -129,11 +169,122 @@ std::string HttpServer::currentState() {
             item["bitrate_out_kbps"] = Json::UInt64(0);
         }
         item["vlc_link"] = "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
+        recordQualitySample(cfg, item);
         streams.append(item);
     }
     root["streams"] = streams;
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, root);
+}
+
+std::string HttpServer::qualityHistory(const std::string& target) {
+    const std::string id = queryValue(target, "id");
+    uint64_t periodSeconds = 3600;
+    try {
+        const std::string period = queryValue(target, "period");
+        if (!period.empty()) {
+            periodSeconds = std::stoull(period);
+        }
+    } catch (const std::exception&) {
+        periodSeconds = 3600;
+    }
+    periodSeconds = std::clamp<uint64_t>(periodSeconds, 60, 30ULL * 24ULL * 60ULL * 60ULL);
+
+    Json::Value root;
+    root["id"] = id;
+    root["period_seconds"] = Json::UInt64(periodSeconds);
+    root["generated_at"] = Json::Int64(unixNowSeconds());
+    Json::Value samples(Json::arrayValue);
+
+    const int64_t cutoff = unixNowSeconds() - static_cast<int64_t>(periodSeconds);
+    std::map<std::string, unsigned int> totals = {
+        {"ok", 0}, {"warn", 0}, {"error", 0}, {"offline", 0}
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(qualityMutex);
+        auto found = qualitySamples.find(id);
+        if (found != qualitySamples.end()) {
+            for (const auto& sample : found->second) {
+                if (sample.timestamp < cutoff) {
+                    continue;
+                }
+                Json::Value item;
+                item["ts"] = Json::Int64(sample.timestamp);
+                item["active"] = sample.active;
+                item["input_kbps"] = Json::UInt64(sample.inputKbps);
+                item["output_kbps"] = Json::UInt64(sample.outputKbps);
+                item["target_kbps"] = Json::UInt64(sample.targetKbps);
+                item["status"] = sample.status;
+                item["level"] = sample.level;
+                item["message"] = sample.message;
+                samples.append(item);
+                totals[sample.level]++;
+            }
+        }
+    }
+
+    root["samples"] = samples;
+    Json::Value summary;
+    summary["ok"] = Json::UInt(totals["ok"]);
+    summary["warn"] = Json::UInt(totals["warn"]);
+    summary["error"] = Json::UInt(totals["error"]);
+    summary["offline"] = Json::UInt(totals["offline"]);
+    root["summary"] = summary;
+
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, root);
+}
+
+void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value& state) {
+    const int64_t now = unixNowSeconds();
+    QualitySample sample;
+    sample.timestamp = now;
+    sample.active = state.get("active", false).asBool();
+    sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
+    sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
+    sample.targetKbps = cfg.targetBitrate / 1000;
+    sample.status = state.get("status", "").asString();
+
+    const std::string statusLower = toLower(sample.status);
+    if (!sample.active) {
+        sample.level = "offline";
+        sample.message = sample.status == "stopped" ? "Поток остановлен" : "Поток не активен: " + sample.status;
+    } else if (statusLower.find("error") != std::string::npos ||
+               statusLower.find("failed") != std::string::npos ||
+               statusLower.find("ended") != std::string::npos) {
+        sample.level = "error";
+        sample.message = "Ошибка GStreamer: " + sample.status;
+    } else if (sample.inputKbps == 0) {
+        sample.level = "warn";
+        sample.message = "Нет входного битрейта при активном потоке";
+    } else if (sample.targetKbps > 0 && sample.outputKbps > 0) {
+        const double diff = std::abs(static_cast<double>(sample.outputKbps) - static_cast<double>(sample.targetKbps));
+        const double deviation = diff / static_cast<double>(sample.targetKbps);
+        if (deviation > 0.20) {
+            sample.level = "warn";
+            sample.message = "Выходной битрейт отклоняется от цели больше чем на 20%";
+        } else {
+            sample.level = "ok";
+            sample.message = "Качество в норме";
+        }
+    } else {
+        sample.level = "ok";
+        sample.message = "Качество в норме";
+    }
+
+    std::lock_guard<std::mutex> lock(qualityMutex);
+    auto& samples = qualitySamples[cfg.id];
+    if (!samples.empty() && samples.back().timestamp == sample.timestamp) {
+        samples.back() = sample;
+    } else {
+        samples.push_back(sample);
+    }
+
+    const int64_t cutoff = now - 30LL * 24LL * 60LL * 60LL;
+    while (!samples.empty() && samples.front().timestamp < cutoff) {
+        samples.pop_front();
+    }
 }
 
 void HttpServer::handleSaveConfig(const std::string& body) {
@@ -225,7 +376,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:.78rem}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
-.tile .controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:.78rem;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
@@ -233,12 +384,34 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .tile .controls .start-button:hover{background:rgba(23,194,97,.28)}
 .tile .controls .stop-button{background:rgba(255,95,95,.18);color:#ffc2c2;box-shadow:inset 0 0 0 1px rgba(255,95,95,.28)}
 .tile .controls .stop-button:hover{background:rgba(255,95,95,.28)}
-.tile .controls .copy-button.copied{background:rgba(31,139,255,.32);color:#fff;box-shadow:0 0 0 2px rgba(31,139,255,.24)}
+.tile .controls .copy-button.copied{background:rgba(23,194,97,.38);color:#fff;box-shadow:0 0 0 2px rgba(23,194,97,.28)}
 .tile .controls .copy-button.copy-error{background:rgba(255,184,77,.24);color:#ffe0a3;box-shadow:0 0 0 2px rgba(255,184,77,.22)}
+.tile .controls .quality-button{background:rgba(57,189,248,.14);color:#bdefff;box-shadow:inset 0 0 0 1px rgba(57,189,248,.2)}
+.tile .controls .quality-button:hover{background:rgba(57,189,248,.24)}
 .modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(8,10,15,.78);display:none;align-items:center;justify-content:center;padding:12px;z-index:20}
 .modal.active{display:flex}
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
+.modal-content.quality-modal{width:min(920px,100%)}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
+.quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
+.quality-title{display:flex;flex-direction:column;gap:4px}
+.quality-title small{color:#9aa3b1}
+.period-tabs{display:flex;gap:6px;flex-wrap:wrap}
+.period-tabs button{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#d7deec;border-radius:8px;cursor:pointer;font-size:.72rem}
+.period-tabs button.active{background:#1f8bff;color:#fff;border-color:#1f8bff}
+.quality-board{position:relative;border:1px solid rgba(255,255,255,.08);background:#101722;border-radius:10px;padding:8px}
+.quality-board canvas{display:block;width:100%;height:320px;cursor:copy}
+.quality-legend{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0;color:#cfd8ea;font-size:.78rem}
+.quality-legend span{display:flex;align-items:center;gap:5px}
+.quality-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.quality-ok{background:#17c261}.quality-warn{background:#ffbd4a}.quality-error{background:#ff5f5f}.quality-offline{background:#7c879b}
+.quality-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:10px}
+.quality-card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:8px;color:#cfd8ea;font-size:.78rem}
+.quality-card strong{display:block;color:#fff;margin-bottom:4px}
+.quality-errors{margin-top:10px;max-height:150px;overflow:auto;border-top:1px solid rgba(255,255,255,.08);padding-top:8px;color:#cfd8ea;font-size:.78rem}
+.quality-errors div{display:flex;gap:8px;padding:3px 0}
+.quality-empty{padding:30px;text-align:center;color:#9aa3b1}
+.quality-copy{color:#7dd1ff;font-size:.78rem;min-height:18px;margin-top:-4px}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .form-grid.full{grid-template-columns:1fr}
 .form-row.full{grid-column:1/-1}
@@ -287,6 +460,7 @@ function fetchState() {
 }
 function openModal(html) {
   document.getElementById('modalContent').innerHTML = html;
+  document.getElementById('modalContent').className = 'modal-content';
   document.getElementById('modal').classList.add('active');
 }
 function closeModal() { document.getElementById('modal').classList.remove('active'); }
@@ -318,7 +492,8 @@ function render() {
       <div class="controls">
         <button class="${stream.active ? 'stop-button' : 'start-button'}" onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Стоп' : 'Старт'}</button>
         <button onclick="editStream('${stream.id}')">Ред.</button>
-        <button class="copy-button" onclick="copyLink('${stream.vlc_link}', this)">URL Out</button>
+        <button class="quality-button" onclick="openQualityModal('${stream.id}')">График</button>
+        <button class="copy-button" onclick="copyLink('${stream.vlc_link}', this)">URL</button>
       </div>`;
     tiles.appendChild(tile);
   });
@@ -379,10 +554,10 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087" /></div>
+        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087 или https://host/live.m3u8" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
         <div class="form-row full"><label>Интерфейс вывода (UDP)</label><select class="compact" id="streamInterface"><option value=""></option>${options}</select></div>
-        <div class="form-row"><label>Режим SRT/Input</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
+        <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
         <div class="form-row"><label>Мультикаст IP</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
         <div class="form-row"><label>Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
         <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
@@ -454,16 +629,12 @@ function saveStream(id) {
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(savePayload)})
     .then(()=>{closeModal();fetchState();});
 }
-function setCopyButtonState(button, label, className) {
+function setCopyButtonState(button, className) {
   if (!button) return;
-  const originalText = button.dataset.originalText || button.textContent;
-  button.dataset.originalText = originalText;
-  button.textContent = label;
   button.classList.remove('copied', 'copy-error');
   button.classList.add(className);
   clearTimeout(button.copyStateTimer);
   button.copyStateTimer = setTimeout(() => {
-    button.textContent = originalText;
     button.classList.remove('copied', 'copy-error');
   }, 1400);
 }
@@ -486,15 +657,217 @@ function fallbackCopyText(text) {
   return ok;
 }
 function copyLink(text, button) {
-  const onSuccess = () => setCopyButtonState(button, 'Скопировано', 'copied');
+  const onSuccess = () => setCopyButtonState(button, 'copied');
   const onError = () => {
     if (fallbackCopyText(text)) {
       onSuccess();
     } else {
-      setCopyButtonState(button, 'Ошибка', 'copy-error');
+      setCopyButtonState(button, 'copy-error');
     }
   };
 
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(onSuccess).catch(onError);
+  } else {
+    onError();
+  }
+}
+const qualityPeriods = [
+  {label:'Месяц', seconds:2592000},
+  {label:'Неделя', seconds:604800},
+  {label:'День', seconds:86400},
+  {label:'Пол дня', seconds:43200},
+  {label:'5 часов', seconds:18000},
+  {label:'1 час', seconds:3600},
+  {label:'30 минут', seconds:1800},
+  {label:'10 минут', seconds:600},
+  {label:'Минута', seconds:60}
+];
+let qualityChart = {streamId:'', period:3600, samples:[], points:[]};
+function qualityColor(level) {
+  return {ok:'#17c261', warn:'#ffbd4a', error:'#ff5f5f', offline:'#7c879b'}[level] || '#9aa3b1';
+}
+function formatTime(ts, period) {
+  const date = new Date(ts * 1000);
+  if (period >= 86400) {
+    return date.toLocaleDateString([], {day:'2-digit', month:'2-digit'}) + ' ' +
+      date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  }
+  return date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second: period <= 600 ? '2-digit' : undefined});
+}
+function openQualityModal(id, periodSeconds=3600) {
+  const stream = state.streams.find(s=>s.id===id);
+  if (!stream) return;
+  qualityChart.streamId = id;
+  qualityChart.period = periodSeconds;
+  document.getElementById('modalContent').className = 'modal-content quality-modal';
+  const tabs = qualityPeriods.map(p=>`<button class="${p.seconds===periodSeconds?'active':''}" onclick="loadQualityHistory('${id}', ${p.seconds})">${p.label}</button>`).join('');
+  document.getElementById('modalContent').innerHTML = `
+    <div class="quality-head">
+      <div class="quality-title">
+        <h2>Качество потока</h2>
+        <small>${stream.name || stream.id} · ${stream.output_host}:${stream.output_port}</small>
+      </div>
+      <div class="period-tabs">${tabs}</div>
+    </div>
+    <div class="quality-board">
+      <canvas id="qualityCanvas" width="860" height="320"></canvas>
+    </div>
+    <div class="quality-legend">
+      <span><i class="quality-dot quality-ok"></i>Норма</span>
+      <span><i class="quality-dot quality-warn"></i>Предупреждение</span>
+      <span><i class="quality-dot quality-error"></i>Ошибка</span>
+      <span><i class="quality-dot quality-offline"></i>Остановлен</span>
+      <span>Клик по графику копирует измерение в буфер</span>
+    </div>
+    <div id="qualityCopyNotice" class="quality-copy"></div>
+    <div id="qualityDetails" class="quality-details"></div>
+    <div id="qualityErrors" class="quality-errors"></div>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="closeModal()">Закрыть</button>
+    </div>
+  `;
+  document.getElementById('modal').classList.add('active');
+  loadQualityHistory(id, periodSeconds);
+}
+function loadQualityHistory(id, periodSeconds) {
+  qualityChart.period = periodSeconds;
+  fetch(`/api/quality-history?id=${encodeURIComponent(id)}&period=${periodSeconds}`)
+    .then(r=>r.json())
+    .then(data=>{
+      qualityChart.samples = data.samples || [];
+      renderQualityTabs(periodSeconds);
+      drawQualityChart(data);
+    });
+}
+function renderQualityTabs(periodSeconds) {
+  document.querySelectorAll('.period-tabs button').forEach((button, index) => {
+    button.classList.toggle('active', qualityPeriods[index]?.seconds === periodSeconds);
+  });
+}
+function drawQualityChart(data) {
+  const canvas = document.getElementById('qualityCanvas');
+  const details = document.getElementById('qualityDetails');
+  const errors = document.getElementById('qualityErrors');
+  if (!canvas || !details || !errors) return;
+  const ctx = canvas.getContext('2d');
+  const rect = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(640, Math.floor(rect.width * ratio));
+  canvas.height = Math.floor(320 * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const width = canvas.width / ratio;
+  const height = canvas.height / ratio;
+  ctx.clearRect(0, 0, width, height);
+  const samples = data.samples || [];
+  if (!samples.length) {
+    ctx.fillStyle = '#9aa3b1';
+    ctx.textAlign = 'center';
+    ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
+    details.innerHTML = '<div class="quality-card"><strong>Нет данных</strong>История собирается в памяти во время работы приложения.</div>';
+    errors.innerHTML = '';
+    qualityChart.points = [];
+    return;
+  }
+  const left = 54, right = 14, top = 16, bottom = 34;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const endTs = data.generated_at || Math.floor(Date.now()/1000);
+  const startTs = endTs - (data.period_seconds || qualityChart.period);
+  const maxBitrate = Math.max(1000, ...samples.map(s=>Math.max(s.input_kbps || 0, s.output_kbps || 0, s.target_kbps || 0))) * 1.15;
+  ctx.strokeStyle = 'rgba(255,255,255,.09)';
+  ctx.fillStyle = '#8e99aa';
+  ctx.font = '11px Arial';
+  ctx.textAlign = 'right';
+  for (let i=0;i<=4;i++) {
+    const y = top + plotH * i / 4;
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
+    const kbps = Math.round(maxBitrate * (1 - i / 4));
+    ctx.fillText(kbps + 'k', left - 7, y + 4);
+  }
+  ctx.textAlign = 'center';
+  for (let i=0;i<=6;i++) {
+    const x = left + plotW * i / 6;
+    const ts = startTs + (endTs - startTs) * i / 6;
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + plotH); ctx.stroke();
+    ctx.fillText(formatTime(ts, data.period_seconds), x, height - 10);
+  }
+  const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
+  const yFor = kbps => top + plotH - (Math.min(kbps, maxBitrate) / maxBitrate) * plotH;
+  const drawLine = (field, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    samples.forEach(s => {
+      const value = s[field] || 0;
+      const x = xFor(s.ts);
+      const y = yFor(value);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    });
+    ctx.stroke();
+  };
+  drawLine('input_kbps', '#58a6ff');
+  drawLine('output_kbps', '#b7f58b');
+  qualityChart.points = [];
+  samples.forEach(s => {
+    const x = xFor(s.ts);
+    const y = yFor(s.output_kbps || s.input_kbps || 0);
+    ctx.fillStyle = qualityColor(s.level);
+    ctx.beginPath();
+    ctx.arc(x, y, s.level === 'ok' ? 3 : 5, 0, Math.PI * 2);
+    ctx.fill();
+    qualityChart.points.push({x, y, sample:s});
+  });
+  const summary = data.summary || {};
+  details.innerHTML = `
+    <div class="quality-card"><strong>Период</strong>${formatTime(startTs, data.period_seconds)} — ${formatTime(endTs, data.period_seconds)}</div>
+    <div class="quality-card"><strong>Сэмплы</strong>${samples.length}</div>
+    <div class="quality-card"><strong>Норма</strong>${summary.ok || 0}</div>
+    <div class="quality-card"><strong>Ошибки</strong>${summary.error || 0} ошибок, ${summary.warn || 0} предупреждений, ${summary.offline || 0} offline</div>
+  `;
+  const bad = samples.filter(s=>s.level !== 'ok').slice(-30).reverse();
+  errors.innerHTML = bad.length
+    ? bad.map(s=>`<div><span style="color:${qualityColor(s.level)}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message}</span></div>`).join('')
+    : '<div><span style="color:#17c261">●</span><span>За выбранный период ошибок нет</span></div>';
+  canvas.onclick = ev => copyQualityPoint(ev, canvas);
+}
+function copyQualityPoint(ev, canvas) {
+  if (!qualityChart.points.length) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  let nearest = qualityChart.points[0];
+  let best = Number.MAX_VALUE;
+  qualityChart.points.forEach(point => {
+    const dist = Math.hypot(point.x - x, point.y - y);
+    if (dist < best) { best = dist; nearest = point; }
+  });
+  const s = nearest.sample;
+  const text = [
+    `Время: ${formatTime(s.ts, qualityChart.period)}`,
+    `Уровень: ${s.level}`,
+    `Вход: ${s.input_kbps} kbps`,
+    `Выход: ${s.output_kbps} kbps`,
+    `Цель: ${s.target_kbps} kbps`,
+    `Статус: ${s.status}`,
+    `Расшифровка: ${s.message}`
+  ].join('\n');
+  const notice = document.getElementById('qualityCopyNotice');
+  const show = message => {
+    if (!notice) return;
+    notice.textContent = message;
+    clearTimeout(notice.copyTimer);
+    notice.copyTimer = setTimeout(()=>{ notice.textContent = ''; }, 1800);
+  };
+  const onSuccess = () => show('Измерение скопировано в буфер обмена');
+  const onError = () => {
+    if (fallbackCopyText(text)) {
+      onSuccess();
+    } else {
+      show('Не удалось скопировать измерение');
+    }
+  };
   if (navigator.clipboard && window.isSecureContext) {
     navigator.clipboard.writeText(text).then(onSuccess).catch(onError);
   } else {

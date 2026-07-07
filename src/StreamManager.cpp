@@ -28,6 +28,12 @@ std::string missingElementStatus(const std::string& elementName) {
     return "missing element: " + elementName;
 }
 
+bool isHlsUri(const std::string& inputLower, const std::string& inputMode) {
+    return inputLower.rfind("hls://", 0) == 0 ||
+           toLower(inputMode) == "hls" ||
+           inputLower.find(".m3u8") != std::string::npos;
+}
+
 bool addElementOrFail(GstElement* pipeline, GstElement* element) {
     return element != nullptr && gst_bin_add(GST_BIN(pipeline), element);
 }
@@ -118,6 +124,28 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         "max-size-bytes", 0,
         "max-size-time", maxSizeTime,
         nullptr);
+}
+
+void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
+    (void)demux;
+    auto* queue = static_cast<GstElement*>(userData);
+    if (!queue) {
+        return;
+    }
+
+    GstPad* sinkPad = gst_element_get_static_pad(queue, "sink");
+    if (!sinkPad) {
+        return;
+    }
+
+    if (!gst_pad_is_linked(sinkPad)) {
+        GstPadLinkReturn ret = gst_pad_link(pad, sinkPad);
+        if (ret != GST_PAD_LINK_OK) {
+            std::cerr << "HLS demux pad link failed: " << gst_pad_link_get_name(ret) << std::endl;
+        }
+    }
+
+    gst_object_unref(sinkPad);
 }
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
@@ -498,6 +526,43 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
             return nullptr;
         }
 
+        terminalElement = queue;
+        return src;
+    }
+
+    if (isHlsUri(inputLower, cfg.inputMode)) {
+        if (!hasElementFactory("souphttpsrc")) {
+            std::cerr << missingElementStatus("souphttpsrc") << std::endl;
+            return nullptr;
+        }
+        if (!hasElementFactory("hlsdemux")) {
+            std::cerr << missingElementStatus("hlsdemux") << std::endl;
+            return nullptr;
+        }
+
+        std::string location = input;
+        if (inputLower.rfind("hls://", 0) == 0) {
+            location = "http://" + input.substr(6);
+        }
+
+        GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
+        GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
+        GstElement* queue = addQueue("input_queue", 5000000000ULL);
+        if (!src || !demux || !queue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, demux)) {
+            return nullptr;
+        }
+
+        g_object_set(src, "location", location.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
+        setIntPropertyIfPresent(src, "timeout", 15);
+        setIntPropertyIfPresent(demux, "connection-speed", static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1)));
+
+        if (!gst_element_link(src, demux)) {
+            return nullptr;
+        }
+
+        g_signal_connect(demux, "pad-added", G_CALLBACK(linkDemuxPadToQueue), queue);
         terminalElement = queue;
         return src;
     }
