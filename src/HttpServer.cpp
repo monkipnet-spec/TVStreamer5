@@ -343,6 +343,7 @@ std::string HttpServer::renderIndexPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TVStreamer5</title>
 <style>
+html{font-size:14px}
 body{font-family:Arial,Helvetica,sans-serif;background:#0f1218;color:#EEE;margin:0;padding:0;min-height:100vh}
 body:before{content:'';position:fixed;inset:0;background:radial-gradient(circle at top left,rgba(40,160,255,.18),transparent 28%),radial-gradient(circle at top right,rgba(120,90,255,.15),transparent 22%),linear-gradient(180deg,#10131a 0%,#090c12 100%);pointer-events:none;z-index:-1}
 header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:rgba(19,23,31,.95);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap}
@@ -777,7 +778,7 @@ function drawQualityChart(data) {
   const maxBitrate = Math.max(1000, ...samples.map(s=>Math.max(s.input_kbps || 0, s.output_kbps || 0, s.target_kbps || 0))) * 1.15;
   ctx.strokeStyle = 'rgba(255,255,255,.09)';
   ctx.fillStyle = '#8e99aa';
-  ctx.font = '11px Arial';
+  ctx.font = '9px Arial';
   ctx.textAlign = 'right';
   for (let i=0;i<=4;i++) {
     const y = top + plotH * i / 4;

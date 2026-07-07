@@ -15,6 +15,9 @@
 
 namespace {
 
+constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
+constexpr guint64 kCbrInitialLatencyNs = 50 * GST_MSECOND;
+
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
     if (!factory) {
@@ -98,6 +101,7 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "port", cfg.outputPort,
         "async", FALSE,
         "sync", cfg.cbr ? TRUE : FALSE,
+        "buffer-size", kUdpSocketBufferSize,
         nullptr);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
@@ -614,7 +618,7 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
             "port", port,
             "reuse", TRUE,
             "do-timestamp", TRUE,
-            "buffer-size", 4 * 1024 * 1024,
+            "buffer-size", kUdpSocketBufferSize,
             nullptr);
 
         if (isMulticastHost(host) && !cfg.interfaceAddress.empty()) {
@@ -998,7 +1002,6 @@ GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* inf
 }
 
 GstPadProbeReturn StreamManager::cbrPacingPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
-    (void)pad;
     auto* state = static_cast<StreamState*>(user_data);
     if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER) ||
         !state->config.cbr || state->config.targetBitrate == 0) {
@@ -1015,14 +1018,42 @@ GstPadProbeReturn StreamManager::cbrPacingPadProbe(GstPad* pad, GstPadProbeInfo*
         return GST_PAD_PROBE_OK;
     }
 
-    const uint64_t durationNs = std::max<uint64_t>(
-        1,
-        gst_util_uint64_scale(static_cast<guint64>(size) * 8ULL, GST_SECOND, state->config.targetBitrate));
-    if (GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer))) {
-        uint64_t expected = 0;
-        state->cbrNextPtsNs.compare_exchange_strong(expected, static_cast<uint64_t>(GST_BUFFER_PTS(buffer)));
+    const guint64 targetBitrate = state->config.targetBitrate;
+    const guint64 bits = static_cast<guint64>(size) * 8ULL;
+    guint64 ptsNs = 0;
+    guint64 durationNs = 1;
+
+    {
+        std::lock_guard<std::mutex> lock(state->cbrMutex);
+
+        const __uint128_t scaledDuration =
+            static_cast<__uint128_t>(bits) * GST_SECOND + state->cbrDurationRemainder;
+        durationNs = static_cast<guint64>(scaledDuration / targetBitrate);
+        state->cbrDurationRemainder = static_cast<uint64_t>(scaledDuration % targetBitrate);
+        durationNs = std::max<guint64>(durationNs, 1);
+
+        if (!state->cbrPacingStarted) {
+            GstElement* element = GST_ELEMENT(gst_pad_get_parent(pad));
+            if (element) {
+                GstClock* clock = gst_element_get_clock(element);
+                const GstClockTime baseTime = gst_element_get_base_time(element);
+                if (clock && GST_CLOCK_TIME_IS_VALID(baseTime)) {
+                    const GstClockTime now = gst_clock_get_time(clock);
+                    if (GST_CLOCK_TIME_IS_VALID(now) && now >= baseTime) {
+                        state->cbrNextPtsNs = static_cast<uint64_t>(now - baseTime + kCbrInitialLatencyNs);
+                    }
+                }
+                if (clock) {
+                    gst_object_unref(clock);
+                }
+                gst_object_unref(element);
+            }
+            state->cbrPacingStarted = true;
+        }
+
+        ptsNs = state->cbrNextPtsNs;
+        state->cbrNextPtsNs += durationNs;
     }
-    const uint64_t ptsNs = state->cbrNextPtsNs.fetch_add(durationNs);
 
     buffer = gst_buffer_make_writable(buffer);
     GST_BUFFER_PTS(buffer) = ptsNs;

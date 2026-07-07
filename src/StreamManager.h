@@ -38,7 +38,10 @@ struct StreamState {
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};
     std::atomic<uint64_t> outputBytes{0};
-    std::atomic<uint64_t> cbrNextPtsNs{0};
+    std::mutex cbrMutex;
+    bool cbrPacingStarted = false;
+    uint64_t cbrNextPtsNs = 0;
+    uint64_t cbrDurationRemainder = 0;
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
