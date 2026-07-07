@@ -94,6 +94,10 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "sync", cfg.cbr ? TRUE : FALSE,
         nullptr);
 
+    if (cfg.cbr && cfg.targetBitrate > 0) {
+        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate));
+    }
+
     if (!cfg.interfaceAddress.empty() && !multicastOutput) {
         setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
     }
@@ -119,6 +123,7 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
     g_object_set(mux,
         "alignment", 7,
+        "pcr-interval", 1800U,
         "pat-interval", 9000U,
         "pmt-interval", 9000U,
         "si-interval", 9000U,
@@ -864,6 +869,9 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         if (!outputAttached && factoryName && g_strcmp0(factoryName, "udpsink") == 0) {
             GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
             if (sinkPad) {
+                if (state->config.cbr && state->config.targetBitrate > 0) {
+                    gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, cbrPacingPadProbe, state, nullptr);
+                }
                 gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
                 gst_object_unref(sinkPad);
                 outputAttached = TRUE;
@@ -921,6 +929,42 @@ GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* inf
     }
 
     state->inputBytes += gst_buffer_get_size(buffer);
+    return GST_PAD_PROBE_OK;
+}
+
+GstPadProbeReturn StreamManager::cbrPacingPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
+    (void)pad;
+    auto* state = static_cast<StreamState*>(user_data);
+    if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER) ||
+        !state->config.cbr || state->config.targetBitrate == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const gsize size = gst_buffer_get_size(buffer);
+    if (size == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const uint64_t durationNs = std::max<uint64_t>(
+        1,
+        gst_util_uint64_scale(static_cast<guint64>(size) * 8ULL, GST_SECOND, state->config.targetBitrate));
+    if (GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer))) {
+        uint64_t expected = 0;
+        state->cbrNextPtsNs.compare_exchange_strong(expected, static_cast<uint64_t>(GST_BUFFER_PTS(buffer)));
+    }
+    const uint64_t ptsNs = state->cbrNextPtsNs.fetch_add(durationNs);
+
+    buffer = gst_buffer_make_writable(buffer);
+    GST_BUFFER_PTS(buffer) = ptsNs;
+    GST_BUFFER_DTS(buffer) = ptsNs;
+    GST_BUFFER_DURATION(buffer) = durationNs;
+    GST_PAD_PROBE_INFO_DATA(info) = buffer;
+
     return GST_PAD_PROBE_OK;
 }
 
