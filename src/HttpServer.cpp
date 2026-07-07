@@ -307,12 +307,11 @@ function render() {
         <div class="info-row"><strong>Bitrate In</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>Bitrate Out</strong><span>${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>Статус</strong><span>${stream.status}</span></div>
-        <div class="info-row"><strong>VLC</strong><span>${stream.vlc_link}</span></div>
       </div>
       <div class="controls">
         <button onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Стоп' : 'Старт'}</button>
         <button onclick="editStream('${stream.id}')">Ред.</button>
-        <button onclick="copyLink('${stream.vlc_link}')">Копия</button>
+        <button onclick="copyLink('${stream.vlc_link}')">URL Out</button>
       </div>`;
     tiles.appendChild(tile);
   });
