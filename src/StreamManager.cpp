@@ -1,11 +1,14 @@
 #include "StreamManager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <regex>
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#include <glib.h>
 
 namespace {
 
@@ -24,6 +27,29 @@ std::string missingElementStatus(const std::string& elementName) {
 
 bool addElementOrFail(GstElement* pipeline, GstElement* element) {
     return element != nullptr && gst_bin_add(GST_BIN(pipeline), element);
+}
+
+bool isMulticastHost(const std::string& host) {
+    std::regex re(R"(^((22[4-9])|(23[0-9]))\.)");
+    return std::regex_search(host, re);
+}
+
+void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
+    g_object_set(sink,
+        "host", cfg.outputHost.c_str(),
+        "port", cfg.outputPort,
+        "async", FALSE,
+        "sync", FALSE,
+        nullptr);
+
+    if (isMulticastHost(cfg.outputHost)) {
+        g_object_set(sink, "auto-multicast", TRUE, nullptr);
+        if (!cfg.interfaceAddress.empty()) {
+            g_object_set(sink, "multicast-iface", cfg.interfaceAddress.c_str(), nullptr);
+        }
+    } else if (!cfg.interfaceAddress.empty()) {
+        g_object_set(sink, "bind-address", cfg.interfaceAddress.c_str(), nullptr);
+    }
 }
 
 } // namespace
@@ -264,6 +290,10 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
         return queue;
     };
 
+    if (inputLower == "test://bars" || inputLower == "testsrc://bars" || inputLower == "bars://hd") {
+        return createTestPatternChain(cfg, pipeline, terminalElement);
+    }
+
     if (inputLower.rfind("srt://", 0) == 0) {
         std::string mode = toLower(cfg.inputMode);
         const char* factory = (mode == "listener") ? "srtsrc" : "srtclientsrc";
@@ -372,6 +402,70 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
     return src;
 }
 
+GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement) {
+    terminalElement = nullptr;
+    const std::vector<const char*> required = {
+        "videotestsrc", "capsfilter", "videoconvert", "x264enc", "h264parse", "mpegtsmux", "queue"
+    };
+    for (const char* element : required) {
+        if (!hasElementFactory(element)) {
+            std::cerr << missingElementStatus(element) << std::endl;
+            return nullptr;
+        }
+    }
+
+    GstElement* src = gst_element_factory_make("videotestsrc", "test_bars_src");
+    GstElement* capsfilter = gst_element_factory_make("capsfilter", "test_bars_caps");
+    GstElement* convert = gst_element_factory_make("videoconvert", "test_bars_convert");
+    GstElement* encoder = gst_element_factory_make("x264enc", "test_bars_encoder");
+    GstElement* parser = gst_element_factory_make("h264parse", "test_bars_h264parse");
+    GstElement* mux = gst_element_factory_make("mpegtsmux", "test_bars_mux");
+    GstElement* queue = gst_element_factory_make("queue", "test_bars_queue");
+
+    if (!src || !capsfilter || !convert || !encoder || !parser || !mux || !queue) {
+        return nullptr;
+    }
+
+    if (!addElementOrFail(pipeline, src) ||
+        !addElementOrFail(pipeline, capsfilter) ||
+        !addElementOrFail(pipeline, convert) ||
+        !addElementOrFail(pipeline, encoder) ||
+        !addElementOrFail(pipeline, parser) ||
+        !addElementOrFail(pipeline, mux) ||
+        !addElementOrFail(pipeline, queue)) {
+        return nullptr;
+    }
+
+    GstCaps* caps = gst_caps_from_string("video/x-raw,width=1920,height=1080,framerate=25/1");
+    g_object_set(capsfilter, "caps", caps, nullptr);
+    gst_caps_unref(caps);
+
+    guint bitrateKbps = static_cast<guint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1000));
+    g_object_set(src,
+        "is-live", TRUE,
+        "pattern", 0,
+        nullptr);
+    g_object_set(encoder,
+        "bitrate", bitrateKbps,
+        "key-int-max", 50,
+        "bframes", 0,
+        nullptr);
+    g_object_set(parser, "config-interval", 1, nullptr);
+    g_object_set(mux, "alignment", 7, nullptr);
+    g_object_set(queue,
+        "max-size-buffers", 0,
+        "max-size-bytes", 0,
+        "max-size-time", 3000000000ULL,
+        nullptr);
+
+    if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, mux, queue, nullptr)) {
+        return nullptr;
+    }
+
+    terminalElement = queue;
+    return src;
+}
+
 bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail) {
     GstElement* tsparse = gst_element_factory_make("tsparse", "tsparse");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
@@ -387,16 +481,7 @@ bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement
         return false;
     }
 
-    g_object_set(sink,
-        "host", cfg.outputHost.c_str(),
-        "port", cfg.outputPort,
-        "async", FALSE,
-        "sync", FALSE,
-        nullptr);
-
-    if (!cfg.interfaceAddress.empty()) {
-        g_object_set(sink, "bind-address", cfg.interfaceAddress.c_str(), nullptr);
-    }
+    configureUdpSink(sink, cfg);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
@@ -433,16 +518,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         "max-size-time", 3000000000ULL,
         nullptr);
     g_object_set(mux, "alignment", 7, nullptr);
-    g_object_set(sink,
-        "host", state->config.outputHost.c_str(),
-        "port", state->config.outputPort,
-        "async", FALSE,
-        "sync", FALSE,
-        nullptr);
-
-    if (!state->config.interfaceAddress.empty()) {
-        g_object_set(sink, "bind-address", state->config.interfaceAddress.c_str(), nullptr);
-    }
+    configureUdpSink(sink, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
@@ -484,7 +560,16 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     GstElement* queue = gst_element_factory_make("queue", nullptr);
-    if (!queue) {
+    GstElement* parser = nullptr;
+    if (capsString.find("video/x-h264") != std::string::npos) {
+        parser = gst_element_factory_make("h264parse", nullptr);
+    } else if (capsString.find("audio/mpeg") != std::string::npos && capsString.find("mpegversion=(int)4") != std::string::npos) {
+        parser = gst_element_factory_make("aacparse", nullptr);
+    }
+
+    if (!queue || !parser) {
+        if (queue) gst_object_unref(queue);
+        if (parser) gst_object_unref(parser);
         return;
     }
 
@@ -494,8 +579,10 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
-    if (!gst_bin_add(GST_BIN(pipeline), queue)) {
-        gst_object_unref(queue);
+    if (!gst_bin_add(GST_BIN(pipeline), queue) ||
+        !gst_bin_add(GST_BIN(pipeline), parser)) {
+        if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+        if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
         gst_object_unref(pipeline);
         return;
     }
@@ -505,7 +592,16 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         "max-size-bytes", 0,
         "max-size-time", 3000000000ULL,
         nullptr);
+    if (G_OBJECT_TYPE_NAME(parser) && g_strcmp0(G_OBJECT_TYPE_NAME(parser), "GstH264Parse") == 0) {
+        g_object_set(parser, "config-interval", 1, nullptr);
+    }
     gst_element_sync_state_with_parent(queue);
+    gst_element_sync_state_with_parent(parser);
+
+    if (!gst_element_link(queue, parser)) {
+        gst_object_unref(pipeline);
+        return;
+    }
 
     GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
     if (!queueSinkPad) {
@@ -520,16 +616,16 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     gst_object_unref(queueSinkPad);
 
-    GstPad* queueSrcPad = gst_element_get_static_pad(queue, "src");
+    GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
     GstPad* muxSinkPad = gst_element_get_request_pad(ctx->mux, "sink_%u");
-    if (!queueSrcPad || !muxSinkPad) {
-        if (queueSrcPad) gst_object_unref(queueSrcPad);
+    if (!parserSrcPad || !muxSinkPad) {
+        if (parserSrcPad) gst_object_unref(parserSrcPad);
         if (muxSinkPad) gst_object_unref(muxSinkPad);
         gst_object_unref(pipeline);
         return;
     }
 
-    if (gst_pad_link(queueSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+    if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
         if (isVideo) {
             ctx->videoLinked = true;
         }
@@ -538,7 +634,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         }
     }
 
-    gst_object_unref(queueSrcPad);
+    gst_object_unref(parserSrcPad);
     gst_object_unref(muxSinkPad);
     gst_object_unref(pipeline);
 }
