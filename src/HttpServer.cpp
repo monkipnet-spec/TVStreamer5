@@ -461,7 +461,6 @@ window.onload = () => {
   loadInterfaces();
   setInterval(fetchState, 2000);
 };
-window.onclick = e => { if (e.target.id === 'modal') closeModal(); };
 </script>
 </body>
 </html>

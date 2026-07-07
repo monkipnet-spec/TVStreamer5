@@ -102,6 +102,59 @@ docker run --rm -it \
   tvstreamer5:local
 ```
 
+Run as a named background service:
+
+```bash
+docker run -d \
+  --name tvstreamer5 \
+  --restart unless-stopped \
+  --init \
+  --network host \
+  -v "$(pwd):/data" \
+  -w /data \
+  -e GST_DEBUG=1 \
+  tvstreamer5:local
+```
+
+Common Docker management commands:
+
+```bash
+# Show running containers
+docker ps
+
+# Show TVStreamer5 status
+docker ps --filter name=tvstreamer5
+
+# Follow logs
+docker logs -f tvstreamer5
+
+# Show the last 100 log lines
+docker logs --tail 100 tvstreamer5
+
+# Stop/start/restart
+docker stop tvstreamer5
+docker start tvstreamer5
+docker restart tvstreamer5
+
+# Remove the stopped container
+docker rm tvstreamer5
+
+# Rebuild the image after updating the source
+docker build -t tvstreamer5:local .
+
+# Recreate the container after rebuild
+docker stop tvstreamer5
+docker rm tvstreamer5
+docker run -d --name tvstreamer5 --restart unless-stopped --init --network host \
+  -v "$(pwd):/data" -w /data -e GST_DEBUG=1 tvstreamer5:local
+
+# Open a shell inside the running container
+docker exec -it tvstreamer5 bash
+
+# Check image/container disk usage
+docker system df
+```
+
 For UDP and multicast, `--network host` is the recommended mode. It gives the
 container access to the host network namespace, so TVStreamer5 can see all host
 interfaces and bind UDP input/output to the interface selected in the web UI.
