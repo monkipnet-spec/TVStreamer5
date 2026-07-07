@@ -231,7 +231,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = streamConfig.targetBitrate;
+    state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
@@ -810,10 +810,23 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
     gboolean inputAttached = FALSE;
     gboolean outputAttached = FALSE;
 
+    GstElement* inputQueue = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_queue");
+    if (inputQueue) {
+        GstPad* sinkPad = gst_element_get_static_pad(inputQueue, "sink");
+        if (sinkPad) {
+            gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, inputPadProbe, state, nullptr);
+            gst_object_unref(sinkPad);
+            inputAttached = TRUE;
+        }
+        gst_object_unref(inputQueue);
+    }
+
     while (gst_iterator_next(iterator, &item) == GST_ITERATOR_OK) {
         GstElement* element = GST_ELEMENT(g_value_get_object(&item));
-        const gchar* factoryName =
-            gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(gst_element_get_factory(element)));
+        GstElementFactory* factory = gst_element_get_factory(element);
+        const gchar* factoryName = factory
+            ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
+            : nullptr;
 
         if (!inputAttached && factoryName &&
             (g_strcmp0(factoryName, "srtsrc") == 0 ||
