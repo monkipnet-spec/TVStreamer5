@@ -226,8 +226,15 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .tile .info-row strong{color:#fff;font-size:.78rem}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
 .tile .controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
-.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:.78rem;cursor:pointer;transition:background .2s ease}
+.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:.78rem;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
+.tile .controls button:active{transform:translateY(1px) scale(.98)}
+.tile .controls .start-button{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.26)}
+.tile .controls .start-button:hover{background:rgba(23,194,97,.28)}
+.tile .controls .stop-button{background:rgba(255,95,95,.18);color:#ffc2c2;box-shadow:inset 0 0 0 1px rgba(255,95,95,.28)}
+.tile .controls .stop-button:hover{background:rgba(255,95,95,.28)}
+.tile .controls .copy-button.copied{background:rgba(31,139,255,.32);color:#fff;box-shadow:0 0 0 2px rgba(31,139,255,.24)}
+.tile .controls .copy-button.copy-error{background:rgba(255,184,77,.24);color:#ffe0a3;box-shadow:0 0 0 2px rgba(255,184,77,.22)}
 .modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(8,10,15,.78);display:none;align-items:center;justify-content:center;padding:12px;z-index:20}
 .modal.active{display:flex}
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
@@ -309,9 +316,9 @@ function render() {
         <div class="info-row"><strong>Статус</strong><span>${stream.status}</span></div>
       </div>
       <div class="controls">
-        <button onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Стоп' : 'Старт'}</button>
+        <button class="${stream.active ? 'stop-button' : 'start-button'}" onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Стоп' : 'Старт'}</button>
         <button onclick="editStream('${stream.id}')">Ред.</button>
-        <button onclick="copyLink('${stream.vlc_link}')">URL Out</button>
+        <button class="copy-button" onclick="copyLink('${stream.vlc_link}', this)">URL Out</button>
       </div>`;
     tiles.appendChild(tile);
   });
@@ -447,8 +454,52 @@ function saveStream(id) {
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(savePayload)})
     .then(()=>{closeModal();fetchState();});
 }
-function copyLink(text) {
-  navigator.clipboard.writeText(text);
+function setCopyButtonState(button, label, className) {
+  if (!button) return;
+  const originalText = button.dataset.originalText || button.textContent;
+  button.dataset.originalText = originalText;
+  button.textContent = label;
+  button.classList.remove('copied', 'copy-error');
+  button.classList.add(className);
+  clearTimeout(button.copyStateTimer);
+  button.copyStateTimer = setTimeout(() => {
+    button.textContent = originalText;
+    button.classList.remove('copied', 'copy-error');
+  }, 1400);
+}
+function fallbackCopyText(text) {
+  const input = document.createElement('textarea');
+  input.value = text;
+  input.setAttribute('readonly', '');
+  input.style.position = 'fixed';
+  input.style.left = '-9999px';
+  input.style.top = '0';
+  document.body.appendChild(input);
+  input.focus();
+  input.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } finally {
+    document.body.removeChild(input);
+  }
+  return ok;
+}
+function copyLink(text, button) {
+  const onSuccess = () => setCopyButtonState(button, 'Скопировано', 'copied');
+  const onError = () => {
+    if (fallbackCopyText(text)) {
+      onSuccess();
+    } else {
+      setCopyButtonState(button, 'Ошибка', 'copy-error');
+    }
+  };
+
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(onSuccess).catch(onError);
+  } else {
+    onError();
+  }
 }
 function loadInterfaces() {
   return fetch('/api/interfaces')
