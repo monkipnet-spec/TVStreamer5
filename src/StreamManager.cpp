@@ -79,7 +79,14 @@ std::string interfaceNameForAddress(const std::string& address) {
     return "";
 }
 
+std::string interfaceNameOrAddress(const std::string& address) {
+    const std::string ifaceName = interfaceNameForAddress(address);
+    return ifaceName.empty() ? address : ifaceName;
+}
+
 void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
+    const bool multicastOutput = isMulticastHost(cfg.outputHost);
+
     g_object_set(sink,
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
@@ -87,18 +94,13 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "sync", cfg.cbr ? TRUE : FALSE,
         nullptr);
 
-    if (!cfg.interfaceAddress.empty()) {
+    if (!cfg.interfaceAddress.empty() && !multicastOutput) {
         setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
     }
 
-    if (isMulticastHost(cfg.outputHost)) {
+    if (multicastOutput) {
         g_object_set(sink, "auto-multicast", TRUE, nullptr);
-        const std::string ifaceName = interfaceNameForAddress(cfg.interfaceAddress);
-        if (!ifaceName.empty()) {
-            setStringPropertyIfPresent(sink, "multicast-iface", ifaceName);
-        } else if (!cfg.interfaceAddress.empty()) {
-            setStringPropertyIfPresent(sink, "multicast-iface", cfg.interfaceAddress);
-        }
+        setStringPropertyIfPresent(sink, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress));
     }
 }
 
@@ -546,9 +548,7 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
             nullptr);
 
         if (isMulticastHost(host) && !cfg.interfaceAddress.empty()) {
-            g_object_set(src, "multicast-iface", cfg.interfaceAddress.c_str(), nullptr);
-        } else if (!isMulticastHost(host) && !cfg.interfaceAddress.empty() && host == "0.0.0.0") {
-            g_object_set(src, "address", cfg.interfaceAddress.c_str(), nullptr);
+            g_object_set(src, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress).c_str(), nullptr);
         }
 
         if (toLower(match[1].str()) == "rtp") {
