@@ -114,9 +114,9 @@ std::string HttpServer::currentState() {
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     Json::Value streams(Json::arrayValue);
+    auto snap = streamManager.snapshot();
     for (const auto& cfg : configManager.config.streams) {
         Json::Value item = cfg.toJson();
-        auto snap = streamManager.snapshot();
         if (snap.count(cfg.id)) {
             item["active"] = true;
             item["status"] = snap.at(cfg.id)->statusMessage;
@@ -321,7 +321,10 @@ function toggleStream(id, active) {
   const url = active ? '/api/stop-stream' : '/api/start-stream';
   const body = active ? {id} : state.streams.find(s=>s.id===id);
   fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(()=>setTimeout(fetchState,500));
+    .then(()=>{
+      setTimeout(fetchState,500);
+      setTimeout(fetchState,1500);
+    });
 }
 function editStream(id) {
   const stream = state.streams.find(s=>s.id===id);
@@ -454,7 +457,11 @@ function loadInterfaces() {
     .then(data=>{ state.interfaces=data; return data; })
     .catch(() => { state.interfaces=[]; return []; });
 }
-window.onload = () => { fetchState(); loadInterfaces(); };
+window.onload = () => {
+  fetchState();
+  loadInterfaces();
+  setInterval(fetchState, 2000);
+};
 window.onclick = e => { if (e.target.id === 'modal') closeModal(); };
 </script>
 </body>

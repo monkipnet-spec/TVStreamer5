@@ -90,6 +90,76 @@ The run script uses `--network host` so SRT, UDP, RTP, multicast, and the web UI
 can use the host network directly. The application reads
 `tvstreamer5-config.json` from the mounted project directory.
 
+Equivalent direct Docker command:
+
+```bash
+docker run --rm -it \
+  --init \
+  --network host \
+  -v "$(pwd):/data" \
+  -w /data \
+  -e GST_DEBUG=1 \
+  tvstreamer5:local
+```
+
+For UDP and multicast, `--network host` is the recommended mode. It gives the
+container access to the host network namespace, so TVStreamer5 can see all host
+interfaces and bind UDP input/output to the interface selected in the web UI.
+Avoid Docker bridge port mappings for MPEG-TS UDP/multicast; they usually add
+loss, jitter, or do not forward multicast correctly.
+
+Recommended host network tuning for high-bitrate UDP:
+
+```bash
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.wmem_max=67108864
+sudo sysctl -w net.core.rmem_default=8388608
+sudo sysctl -w net.core.wmem_default=8388608
+sudo sysctl -w net.ipv4.udp_rmem_min=131072
+sudo sysctl -w net.ipv4.udp_wmem_min=131072
+sudo sysctl -w net.core.netdev_max_backlog=50000
+```
+
+Persist the tuning after reboot:
+
+```bash
+sudo tee /etc/sysctl.d/99-tvstreamer5-udp.conf >/dev/null <<'EOF'
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=8388608
+net.core.wmem_default=8388608
+net.ipv4.udp_rmem_min=131072
+net.ipv4.udp_wmem_min=131072
+net.core.netdev_max_backlog=50000
+EOF
+sudo sysctl --system
+```
+
+For multicast receive/transmit on a selected interface, replace `eth0` with the
+real interface name shown by `ip -br addr`:
+
+```bash
+ip -br addr
+sudo ip link set dev eth0 multicast on
+sudo ip route replace 224.0.0.0/4 dev eth0
+sudo sysctl -w net.ipv4.conf.eth0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+```
+
+If several interfaces are used for different streams, repeat the `ip link` and
+`rp_filter` commands for each interface. Add only one broad multicast route if
+all multicast should leave through one default interface; otherwise let
+TVStreamer5 select the output interface in the stream settings.
+
+Useful checks while testing:
+
+```bash
+ip -br addr
+ip route get 239.1.1.1
+ss -u -n -a
+sudo tcpdump -ni eth0 udp port 1234
+```
+
 Optional variables:
 
 ```bash

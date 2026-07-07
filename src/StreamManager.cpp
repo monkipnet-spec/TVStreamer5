@@ -65,22 +65,53 @@ bool isMulticastHost(const std::string& host) {
     return std::regex_search(host, re);
 }
 
+std::string interfaceNameForAddress(const std::string& address) {
+    if (address.empty()) {
+        return "";
+    }
+
+    for (const auto& iface : enumerateNetworkInterfaces()) {
+        if (iface.address == address) {
+            return iface.name;
+        }
+    }
+
+    return "";
+}
+
 void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
     g_object_set(sink,
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
         "async", FALSE,
-        "sync", FALSE,
+        "sync", cfg.cbr ? TRUE : FALSE,
         nullptr);
+
+    if (!cfg.interfaceAddress.empty()) {
+        setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
+    }
 
     if (isMulticastHost(cfg.outputHost)) {
         g_object_set(sink, "auto-multicast", TRUE, nullptr);
-        if (!cfg.interfaceAddress.empty()) {
-            g_object_set(sink, "multicast-iface", cfg.interfaceAddress.c_str(), nullptr);
+        const std::string ifaceName = interfaceNameForAddress(cfg.interfaceAddress);
+        if (!ifaceName.empty()) {
+            setStringPropertyIfPresent(sink, "multicast-iface", ifaceName);
+        } else if (!cfg.interfaceAddress.empty()) {
+            setStringPropertyIfPresent(sink, "multicast-iface", cfg.interfaceAddress);
         }
-    } else if (!cfg.interfaceAddress.empty()) {
-        g_object_set(sink, "bind-address", cfg.interfaceAddress.c_str(), nullptr);
     }
+}
+
+void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
+    if (!queue) {
+        return;
+    }
+
+    g_object_set(queue,
+        "max-size-buffers", 0,
+        "max-size-bytes", 0,
+        "max-size-time", maxSizeTime,
+        nullptr);
 }
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
@@ -392,7 +423,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     bool ok = false;
-    if (cfg.remapEnabled) {
+    if (cfg.remapEnabled || cfg.cbr) {
         if (!state->remapContext) {
             state->remapContext = std::make_unique<RemapContext>();
         }
@@ -420,11 +451,7 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
         if (!addElementOrFail(pipeline, queue)) {
             return nullptr;
         }
-        g_object_set(queue,
-            "max-size-buffers", 0,
-            "max-size-bytes", 0,
-            "max-size-time", maxSizeTime,
-            nullptr);
+        configureQueue(queue, maxSizeTime);
         return queue;
     };
 
@@ -611,11 +638,7 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
         nullptr);
     g_object_set(parser, "config-interval", 1, nullptr);
     configureTsMux(mux, cfg);
-    g_object_set(queue,
-        "max-size-buffers", 0,
-        "max-size-bytes", 0,
-        "max-size-time", 3000000000ULL,
-        nullptr);
+    configureQueue(queue);
 
     if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, mux, queue, nullptr)) {
         return nullptr;
@@ -641,6 +664,7 @@ bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement
     }
 
     configureUdpSink(sink, cfg);
+    configureQueue(queue);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
@@ -658,8 +682,9 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
+    GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
     GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
-    if (!tsparse || !preDemuxQueue || !demux || !mux || !sink) {
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
         return false;
     }
 
@@ -667,15 +692,13 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
+        !addElementOrFail(pipeline, outputQueue) ||
         !addElementOrFail(pipeline, sink)) {
         return false;
     }
 
-    g_object_set(preDemuxQueue,
-        "max-size-buffers", 0,
-        "max-size-bytes", 0,
-        "max-size-time", 3000000000ULL,
-        nullptr);
+    configureQueue(preDemuxQueue);
+    configureQueue(outputQueue);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
     configureUdpSink(sink, state->config);
@@ -683,7 +706,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    if (!gst_element_link(mux, sink)) {
+    if (!gst_element_link_many(mux, outputQueue, sink, nullptr)) {
         return false;
     }
 
@@ -744,11 +767,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
-    g_object_set(queue,
-        "max-size-buffers", 0,
-        "max-size-bytes", 0,
-        "max-size-time", 3000000000ULL,
-        nullptr);
+    configureQueue(queue);
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", 1, nullptr);
     }
@@ -879,10 +898,10 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
-    state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
-
-    if (state->config.cbr && state->outputBitrate.load() == 0 && state->config.targetBitrate > 0) {
+    if (state->config.cbr && state->config.targetBitrate > 0) {
         state->outputBitrate = state->config.targetBitrate;
+    } else {
+        state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
     }
 
     state->lastInputBytesSample = currentInputBytes;
