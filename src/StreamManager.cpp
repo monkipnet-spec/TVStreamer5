@@ -16,7 +16,9 @@
 namespace {
 
 constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
-constexpr guint64 kCbrInitialLatencyNs = 50 * GST_MSECOND;
+constexpr guint64 kCbrInitialLatencyNs = 100 * GST_MSECOND;
+constexpr guint64 kCbrMaxLateNs = 25 * GST_MSECOND;
+constexpr guint64 kCbrMaxAheadNs = 500 * GST_MSECOND;
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -63,6 +65,12 @@ void setUInt64PropertyIfPresent(GstElement* element, const char* propertyName, g
     }
 }
 
+void setInt64PropertyIfPresent(GstElement* element, const char* propertyName, gint64 value) {
+    if (hasProperty(element, propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
 void setStringPropertyIfPresent(GstElement* element, const char* propertyName, const std::string& value) {
     if (hasProperty(element, propertyName) && !value.empty()) {
         g_object_set(element, propertyName, value.c_str(), nullptr);
@@ -100,12 +108,14 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
         "async", FALSE,
-        "sync", cfg.cbr ? TRUE : FALSE,
+        "sync", FALSE,
         "buffer-size", kUdpSocketBufferSize,
         nullptr);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate));
+        setBooleanPropertyIfPresent(sink, "qos", FALSE);
+        setInt64PropertyIfPresent(sink, "max-lateness", -1);
     }
 
     if (!cfg.interfaceAddress.empty() && !multicastOutput) {
@@ -302,6 +312,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->active = true;
     state->statusMessage = "starting";
     state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
+    attachBitrateProbes(state.get());
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
@@ -340,7 +351,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
 
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
     streams[streamConfig.id] = std::move(state);
-    attachBitrateProbes(streams[streamConfig.id].get());
     streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
     telegramNotifier.sendMessage("Stream started: " + streamConfig.name);
     return true;
@@ -639,6 +649,10 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
                 return nullptr;
             }
         } else {
+            GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+            g_object_set(src, "caps", caps, nullptr);
+            gst_caps_unref(caps);
+
             if (!gst_element_link(src, queue)) {
                 return nullptr;
             }
@@ -1022,6 +1036,21 @@ GstPadProbeReturn StreamManager::cbrPacingPadProbe(GstPad* pad, GstPadProbeInfo*
     const guint64 bits = static_cast<guint64>(size) * 8ULL;
     guint64 ptsNs = 0;
     guint64 durationNs = 1;
+    bool canWait = false;
+    GstClockTime targetClockTime = GST_CLOCK_TIME_NONE;
+    GstClockTime nowClockTime = GST_CLOCK_TIME_NONE;
+    GstClock* clock = nullptr;
+    GstElement* element = GST_ELEMENT(gst_pad_get_parent(pad));
+    GstClockTime baseTime = GST_CLOCK_TIME_NONE;
+
+    if (element) {
+        clock = gst_element_get_clock(element);
+        baseTime = gst_element_get_base_time(element);
+        if (clock && GST_CLOCK_TIME_IS_VALID(baseTime)) {
+            nowClockTime = gst_clock_get_time(clock);
+            canWait = GST_CLOCK_TIME_IS_VALID(nowClockTime) && nowClockTime >= baseTime;
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(state->cbrMutex);
@@ -1032,27 +1061,47 @@ GstPadProbeReturn StreamManager::cbrPacingPadProbe(GstPad* pad, GstPadProbeInfo*
         state->cbrDurationRemainder = static_cast<uint64_t>(scaledDuration % targetBitrate);
         durationNs = std::max<guint64>(durationNs, 1);
 
-        if (!state->cbrPacingStarted) {
-            GstElement* element = GST_ELEMENT(gst_pad_get_parent(pad));
-            if (element) {
-                GstClock* clock = gst_element_get_clock(element);
-                const GstClockTime baseTime = gst_element_get_base_time(element);
-                if (clock && GST_CLOCK_TIME_IS_VALID(baseTime)) {
-                    const GstClockTime now = gst_clock_get_time(clock);
-                    if (GST_CLOCK_TIME_IS_VALID(now) && now >= baseTime) {
-                        state->cbrNextPtsNs = static_cast<uint64_t>(now - baseTime + kCbrInitialLatencyNs);
-                    }
-                }
-                if (clock) {
-                    gst_object_unref(clock);
-                }
-                gst_object_unref(element);
+        if (canWait) {
+            const guint64 nowRunningNs = static_cast<guint64>(nowClockTime - baseTime);
+            const bool scheduleIsLate =
+                state->cbrPacingStarted && state->cbrNextPtsNs + kCbrMaxLateNs < nowRunningNs;
+            const bool scheduleIsTooFarAhead =
+                state->cbrPacingStarted && state->cbrNextPtsNs > nowRunningNs + kCbrMaxAheadNs;
+
+            if (!state->cbrPacingStarted || scheduleIsLate || scheduleIsTooFarAhead) {
+                state->cbrNextPtsNs = nowRunningNs + kCbrInitialLatencyNs;
+                state->cbrDurationRemainder = 0;
             }
+        } else if (!state->cbrPacingStarted) {
+            state->cbrNextPtsNs = 0;
+            state->cbrDurationRemainder = 0;
+        }
+
+        if (!state->cbrPacingStarted) {
             state->cbrPacingStarted = true;
         }
 
         ptsNs = state->cbrNextPtsNs;
         state->cbrNextPtsNs += durationNs;
+
+        if (canWait) {
+            targetClockTime = baseTime + ptsNs;
+        }
+    }
+
+    if (canWait && GST_CLOCK_TIME_IS_VALID(targetClockTime) && targetClockTime > nowClockTime) {
+        GstClockID clockId = gst_clock_new_single_shot_id(clock, targetClockTime);
+        if (clockId) {
+            gst_clock_id_wait(clockId, nullptr);
+            gst_clock_id_unref(clockId);
+        }
+    }
+
+    if (clock) {
+        gst_object_unref(clock);
+    }
+    if (element) {
+        gst_object_unref(element);
     }
 
     buffer = gst_buffer_make_writable(buffer);

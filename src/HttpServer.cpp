@@ -362,23 +362,23 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .stats-panel .status strong{color:#fff;font-size:.78rem}
 .stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
-.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:130px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease}
+.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:130px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
 .tile.error{border-color:#fb5f5f}
 .tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px}
-.tile .title{font-size:.84rem;font-weight:700;line-height:1.2;color:#fff}
-.tile .badge{padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:.64rem;text-transform:uppercase;letter-spacing:.08em}
-.tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:.64rem;text-transform:uppercase;letter-spacing:.08em}
+.tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff}
+.tile .badge{padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
-.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:.78rem;color:#b3b8c6}
+.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6}
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
-.tile .info-row strong{color:#fff;font-size:.78rem}
+.tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
 .tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
-.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:.78rem;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
+.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:11px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
 .tile .controls .start-button{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.26)}
