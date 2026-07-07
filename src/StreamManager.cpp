@@ -20,6 +20,8 @@ constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
 constexpr guint64 kCbrInitialLatencyNs = 100 * GST_MSECOND;
 constexpr guint64 kCbrMaxLateNs = 25 * GST_MSECOND;
 constexpr guint64 kCbrMaxAheadNs = 500 * GST_MSECOND;
+constexpr auto kInputFailoverDelay = std::chrono::seconds(2);
+constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -112,6 +114,24 @@ std::string outputType(const StreamConfig& cfg) {
 
 std::string hlsDirectory(const StreamConfig& cfg) {
     return "/tmp/tvstreamer5-hls/" + cfg.id;
+}
+
+std::string telegramEscape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '&': escaped += "&amp;"; break;
+            case '<': escaped += "&lt;"; break;
+            case '>': escaped += "&gt;"; break;
+            default: escaped.push_back(ch); break;
+        }
+    }
+    return escaped;
+}
+
+std::string displayName(const StreamConfig& cfg) {
+    return cfg.name.empty() ? cfg.id : cfg.name;
 }
 
 void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
@@ -335,6 +355,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
 
     auto state = std::make_unique<StreamState>();
     state->config = streamConfig;
+    state->primaryInputUri = streamConfig.inputUri;
+    state->activeInputUri = streamConfig.inputUri;
     if (streamConfig.remapEnabled) {
         state->remapContext = std::make_unique<RemapContext>();
         state->remapContext->config = streamConfig;
@@ -355,6 +377,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->active = true;
     state->statusMessage = "starting";
     state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
+    state->lastInputActivity = std::chrono::steady_clock::now();
+    state->lastPrimaryRetry = state->lastInputActivity;
     attachBitrateProbes(state.get());
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -395,7 +419,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
     streams[streamConfig.id] = std::move(state);
     streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
-    telegramNotifier.sendMessage("Stream started: " + streamConfig.name);
+    notifyStreamState(streamConfig, "🟢", "Поток запущен", "Источник: основной\nURL: " + streamConfig.inputUri);
     return true;
 }
 
@@ -406,6 +430,7 @@ bool StreamManager::stopStream(const std::string& id) {
     }
 
     auto& state = *streams[id];
+    const StreamConfig stoppedConfig = state.config;
     state.running = false;
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
@@ -426,7 +451,7 @@ bool StreamManager::stopStream(const std::string& id) {
     state.remapContext.reset();
 
     streams.erase(id);
-    telegramNotifier.sendMessage("Stream stopped: " + id);
+    notifyStreamState(stoppedConfig, "⚪", "Поток остановлен", "Остановлен вручную");
     return true;
 }
 
@@ -526,6 +551,89 @@ bool StreamManager::addHttpClient(const std::string& id, int fd) {
     g_signal_emit_by_name(sink, "add", fd);
     gst_object_unref(sink);
     return true;
+}
+
+void StreamManager::notifyStreamState(
+    const StreamConfig& cfg,
+    const std::string& color,
+    const std::string& title,
+    const std::string& details) {
+    std::ostringstream message;
+    message << color << " <b>" << telegramEscape(title) << "</b>\n"
+            << "Канал: <b>" << telegramEscape(displayName(cfg)) << "</b>\n"
+            << "ID: <code>" << telegramEscape(cfg.id) << "</code>";
+    if (!details.empty()) {
+        message << "\n" << telegramEscape(details);
+    }
+    telegramNotifier.sendMessage(message.str());
+}
+
+bool StreamManager::restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup) {
+    if (!state || inputUri.empty()) {
+        return false;
+    }
+
+    GstElement* oldPipeline = state->pipeline;
+    GstBus* oldBus = state->bus;
+
+    if (oldPipeline) {
+        gst_element_set_state(oldPipeline, GST_STATE_NULL);
+    }
+
+    state->config.inputUri = inputUri;
+    state->remapContext.reset();
+    if (state->config.remapEnabled || state->config.cbr) {
+        state->remapContext = std::make_unique<RemapContext>();
+        state->remapContext->config = state->config;
+    }
+
+    GstElement* newPipeline = createPipeline(state);
+    if (!newPipeline) {
+        state->pipeline = oldPipeline;
+        state->bus = oldBus;
+        state->statusMessage = "error: restart failed";
+        if (oldPipeline) {
+            gst_element_set_state(oldPipeline, GST_STATE_PLAYING);
+        }
+        return false;
+    }
+
+    GstBus* newBus = gst_element_get_bus(newPipeline);
+    state->pipeline = newPipeline;
+    state->bus = newBus;
+    state->usingBackup = useBackup;
+    state->backupAttempted = useBackup;
+    state->primaryRetryPending = !useBackup;
+    state->inputLossNotified = false;
+    state->activeInputUri = inputUri;
+    state->active = true;
+    state->statusMessage = useBackup ? "running on backup" : "running on primary";
+    state->inputBytes = 0;
+    state->outputBytes = 0;
+    state->inputBitrate = 0;
+    state->lastInputBytesSample = 0;
+    state->lastOutputBytesSample = 0;
+    state->lastInputBytesSeen = 0;
+    state->lastInputActivity = std::chrono::steady_clock::now();
+    state->lastPrimaryRetry = state->lastInputActivity;
+    state->cbrPacingStarted = false;
+    state->cbrNextPtsNs = 0;
+    state->cbrDurationRemainder = 0;
+    attachBitrateProbes(state);
+
+    GstStateChangeReturn ret = gst_element_set_state(newPipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        state->statusMessage = "error: restart playback failed";
+        state->active = false;
+    }
+
+    if (oldBus) {
+        gst_object_unref(oldBus);
+    }
+    if (oldPipeline) {
+        gst_object_unref(oldPipeline);
+    }
+    return ret != GST_STATE_CHANGE_FAILURE;
 }
 
 GstElement* StreamManager::createPipeline(StreamState* state) {
@@ -1259,7 +1367,90 @@ void StreamManager::monitorBus(const std::string& id) {
     StreamState* state = found->second.get();
     GstBus* bus = state->bus;
     while (state->running.load()) {
-        GstMessage* msg = gst_bus_timed_pop(bus, 1000000000LL);
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t currentInputBytes = state->inputBytes.load();
+        if (currentInputBytes != state->lastInputBytesSeen) {
+            state->lastInputBytesSeen = currentInputBytes;
+            state->lastInputActivity = now;
+            if (state->inputLossNotified && !state->usingBackup && !state->primaryRetryPending) {
+                state->statusMessage = "running";
+                notifyStreamState(
+                    state->config,
+                    "🟢",
+                    "Входной сигнал восстановлен",
+                    "Активный источник: основной\nURL: " + state->activeInputUri);
+            }
+            state->inputLossNotified = false;
+            if (state->primaryRetryPending && !state->usingBackup) {
+                state->primaryRetryPending = false;
+                state->backupAttempted = false;
+                state->statusMessage = "running on primary";
+                notifyStreamState(
+                    state->config,
+                    "🟢",
+                    "Основной поток восстановлен",
+                    "Активный источник: основной\nURL: " + state->activeInputUri);
+            }
+        }
+
+        const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
+        if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
+                notifyStreamState(
+                    state->config,
+                    "🟡",
+                    "Основной поток пропал",
+                    "Нет входных данных 2 секунды\nПереключаюсь на резерв\nBackup: " + state->config.backupInputUri);
+            if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                bus = state->bus;
+                state->inputLossNotified = false;
+                notifyStreamState(
+                    state->config,
+                    "🟠",
+                    "Работаю с резервного источника",
+                    "Активный источник: резерв\nURL: " + state->activeInputUri);
+            } else {
+                state->inputLossNotified = true;
+                notifyStreamState(
+                    state->config,
+                    "🔴",
+                    "Не удалось включить резерв",
+                    "Backup pipeline не стартовал\nBackup: " + state->config.backupInputUri);
+            }
+        } else if (state->usingBackup && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+            const std::string primaryUri = state->primaryInputUri;
+
+            if (!primaryUri.empty()) {
+                notifyStreamState(
+                    state->config,
+                    "🔵",
+                    "Проверяю основной источник",
+                    "Временно возвращаюсь на основной URL\nURL: " + primaryUri);
+                if (restartPipelineWithInput(state, primaryUri, false)) {
+                    bus = state->bus;
+                    state->inputLossNotified = false;
+                }
+            }
+        } else if (inputTimedOut && !state->usingBackup && state->primaryRetryPending && !state->config.backupInputUri.empty()) {
+            notifyStreamState(
+                state->config,
+                "🟡",
+                "Основной пока недоступен",
+                "Возвращаюсь на резервный источник\nBackup: " + state->config.backupInputUri);
+            if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                bus = state->bus;
+                state->inputLossNotified = false;
+            }
+        } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
+            state->inputLossNotified = true;
+            state->statusMessage = "no input signal";
+            notifyStreamState(
+                state->config,
+                "🔴",
+                "Нет входного сигнала",
+                "Входных данных нет 2 секунды\nРезервная ссылка не задана\nURL: " + state->activeInputUri);
+        }
+
+        GstMessage* msg = gst_bus_timed_pop(bus, 500000000LL);
         if (!msg) {
             continue;
         }
@@ -1277,14 +1468,14 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: " + message;
                 state->active = false;
-                telegramNotifier.sendMessage("Stream error: " + found->first + " -> " + message);
+                notifyStreamState(state->config, "🔴", "Ошибка потока", "Причина: " + message);
                 gst_message_unref(msg);
                 return;
             }
             case GST_MESSAGE_EOS:
                 state->statusMessage = "ended";
                 state->active = false;
-                telegramNotifier.sendMessage("Stream ended: " + found->first);
+                notifyStreamState(state->config, "⚫", "Поток завершился", "GStreamer получил EOS");
                 gst_message_unref(msg);
                 return;
             default:

@@ -1,7 +1,8 @@
 # TVStreamer5
 
-TVStreamer5 receives SRT/HTTP/UDP/RTP MPEG-TS streams, optionally remaps
-service/PID metadata, and outputs MPEG-TS over UDP.
+TVStreamer5 receives SRT/HTTP/HLS/UDP/RTP MPEG-TS streams, optionally remaps
+service/PID metadata, monitors input quality, switches to a backup source when
+the primary source disappears, and outputs streams as UDP, SRT, HTTP TS, or HLS.
 
 ## Build on the Host
 
@@ -19,7 +20,9 @@ http://localhost:9000
 ```
 
 The default config file is `tvstreamer5-config.json` in the current working
-directory.
+directory. The web UI is the recommended way to edit streams because it exposes
+input/output interfaces, output format, CBR, PID remap, Telegram settings, and
+backup source status in one place.
 
 ## Install on Linux
 
@@ -86,9 +89,11 @@ chmod +x scripts/build_container.sh scripts/run_container.sh
 ./scripts/run_container.sh
 ```
 
-The run script uses `--network host` so SRT, UDP, RTP, multicast, and the web UI
-can use the host network directly. The application reads
-`tvstreamer5-config.json` from the mounted project directory.
+The run script uses `--network host` so SRT, UDP, RTP, multicast, HTTP TS, HLS,
+and the web UI can use the host network directly. The application reads
+`tvstreamer5-config.json` from `/data` inside the container. If `CONFIG_FILE`
+points to a file with a different name, the run script mounts it as
+`/data/tvstreamer5-config.json` automatically.
 
 Equivalent direct Docker command:
 
@@ -155,11 +160,12 @@ docker exec -it tvstreamer5 bash
 docker system df
 ```
 
-For UDP and multicast, `--network host` is the recommended mode. It gives the
-container access to the host network namespace, so TVStreamer5 can see all host
-interfaces and bind UDP input/output to the interface selected in the web UI.
-Avoid Docker bridge port mappings for MPEG-TS UDP/multicast; they usually add
-loss, jitter, or do not forward multicast correctly.
+For UDP, SRT listener mode, HTTP TS, HLS, and multicast, `--network host` is the
+recommended mode. It gives the container access to the host network namespace,
+so TVStreamer5 can see all host interfaces and bind input/output to the
+interface selected in the web UI. Avoid Docker bridge port mappings for
+MPEG-TS UDP/multicast; they usually add loss, jitter, or do not forward
+multicast correctly.
 
 Recommended host network tuning for high-bitrate UDP:
 
@@ -242,6 +248,101 @@ listener
 auto
 ```
 
+## Output Formats
+
+Each stream has an `output_type` field. Existing configs without this field are
+treated as `udp`.
+
+```text
+udp   MPEG-TS over UDP unicast or multicast
+srt   MPEG-TS over SRT
+http  MPEG-TS over HTTP at /stream/<stream-id>.ts
+hls   HLS playlist at /hls/<stream-id>/playlist.m3u8
+```
+
+Examples of player URLs shown by the UI:
+
+```text
+udp://@239.1.1.1:1234
+srt://192.168.1.20:9000
+http://192.168.1.20:9000/stream/channel-1.ts
+http://192.168.1.20:9000/hls/channel-1/playlist.m3u8
+```
+
+Output host and port meaning depends on the selected format:
+
+```text
+UDP:  output_host is the unicast/multicast destination, output_port is UDP port.
+SRT:  output_host is the SRT destination. Use 0.0.0.0 for listener mode.
+HTTP: output_host is the address advertised in the player URL; port is web UI port.
+HLS:  output_host is the address advertised in the player URL; port is web UI port.
+```
+
+The web UI lets you choose the output interface. For UDP multicast it is used as
+the multicast interface. For UDP unicast it is used as the bind address. For SRT
+it is used as the local address when supported by the GStreamer SRT plugin.
+
+## Backup Failover
+
+Set `backup_input_uri` to enable source failover. If the active input produces no
+data for 2 seconds, TVStreamer5 switches from the primary input to the backup
+input. While running on backup, it periodically checks the primary source and
+switches back automatically when data appears again.
+
+The stream tile shows the currently active input:
+
+```text
+Активный вход: Основной · udp://...
+Активный вход: Резерв · srt://...
+```
+
+The tile status changes to `Backup` while the backup URL is active.
+
+## Telegram Notifications
+
+Configure `telegram_token` and `telegram_chat_id` in the web UI or config file
+to enable notifications. Messages use Telegram HTML formatting and colored
+status indicators:
+
+```text
+🟢 Поток запущен / основной восстановлен
+🟡 Основной поток пропал / идет переключение
+🟠 Поток работает с резервного источника
+🔵 Проверка основного источника
+🔴 Ошибка потока или нет входного сигнала
+⚫ GStreamer EOS
+⚪ Поток остановлен вручную
+```
+
+Notifications include the stream name, stream ID, human-readable reason, and the
+active URL when applicable.
+
 For remapping, enable `remap_enabled` and set `video_pid`, `audio_pid`,
 `service_id`, `service_name`, and `service_provider` in `tvstreamer5-config.json`
 or through the web UI.
+
+## Important Config Fields
+
+Minimal stream object:
+
+```json
+{
+  "id": "channel-1",
+  "name": "Channel 1",
+  "input_uri": "udp://@:1234",
+  "backup_input_uri": "srt://192.168.1.10:9000",
+  "input_mode": "auto",
+  "output_type": "udp",
+  "output_host": "239.1.1.1",
+  "output_port": 1234,
+  "interface_address": "",
+  "cbr": true,
+  "target_bitrate": 7000000,
+  "remap_enabled": false,
+  "video_pid": 0,
+  "audio_pid": 0,
+  "service_id": 1,
+  "service_name": "",
+  "service_provider": ""
+}
+```

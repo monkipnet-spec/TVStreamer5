@@ -24,6 +24,8 @@ void TelegramNotifier::sendMessage(const std::string& text) {
         << curl_easy_escape(curl, config.telegramToken.c_str(), 0)
         << "/sendMessage?chat_id="
         << curl_easy_escape(curl, config.telegramChatId.c_str(), 0)
+        << "&parse_mode=HTML"
+        << "&disable_web_page_preview=true"
         << "&text=" << curl_easy_escape(curl, text.c_str(), 0);
 
     curl_easy_setopt(curl, CURLOPT_URL, url.str().c_str());

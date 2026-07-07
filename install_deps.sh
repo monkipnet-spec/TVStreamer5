@@ -12,7 +12,11 @@ sudo apt-get install -y \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-good1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
     libgstrtspserver-1.0-dev \
     libcurl4-openssl-dev \
     libjsoncpp-dev \
@@ -28,4 +32,4 @@ sudo apt-get install -y \
 
 sudo apt-get clean
 
-echo "Dependencies installed. Build with: mkdir -p build && cd build && cmake .. && make -j4"
+echo "Dependencies installed. Build with: cmake -S . -B build && cmake --build build --parallel"

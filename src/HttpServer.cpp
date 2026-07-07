@@ -199,13 +199,20 @@ std::string HttpServer::currentState() {
     for (const auto& cfg : configManager.config.streams) {
         Json::Value item = cfg.toJson();
         if (snap.count(cfg.id)) {
-            item["active"] = true;
-            item["status"] = snap.at(cfg.id)->statusMessage;
-            item["bitrate_in_kbps"] = Json::UInt64(snap.at(cfg.id)->inputBitrate.load() / 1000);
-            item["bitrate_out_kbps"] = Json::UInt64(snap.at(cfg.id)->outputBitrate.load() / 1000);
+            auto* streamState = snap.at(cfg.id);
+            item["active"] = streamState->active.load();
+            item["status"] = streamState->statusMessage;
+            item["using_backup"] = streamState->usingBackup;
+            item["active_input_uri"] = streamState->activeInputUri.empty() ? cfg.inputUri : streamState->activeInputUri;
+            item["active_input_label"] = streamState->usingBackup ? "Резерв" : "Основной";
+            item["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
+            item["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
         } else {
             item["active"] = false;
             item["status"] = "stopped";
+            item["using_backup"] = false;
+            item["active_input_uri"] = cfg.inputUri;
+            item["active_input_label"] = "Основной";
             item["bitrate_in_kbps"] = Json::UInt64(0);
             item["bitrate_out_kbps"] = Json::UInt64(0);
         }
@@ -480,7 +487,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
 .tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
-.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:11px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
+.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
 .tile .controls .start-button{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.26)}
@@ -579,13 +586,14 @@ function render() {
       <div class="top">
         <div>
           <div class="title">${stream.name || stream.id}</div>
-          <div class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? 'Online' : 'Offline'}</div>
+          <div class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
         </div>
         <div class="badge">${stream.cbr ? 'CBR' : 'VBR'}</div>
       </div>
       <div class="info">
         <div class="info-row"><strong>Вывод</strong><span>${(stream.output_type || 'udp').toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
-        <div class="info-row"><strong>Вход</strong><span>${stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>Активный вход</strong><span>${stream.active_input_label || 'Основной'} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>Основной</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>Резерв</strong><span>${stream.backup_input_uri || '—'}</span></div>
         <div class="info-row"><strong>SID</strong><span>${stream.service_id || '—'}</span></div>
         <div class="info-row"><strong>Bitrate In</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>

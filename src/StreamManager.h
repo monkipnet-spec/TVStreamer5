@@ -29,7 +29,11 @@ struct StreamState {
     std::atomic<bool> running{false};
     bool usingBackup = false;
     bool backupAttempted = false;
+    bool primaryRetryPending = false;
+    bool inputLossNotified = false;
     std::string statusMessage = "stopped";
+    std::string primaryInputUri;
+    std::string activeInputUri;
     GstElement* pipeline = nullptr;
     GstBus* bus = nullptr;
     std::thread busThread;
@@ -45,6 +49,9 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
+    uint64_t lastInputBytesSeen = 0;
+    std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::unique_ptr<RemapContext> remapContext;
 };
 
@@ -69,6 +76,8 @@ private:
     bool buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail);
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
     GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline);
+    bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
+    void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
