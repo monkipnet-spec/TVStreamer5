@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <regex>
 #include <sstream>
@@ -9,6 +10,8 @@
 #include <vector>
 
 #include <glib.h>
+#define GST_USE_UNSTABLE_API
+#include <gst/mpegts/mpegts.h>
 
 namespace {
 
@@ -27,6 +30,34 @@ std::string missingElementStatus(const std::string& elementName) {
 
 bool addElementOrFail(GstElement* pipeline, GstElement* element) {
     return element != nullptr && gst_bin_add(GST_BIN(pipeline), element);
+}
+
+bool hasProperty(GstElement* element, const char* propertyName) {
+    return element && g_object_class_find_property(G_OBJECT_GET_CLASS(element), propertyName) != nullptr;
+}
+
+void setBooleanPropertyIfPresent(GstElement* element, const char* propertyName, gboolean value) {
+    if (hasProperty(element, propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
+void setIntPropertyIfPresent(GstElement* element, const char* propertyName, gint value) {
+    if (hasProperty(element, propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
+void setUInt64PropertyIfPresent(GstElement* element, const char* propertyName, guint64 value) {
+    if (hasProperty(element, propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
+void setStringPropertyIfPresent(GstElement* element, const char* propertyName, const std::string& value) {
+    if (hasProperty(element, propertyName) && !value.empty()) {
+        g_object_set(element, propertyName, value.c_str(), nullptr);
+    }
 }
 
 bool isMulticastHost(const std::string& host) {
@@ -50,6 +81,111 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
     } else if (!cfg.interfaceAddress.empty()) {
         g_object_set(sink, "bind-address", cfg.interfaceAddress.c_str(), nullptr);
     }
+}
+
+void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
+    g_object_set(mux,
+        "alignment", 7,
+        "pat-interval", 9000U,
+        "pmt-interval", 9000U,
+        "si-interval", 9000U,
+        nullptr);
+    if (cfg.cbr && cfg.targetBitrate > 0) {
+        setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
+    }
+}
+
+void sendServiceDescription(GstElement* mux, const StreamConfig& cfg) {
+    if (!mux || (cfg.serviceName.empty() && cfg.serviceProvider.empty())) {
+        return;
+    }
+
+    GstMpegtsSDT* sdt = gst_mpegts_sdt_new();
+    GstMpegtsSDTService* service = gst_mpegts_sdt_service_new();
+    if (!sdt || !service) {
+        return;
+    }
+
+    sdt->actual_ts = TRUE;
+    sdt->transport_stream_id = 1;
+    sdt->original_network_id = 1;
+
+    service->service_id = static_cast<guint16>(cfg.serviceId ? cfg.serviceId : 1);
+    service->EIT_schedule_flag = FALSE;
+    service->EIT_present_following_flag = FALSE;
+    service->running_status = GST_MPEGTS_RUNNING_STATUS_RUNNING;
+    service->free_CA_mode = FALSE;
+
+    GstMpegtsDescriptor* descriptor = gst_mpegts_descriptor_from_dvb_service(
+        GST_DVB_SERVICE_DIGITAL_TELEVISION,
+        cfg.serviceName.empty() ? cfg.name.c_str() : cfg.serviceName.c_str(),
+        cfg.serviceProvider.empty() ? "TVStreamer5" : cfg.serviceProvider.c_str());
+    if (descriptor) {
+        g_ptr_array_add(service->descriptors, descriptor);
+    }
+    g_ptr_array_add(sdt->services, service);
+
+    GstMpegtsSection* section = gst_mpegts_section_from_sdt(sdt);
+    if (section) {
+        gst_mpegts_section_send_event(section, mux);
+        gst_mpegts_section_unref(section);
+    }
+}
+
+GstPad* requestMuxSinkPad(GstElement* mux, uint32_t requestedPid) {
+    GstPad* pad = nullptr;
+    if (requestedPid > 0) {
+        std::string requestedName = "sink_" + std::to_string(requestedPid);
+        pad = gst_element_request_pad_simple(mux, requestedName.c_str());
+    }
+    if (!pad) {
+        pad = gst_element_request_pad_simple(mux, "sink_%d");
+    }
+    return pad;
+}
+
+void updateMuxProgramMap(RemapContext* ctx) {
+    if (!ctx || !ctx->mux) {
+        return;
+    }
+
+    GstStructure* programMap = gst_structure_new_empty("program_map");
+    int serviceId = static_cast<int>(ctx->config.serviceId ? ctx->config.serviceId : 1);
+    if (!ctx->videoPadName.empty()) {
+        gst_structure_set(programMap, ctx->videoPadName.c_str(), G_TYPE_INT, serviceId, nullptr);
+    }
+    if (!ctx->audioPadName.empty()) {
+        gst_structure_set(programMap, ctx->audioPadName.c_str(), G_TYPE_INT, serviceId, nullptr);
+    }
+    g_object_set(ctx->mux, "prog-map", programMap, nullptr);
+    gst_structure_free(programMap);
+}
+
+std::string parserForCaps(const std::string& capsString) {
+    if (capsString.find("video/x-h264") != std::string::npos) {
+        return "h264parse";
+    }
+    if (capsString.find("video/x-h265") != std::string::npos) {
+        return "h265parse";
+    }
+    if (capsString.find("video/mpeg") != std::string::npos) {
+        return "mpegvideoparse";
+    }
+    if (capsString.find("audio/mpeg") != std::string::npos &&
+        capsString.find("mpegversion=(int)4") != std::string::npos) {
+        return "aacparse";
+    }
+    if (capsString.find("audio/mpeg") != std::string::npos &&
+        capsString.find("mpegversion=(int)1") != std::string::npos) {
+        return "mpegaudioparse";
+    }
+    if (capsString.find("audio/x-ac3") != std::string::npos) {
+        return "ac3parse";
+    }
+    if (capsString.find("audio/x-dts") != std::string::npos) {
+        return "dtsparse";
+    }
+    return "";
 }
 
 } // namespace
@@ -81,7 +217,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         state->remapContext->config = streamConfig;
     }
 
-    GstElement* pipeline = createPipeline(streamConfig);
+    GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
         return false;
@@ -239,7 +375,11 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     return desc.str();
 }
 
-GstElement* StreamManager::createPipeline(const StreamConfig& cfg) {
+GstElement* StreamManager::createPipeline(StreamState* state) {
+    if (!state) {
+        return nullptr;
+    }
+    const StreamConfig& cfg = state->config;
     GstElement* pipeline = gst_pipeline_new(cfg.id.c_str());
     if (!pipeline) {
         return nullptr;
@@ -253,13 +393,11 @@ GstElement* StreamManager::createPipeline(const StreamConfig& cfg) {
 
     bool ok = false;
     if (cfg.remapEnabled) {
-        RemapContext remapContext;
-        remapContext.config = cfg;
-        StreamState tempState;
-        tempState.config = cfg;
-        tempState.remapContext = std::make_unique<RemapContext>(remapContext);
-        ok = buildRemapPipeline(&tempState, pipeline, sourceTail);
-        tempState.remapContext.release();
+        if (!state->remapContext) {
+            state->remapContext = std::make_unique<RemapContext>();
+        }
+        state->remapContext->config = cfg;
+        ok = buildRemapPipeline(state, pipeline, sourceTail);
     } else {
         ok = buildPassthroughPipeline(cfg, pipeline, sourceTail);
     }
@@ -309,10 +447,17 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
         }
 
         g_object_set(src, "uri", input.c_str(), nullptr);
-        if (std::string(factory) == "srtsrc") {
-            g_object_set(src, "wait-for-connection", TRUE, nullptr);
+        setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
+        setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
+        setIntPropertyIfPresent(src, "latency", 500);
+        setStringPropertyIfPresent(src, "localaddress", cfg.interfaceAddress);
+        if (mode == "listener") {
+            setIntPropertyIfPresent(src, "mode", 2);
+            setBooleanPropertyIfPresent(src, "wait-for-connection", TRUE);
+            setBooleanPropertyIfPresent(src, "keep-listening", TRUE);
         } else {
-            g_object_set(src, "latency", 500, nullptr);
+            setIntPropertyIfPresent(src, "mode", 1);
+            setBooleanPropertyIfPresent(src, "wait-for-connection", FALSE);
         }
 
         if (!gst_element_link(src, queue)) {
@@ -336,6 +481,7 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
         }
 
         g_object_set(src, "location", input.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
+        setIntPropertyIfPresent(src, "timeout", 15);
 
         if (!gst_element_link(src, queue)) {
             return nullptr;
@@ -346,7 +492,7 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
     }
 
     if (inputLower.rfind("udp://", 0) == 0 || inputLower.rfind("rtp://", 0) == 0) {
-        std::regex re("^(udp|rtp)://([^:/]+):(\\d+).*$", std::regex::icase);
+        std::regex re(R"(^(udp|rtp)://@?([^:/]*):(\d+).*$)", std::regex::icase);
         std::smatch match;
         if (!std::regex_match(input, match, re) || match.size() < 4) {
             return nullptr;
@@ -359,10 +505,23 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
         }
 
         int port = std::stoi(match[3].str());
-        g_object_set(src, "port", port, nullptr);
+        std::string host = match[2].str();
+        if (host.empty() || host == "@") {
+            host = "0.0.0.0";
+        }
 
-        if (!cfg.interfaceAddress.empty()) {
+        g_object_set(src,
+            "address", host.c_str(),
+            "port", port,
+            "reuse", TRUE,
+            "do-timestamp", TRUE,
+            "buffer-size", 4 * 1024 * 1024,
+            nullptr);
+
+        if (isMulticastHost(host) && !cfg.interfaceAddress.empty()) {
             g_object_set(src, "multicast-iface", cfg.interfaceAddress.c_str(), nullptr);
+        } else if (!isMulticastHost(host) && !cfg.interfaceAddress.empty() && host == "0.0.0.0") {
+            g_object_set(src, "address", cfg.interfaceAddress.c_str(), nullptr);
         }
 
         if (toLower(match[1].str()) == "rtp") {
@@ -451,7 +610,7 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
         "bframes", 0,
         nullptr);
     g_object_set(parser, "config-interval", 1, nullptr);
-    g_object_set(mux, "alignment", 7, nullptr);
+    configureTsMux(mux, cfg);
     g_object_set(queue,
         "max-size-buffers", 0,
         "max-size-bytes", 0,
@@ -517,7 +676,8 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         "max-size-bytes", 0,
         "max-size-time", 3000000000ULL,
         nullptr);
-    g_object_set(mux, "alignment", 7, nullptr);
+    configureTsMux(mux, state->config);
+    sendServiceDescription(mux, state->config);
     configureUdpSink(sink, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
@@ -559,15 +719,12 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
+    std::string parserFactory = parserForCaps(capsString);
     GstElement* queue = gst_element_factory_make("queue", nullptr);
-    GstElement* parser = nullptr;
-    if (capsString.find("video/x-h264") != std::string::npos) {
-        parser = gst_element_factory_make("h264parse", nullptr);
-    } else if (capsString.find("audio/mpeg") != std::string::npos && capsString.find("mpegversion=(int)4") != std::string::npos) {
-        parser = gst_element_factory_make("aacparse", nullptr);
-    }
+    GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
 
     if (!queue || !parser) {
+        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString << std::endl;
         if (queue) gst_object_unref(queue);
         if (parser) gst_object_unref(parser);
         return;
@@ -592,7 +749,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         "max-size-bytes", 0,
         "max-size-time", 3000000000ULL,
         nullptr);
-    if (G_OBJECT_TYPE_NAME(parser) && g_strcmp0(G_OBJECT_TYPE_NAME(parser), "GstH264Parse") == 0) {
+    if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", 1, nullptr);
     }
     gst_element_sync_state_with_parent(queue);
@@ -617,7 +774,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     gst_object_unref(queueSinkPad);
 
     GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
-    GstPad* muxSinkPad = gst_element_get_request_pad(ctx->mux, "sink_%u");
+    GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, isVideo ? ctx->config.videoPid : ctx->config.audioPid);
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
         if (muxSinkPad) gst_object_unref(muxSinkPad);
@@ -626,12 +783,16 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+        const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {
             ctx->videoLinked = true;
+            ctx->videoPadName = padName ? padName : "";
         }
         if (isAudio) {
             ctx->audioLinked = true;
+            ctx->audioPadName = padName ? padName : "";
         }
+        updateMuxProgramMap(ctx);
     }
 
     gst_object_unref(parserSrcPad);

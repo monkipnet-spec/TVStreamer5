@@ -20,6 +20,8 @@ struct RemapContext {
     StreamConfig config;
     bool videoLinked = false;
     bool audioLinked = false;
+    std::string videoPadName;
+    std::string audioPadName;
 };
 
 struct StreamState {
@@ -56,7 +58,7 @@ public:
 private:
     bool gstreamerInitialized;
     std::string buildPipelineDescription(const StreamConfig& cfg);
-    GstElement* createPipeline(const StreamConfig& cfg);
+    GstElement* createPipeline(StreamState* state);
     GstElement* createSourceChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
     GstElement* createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
     bool buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail);
