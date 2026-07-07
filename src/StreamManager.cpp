@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <glib.h>
+#include <unistd.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
 
@@ -101,6 +102,18 @@ std::string interfaceNameOrAddress(const std::string& address) {
     return ifaceName.empty() ? address : ifaceName;
 }
 
+std::string outputType(const StreamConfig& cfg) {
+    std::string type = toLower(cfg.outputType);
+    if (type != "srt" && type != "http" && type != "hls") {
+        type = "udp";
+    }
+    return type;
+}
+
+std::string hlsDirectory(const StreamConfig& cfg) {
+    return "/tmp/tvstreamer5-hls/" + cfg.id;
+}
+
 void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
     const bool multicastOutput = isMulticastHost(cfg.outputHost);
 
@@ -126,6 +139,36 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         g_object_set(sink, "auto-multicast", TRUE, nullptr);
         setStringPropertyIfPresent(sink, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress));
     }
+}
+
+void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
+    const std::string host = cfg.outputHost.empty() ? "0.0.0.0" : cfg.outputHost;
+    const bool listener = host == "0.0.0.0" || host == "::";
+    const std::string uri = "srt://" + host + ":" + std::to_string(cfg.outputPort);
+    g_object_set(sink, "uri", uri.c_str(), "sync", FALSE, "async", FALSE, nullptr);
+    setIntPropertyIfPresent(sink, "mode", listener ? 2 : 1);
+    setBooleanPropertyIfPresent(sink, "wait-for-connection", listener ? TRUE : FALSE);
+    setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
+}
+
+void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
+    (void)cfg;
+    g_object_set(sink,
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr);
+}
+
+void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
+    std::filesystem::create_directories(hlsDirectory(cfg));
+    const std::string playlist = hlsDirectory(cfg) + "/playlist.m3u8";
+    const std::string location = hlsDirectory(cfg) + "/segment%05d.ts";
+    g_object_set(sink,
+        "playlist-location", playlist.c_str(),
+        "location", location.c_str(),
+        "target-duration", 4,
+        "max-files", 8,
+        nullptr);
 }
 
 void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
@@ -447,12 +490,42 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " input=" << cfg.inputUri
          << " input_mode=" << cfg.inputMode
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
+         << " output_type=" << outputType(cfg)
          << " output=" << cfg.outputHost << ":" << cfg.outputPort
          << " iface=" << cfg.interfaceAddress
          << " service_id=" << cfg.serviceId
          << " vpid=" << cfg.videoPid
          << " apid=" << cfg.audioPid;
     return desc.str();
+}
+
+bool StreamManager::addHttpClient(const std::string& id, int fd) {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    auto found = streams.find(id);
+    if (found == streams.end() || !found->second->pipeline) {
+        close(fd);
+        return false;
+    }
+
+    GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
+    if (!sink) {
+        close(fd);
+        return false;
+    }
+
+    GstElementFactory* factory = gst_element_get_factory(sink);
+    const gchar* factoryName = factory
+        ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
+        : nullptr;
+    if (!factoryName || g_strcmp0(factoryName, "multifdsink") != 0) {
+        gst_object_unref(sink);
+        close(fd);
+        return false;
+    }
+
+    g_signal_emit_by_name(sink, "add", fd);
+    gst_object_unref(sink);
+    return true;
 }
 
 GstElement* StreamManager::createPipeline(StreamState* state) {
@@ -739,19 +812,17 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
 bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail) {
     GstElement* tsparse = gst_element_factory_make("tsparse", "tsparse");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
-    GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
+    GstElement* sink = createOutputSink(cfg, pipeline);
 
     if (!tsparse || !queue || !sink) {
         return false;
     }
 
     if (!addElementOrFail(pipeline, tsparse) ||
-        !addElementOrFail(pipeline, queue) ||
-        !addElementOrFail(pipeline, sink)) {
+        !addElementOrFail(pipeline, queue)) {
         return false;
     }
 
-    configureUdpSink(sink, cfg);
     configureQueue(queue);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
@@ -771,7 +842,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
-    GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
+    GstElement* sink = createOutputSink(state->config, pipeline);
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
         return false;
     }
@@ -780,8 +851,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, outputQueue) ||
-        !addElementOrFail(pipeline, sink)) {
+        !addElementOrFail(pipeline, outputQueue)) {
         return false;
     }
 
@@ -789,7 +859,6 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     configureQueue(outputQueue);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
-    configureUdpSink(sink, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
@@ -802,6 +871,40 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     state->remapContext->sink = sink;
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->remapContext.get());
     return true;
+}
+
+GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline) {
+    const std::string type = outputType(cfg);
+    const char* factory = "udpsink";
+    if (type == "srt") {
+        factory = "srtsink";
+    } else if (type == "http") {
+        factory = "multifdsink";
+    } else if (type == "hls") {
+        factory = "hlssink";
+    }
+
+    if (!hasElementFactory(factory)) {
+        std::cerr << missingElementStatus(factory) << std::endl;
+        return nullptr;
+    }
+
+    GstElement* sink = gst_element_factory_make(factory, "output_sink");
+    if (!sink || !addElementOrFail(pipeline, sink)) {
+        return nullptr;
+    }
+
+    if (type == "srt") {
+        configureSrtSink(sink, cfg);
+    } else if (type == "http") {
+        configureHttpSink(sink, cfg);
+    } else if (type == "hls") {
+        configureHlsSink(sink, cfg);
+    } else {
+        configureUdpSink(sink, cfg);
+    }
+
+    return sink;
 }
 
 void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data) {
@@ -928,6 +1031,20 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         gst_object_unref(inputQueue);
     }
 
+    GstElement* outputSink = gst_bin_get_by_name(GST_BIN(state->pipeline), "output_sink");
+    if (outputSink) {
+        GstPad* sinkPad = gst_element_get_static_pad(outputSink, "sink");
+        if (sinkPad) {
+            if (state->config.cbr && state->config.targetBitrate > 0) {
+                gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, cbrPacingPadProbe, state, nullptr);
+            }
+            gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
+            gst_object_unref(sinkPad);
+            outputAttached = TRUE;
+        }
+        gst_object_unref(outputSink);
+    }
+
     while (gst_iterator_next(iterator, &item) == GST_ITERATOR_OK) {
         GstElement* element = GST_ELEMENT(g_value_get_object(&item));
         GstElementFactory* factory = gst_element_get_factory(element);
@@ -949,7 +1066,11 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
             }
         }
 
-        if (!outputAttached && factoryName && g_strcmp0(factoryName, "udpsink") == 0) {
+        if (!outputAttached && factoryName &&
+            (g_strcmp0(factoryName, "udpsink") == 0 ||
+             g_strcmp0(factoryName, "srtsink") == 0 ||
+             g_strcmp0(factoryName, "multifdsink") == 0 ||
+             g_strcmp0(factoryName, "hlssink") == 0)) {
             GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
             if (sinkPad) {
                 if (state->config.cbr && state->config.targetBitrate > 0) {

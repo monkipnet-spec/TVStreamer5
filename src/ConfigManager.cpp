@@ -10,6 +10,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.name = root.get("name", "").asString();
     config.inputUri = root.get("input_uri", "").asString();
     config.backupInputUri = root.get("backup_input_uri", "").asString();
+    config.outputType = root.get("output_type", "udp").asString();
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
     config.outputPort = root.get("output_port", 1234).asInt();
     config.interfaceAddress = root.get("interface_address", "").asString();
@@ -31,6 +32,7 @@ Json::Value StreamConfig::toJson() const {
     root["name"] = name;
     root["input_uri"] = inputUri;
     root["backup_input_uri"] = backupInputUri;
+    root["output_type"] = outputType;
     root["output_host"] = outputHost;
     root["output_port"] = outputPort;
     root["interface_address"] = interfaceAddress;

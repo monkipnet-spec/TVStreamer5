@@ -58,6 +58,7 @@ public:
     void stopAll();
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
+    bool addHttpClient(const std::string& id, int fd);
 
 private:
     bool gstreamerInitialized;
@@ -67,6 +68,7 @@ private:
     GstElement* createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
     bool buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail);
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
+    GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     uint64_t queryPipelineBitrate(GstElement* pipeline);

@@ -10,10 +10,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cctype>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <unistd.h>
 
 namespace {
 
@@ -41,6 +44,40 @@ std::string queryValue(const std::string& target, const std::string& key) {
 int64_t unixNowSeconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+std::string cleanPathToken(const std::string& value, bool allowDot = false) {
+    std::string cleaned;
+    for (char ch : value) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_' || (allowDot && ch == '.')) {
+            cleaned.push_back(ch);
+        }
+    }
+    return cleaned;
+}
+
+std::string advertisedHost(const StreamConfig& cfg) {
+    if (cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::") {
+        if (!cfg.interfaceAddress.empty()) {
+            return cfg.interfaceAddress;
+        }
+        return "127.0.0.1";
+    }
+    return cfg.outputHost;
+}
+
+std::string streamLink(const StreamConfig& cfg, int httpPort) {
+    const std::string type = toLower(cfg.outputType);
+    if (type == "srt") {
+        return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort);
+    }
+    if (type == "http") {
+        return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/stream/" + cfg.id + ".ts";
+    }
+    if (type == "hls") {
+        return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/hls/" + cfg.id + "/playlist.m3u8";
+    }
+    return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
 }
 
 } // namespace
@@ -85,7 +122,11 @@ void HttpServer::handleSession(tcp::socket socket) {
 
         const std::string target(req.target());
         if (req.method() == http::verb::get) {
-            if (target == "/" || target == "/index.html") {
+            if (target.rfind("/stream/", 0) == 0 && handleHttpStream(socket, target)) {
+                return;
+            } else if (target.rfind("/hls/", 0) == 0 && serveHlsFile(target, res)) {
+                // serveHlsFile filled the response.
+            } else if (target == "/" || target == "/index.html") {
                 res.body() = renderIndexPage();
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
@@ -168,13 +209,74 @@ std::string HttpServer::currentState() {
             item["bitrate_in_kbps"] = Json::UInt64(0);
             item["bitrate_out_kbps"] = Json::UInt64(0);
         }
-        item["vlc_link"] = "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
+        item["vlc_link"] = streamLink(cfg, configManager.config.httpPort);
         recordQualitySample(cfg, item);
         streams.append(item);
     }
     root["streams"] = streams;
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, root);
+}
+
+bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target) {
+    const std::string prefix = "/stream/";
+    if (target.size() <= prefix.size() + 3 || target.substr(target.size() - 3) != ".ts") {
+        return false;
+    }
+
+    const std::string id = cleanPathToken(target.substr(prefix.size(), target.size() - prefix.size() - 3));
+    if (id.empty()) {
+        return false;
+    }
+
+    const std::string header =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: TVStreamer5\r\n"
+        "Content-Type: video/MP2T\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    boost::asio::write(socket, boost::asio::buffer(header));
+    int fd = socket.release();
+    streamManager.addHttpClient(id, fd);
+    return true;
+}
+
+bool HttpServer::serveHlsFile(const std::string& target, http::response<http::string_body>& res) {
+    const std::string prefix = "/hls/";
+    const auto slash = target.find('/', prefix.size());
+    if (slash == std::string::npos) {
+        return false;
+    }
+
+    const std::string id = cleanPathToken(target.substr(prefix.size(), slash - prefix.size()));
+    const std::string rawFileName = target.substr(slash + 1);
+    const std::string fileName = cleanPathToken(rawFileName, true);
+    if (id.empty() || fileName.empty() || fileName != rawFileName || fileName.find("..") != std::string::npos) {
+        return false;
+    }
+
+    const std::filesystem::path filePath =
+        std::filesystem::path("/tmp/tvstreamer5-hls") / id / fileName;
+    if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+        res.result(http::status::not_found);
+        res.set(http::field::content_type, "text/plain");
+        res.body() = "Not Found";
+        return true;
+    }
+
+    std::ifstream input(filePath, std::ios::binary);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    res.body() = buffer.str();
+    if (filePath.extension() == ".m3u8") {
+        res.set(http::field::content_type, "application/vnd.apple.mpegurl");
+        res.set(http::field::cache_control, "no-cache");
+    } else {
+        res.set(http::field::content_type, "video/MP2T");
+        res.set(http::field::cache_control, "no-cache");
+    }
+    return true;
 }
 
 std::string HttpServer::qualityHistory(const std::string& target) {
@@ -482,7 +584,7 @@ function render() {
         <div class="badge">${stream.cbr ? 'CBR' : 'VBR'}</div>
       </div>
       <div class="info">
-        <div class="info-row"><strong>Вывод</strong><span>${stream.output_host}:${stream.output_port}</span></div>
+        <div class="info-row"><strong>Вывод</strong><span>${(stream.output_type || 'udp').toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
         <div class="info-row"><strong>Вход</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>Резерв</strong><span>${stream.backup_input_uri || '—'}</span></div>
         <div class="info-row"><strong>SID</strong><span>${stream.service_id || '—'}</span></div>
@@ -542,7 +644,7 @@ function openTelegramModal() {
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
-    name:'', input_uri:'', backup_input_uri:'', output_host:'127.0.0.1', output_port:1234,
+    name:'', input_uri:'', backup_input_uri:'', output_type:'udp', output_host:'127.0.0.1', output_port:1234,
     interface_address:'', input_mode:'auto', remap_enabled:false, cbr:true, target_bitrate:2000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:''
   });
@@ -551,16 +653,19 @@ function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
     const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
+    const outputType = stream.output_type || 'udp';
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087 или https://host/live.m3u8" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
-        <div class="form-row full"><label>Интерфейс вывода (UDP)</label><select class="compact" id="streamInterface"><option value=""></option>${options}</select></div>
+        <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
-        <div class="form-row"><label>Мультикаст IP</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
-        <div class="form-row"><label>Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
+        <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp" ${outputType==='udp'?'selected':''}>UDP MPEG-TS</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option></select></div>
+        <div class="form-row"><label id="streamOutputHostLabel">Адрес выхода</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
+        <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
+        <div class="form-row full"><label>URL для плеера</label><input class="compact" id="streamPreviewUrl" readonly value="${stream.vlc_link||''}" placeholder="Ссылка появится после сохранения" /></div>
         <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
         <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
@@ -574,12 +679,48 @@ function openStreamForm(stream) {
       </div>
     `);
     document.getElementById('streamCbr').checked = stream.cbr;
+    updateOutputHints();
   };
 
   if (!state.interfaces || !state.interfaces.length) {
     loadInterfaces().then(renderStreamForm);
   } else {
     renderStreamForm();
+  }
+}
+function updateOutputHints() {
+  const type = document.getElementById('streamOutputType')?.value || 'udp';
+  const hostLabel = document.getElementById('streamOutputHostLabel');
+  const portLabel = document.getElementById('streamOutputPortLabel');
+  const host = document.getElementById('streamOutputHost');
+  const port = document.getElementById('streamOutputPort');
+  if (!hostLabel || !portLabel || !host || !port) return;
+  if (type === 'http' || type === 'hls') {
+    hostLabel.textContent = 'Адрес для ссылки';
+    portLabel.textContent = 'Порт панели';
+    port.value = state.http_port || port.value || 9000;
+    port.disabled = true;
+    host.placeholder = 'IP интерфейса или DNS';
+  } else if (type === 'srt') {
+    hostLabel.textContent = 'SRT host';
+    portLabel.textContent = 'SRT порт';
+    port.disabled = false;
+    host.placeholder = 'receiver.example.com';
+  } else {
+    hostLabel.textContent = 'Мультикаст / UDP IP';
+    portLabel.textContent = 'UDP порт';
+    port.disabled = false;
+    host.placeholder = '239.0.0.1';
+  }
+  syncOutputHostWithInterface();
+}
+function syncOutputHostWithInterface() {
+  const type = document.getElementById('streamOutputType')?.value || 'udp';
+  const iface = document.getElementById('streamInterface')?.value || '';
+  const host = document.getElementById('streamOutputHost');
+  if (!host || !iface || (type !== 'http' && type !== 'hls')) return;
+  if (!host.value || host.value === '0.0.0.0' || host.value === '127.0.0.1') {
+    host.value = iface;
   }
 }
 function saveSettings() {
@@ -599,6 +740,7 @@ function saveStream(id) {
     id: id,
     name: document.getElementById('streamName').value,
     input_uri: document.getElementById('streamInput').value,
+    output_type: document.getElementById('streamOutputType').value,
     output_host: document.getElementById('streamOutputHost').value,
     output_port: Number(document.getElementById('streamOutputPort').value),
     backup_input_uri: document.getElementById('streamBackupInput').value,
