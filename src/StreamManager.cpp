@@ -154,12 +154,11 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
         "async", FALSE,
-        "sync", cfg.cbr ? TRUE : FALSE,
+        "sync", FALSE,
         "buffer-size", kUdpSocketBufferSize,
         nullptr);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
-        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate));
         setBooleanPropertyIfPresent(sink, "qos", FALSE);
         setInt64PropertyIfPresent(sink, "max-lateness", -1);
     }
