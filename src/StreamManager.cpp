@@ -178,10 +178,25 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     const std::string host = cfg.outputHost.empty() ? "0.0.0.0" : cfg.outputHost;
     const bool listener = host == "0.0.0.0" || host == "::";
     const std::string uri = "srt://" + host + ":" + std::to_string(cfg.outputPort);
-    g_object_set(sink, "uri", uri.c_str(), "sync", FALSE, "async", FALSE, nullptr);
+
+    g_object_set(sink,
+        "uri", uri.c_str(),
+        "sync", FALSE,
+        "async", FALSE,
+        "blocksize", static_cast<guint>(kTsPacketsPerUdpBuffer * 188),
+        nullptr);
+
     setIntPropertyIfPresent(sink, "mode", listener ? 2 : 1);
-    setBooleanPropertyIfPresent(sink, "wait-for-connection", listener ? TRUE : FALSE);
+    setBooleanPropertyIfPresent(sink, "wait-for-connection", TRUE);
+    setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
+    setBooleanPropertyIfPresent(sink, "qos", FALSE);
+    setIntPropertyIfPresent(sink, "latency", 250);
+    setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
+
+    if (cfg.targetBitrate > 0) {
+        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
+    }
 }
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
@@ -218,6 +233,23 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
+}
+
+void configureCbrPacer(GstElement* pacer, const StreamConfig& cfg) {
+    if (!pacer || !cfg.cbr || cfg.targetBitrate == 0) {
+        return;
+    }
+
+    g_object_set(pacer,
+        "sync", TRUE,
+        "silent", TRUE,
+        "single-segment", TRUE,
+        nullptr);
+
+    const uint64_t bytesPerSecond = cfg.targetBitrate / 8;
+    if (bytesPerSecond > 0 && bytesPerSecond <= static_cast<uint64_t>(G_MAXINT)) {
+        setIntPropertyIfPresent(pacer, "datarate", static_cast<gint>(bytesPerSecond));
+    }
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
@@ -302,6 +334,26 @@ GstPad* requestMuxSinkPad(GstElement* mux, uint32_t requestedPid) {
         pad = gst_element_request_pad_simple(mux, "sink_%d");
     }
     return pad;
+}
+
+uint32_t pidFromDemuxPadName(GstPad* pad) {
+    const gchar* padName = pad ? GST_PAD_NAME(pad) : nullptr;
+    if (!padName) {
+        return 0;
+    }
+
+    std::string name(padName);
+    const std::size_t separator = name.rfind('_');
+    if (separator == std::string::npos || separator + 1 >= name.size()) {
+        return 0;
+    }
+
+    try {
+        const unsigned long pid = std::stoul(name.substr(separator + 1), nullptr, 16);
+        return pid <= 0x1FFF ? static_cast<uint32_t>(pid) : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 void updateMuxProgramMap(RemapContext* ctx) {
@@ -668,15 +720,16 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return nullptr;
     }
 
+    const bool needsRemux = cfg.remapEnabled || (cfg.cbr && cfg.targetBitrate > 0);
     bool ok = false;
-    if (cfg.remapEnabled) {
+    if (needsRemux) {
         if (!state->remapContext) {
             state->remapContext = std::make_unique<RemapContext>();
         }
         state->remapContext->config = cfg;
         ok = buildRemapPipeline(state, pipeline, sourceTail);
     } else {
-        ok = buildPassthroughPipeline(cfg, pipeline, sourceTail);
+        ok = buildPassthroughPipeline(state, pipeline, sourceTail);
     }
 
     if (!ok) {
@@ -933,7 +986,11 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
     return src;
 }
 
-bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail) {
+bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
+    if (!state) {
+        return false;
+    }
+    const StreamConfig& cfg = state->config;
     GstElement* tsparse = gst_element_factory_make("tsparse", "tsparse");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
     GstElement* sink = createOutputSink(cfg, pipeline);
@@ -966,9 +1023,12 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
+    const bool cbrActive = state->config.cbr && state->config.targetBitrate > 0;
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
+    GstElement* pacer = cbrActive ? gst_element_factory_make("identity", "cbr_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
-    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
+        (cbrActive && !pacer)) {
         return false;
     }
 
@@ -976,19 +1036,24 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, outputQueue)) {
+        !addElementOrFail(pipeline, outputQueue) ||
+        (pacer && !addElementOrFail(pipeline, pacer))) {
         return false;
     }
 
     configureQueue(preDemuxQueue);
     configureQueue(outputQueue);
+    configureCbrPacer(pacer, state->config);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    if (!gst_element_link_many(mux, outputQueue, sink, nullptr)) {
+    const bool outputLinked = pacer
+        ? gst_element_link_many(mux, outputQueue, pacer, sink, nullptr)
+        : gst_element_link_many(mux, outputQueue, sink, nullptr);
+    if (!outputLinked) {
         return false;
     }
 
@@ -1108,8 +1173,13 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     gst_object_unref(queueSinkPad);
 
+    uint32_t requestedPid = isVideo ? ctx->config.videoPid : ctx->config.audioPid;
+    if (requestedPid == 0) {
+        requestedPid = pidFromDemuxPadName(pad);
+    }
+
     GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
-    GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, isVideo ? ctx->config.videoPid : ctx->config.audioPid);
+    GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, requestedPid);
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
         if (muxSinkPad) gst_object_unref(muxSinkPad);

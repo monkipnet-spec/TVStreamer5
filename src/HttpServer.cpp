@@ -101,6 +101,10 @@ std::string advertisedHost(const StreamConfig& cfg) {
         if (!cfg.interfaceAddress.empty()) {
             return cfg.interfaceAddress;
         }
+        const auto interfaces = enumerateNetworkInterfaces();
+        if (!interfaces.empty()) {
+            return interfaces.front().address;
+        }
         return "127.0.0.1";
     }
     return cfg.outputHost;
@@ -809,7 +813,10 @@ function updateOutputHints() {
     hostLabel.textContent = 'SRT host';
     portLabel.textContent = 'SRT порт';
     port.disabled = false;
-    host.placeholder = 'receiver.example.com';
+    host.placeholder = '0.0.0.0 для listener';
+    if (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1') {
+      host.value = '0.0.0.0';
+    }
   } else {
     hostLabel.textContent = 'Мультикаст / UDP IP';
     portLabel.textContent = 'UDP порт';

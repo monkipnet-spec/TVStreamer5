@@ -69,7 +69,7 @@ private:
     GstElement* createPipeline(StreamState* state);
     GstElement* createSourceChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
     GstElement* createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
-    bool buildPassthroughPipeline(const StreamConfig& cfg, GstElement* pipeline, GstElement* sourceTail);
+    bool buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
     GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
