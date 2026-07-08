@@ -233,6 +233,7 @@ Examples:
 
 ```text
 srt://192.168.1.10:9000
+rtmp://192.168.1.10/live/camera1
 http://192.168.1.10:8080/stream.ts
 udp://@:1234
 udp://239.1.1.1:1234
@@ -258,6 +259,8 @@ udp   MPEG-TS over UDP unicast or multicast
 srt   MPEG-TS over SRT
 http  MPEG-TS over HTTP at /stream/<stream-id>.ts
 hls   HLS playlist at /hls/<stream-id>/playlist.m3u8
+rtmp  FLV over RTMP push
+youtube  FLV over RTMP push to YouTube Live
 ```
 
 Examples of player URLs shown by the UI:
@@ -265,6 +268,8 @@ Examples of player URLs shown by the UI:
 ```text
 udp://@239.1.1.1:1234
 srt://192.168.1.20:9000
+rtmp://live.example.com:1935/live/channel-1
+rtmp://a.rtmp.youtube.com/live2/<stream-key>
 http://192.168.1.20:9000/stream/channel-1.ts
 http://192.168.1.20:9000/hls/channel-1/playlist.m3u8
 ```
@@ -276,11 +281,14 @@ UDP:  output_host is the unicast/multicast destination, output_port is UDP port.
 SRT:  output_host is the SRT destination. Use 0.0.0.0 for listener mode.
 HTTP: output_host is the address advertised in the player URL; port is web UI port.
 HLS:  output_host is the address advertised in the player URL; port is web UI port.
+RTMP: output_host is a full RTMP/RTMPS URL or host; output_port is used for host mode.
+YouTube: output_host is the stream key or a full RTMP/RTMPS ingest URL.
 ```
 
 The web UI lets you choose the output interface. For UDP multicast it is used as
 the multicast interface. For UDP unicast it is used as the bind address. For SRT
 it is used as the local address when supported by the GStreamer SRT plugin.
+RTMP camera input and RTMP/YouTube output remux H.264/AAC without transcoding.
 
 ## Backup Failover
 

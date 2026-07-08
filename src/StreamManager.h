@@ -20,6 +20,7 @@ struct RemapContext {
     StreamConfig config;
     bool videoLinked = false;
     bool audioLinked = false;
+    bool flvMux = false;
     std::string videoPadName;
     std::string audioPadName;
 };
@@ -48,6 +49,7 @@ struct StreamState {
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
+    std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<RemapContext> remapContext;
 };
 
@@ -67,14 +69,16 @@ private:
     bool gstreamerInitialized;
     std::string buildPipelineDescription(const StreamConfig& cfg);
     GstElement* createPipeline(StreamState* state);
-    GstElement* createSourceChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
+    GstElement* createSourceChain(StreamState* state, GstElement* pipeline, GstElement*& terminalElement);
     GstElement* createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
     bool buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
+    bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
     GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
+    static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);

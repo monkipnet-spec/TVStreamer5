@@ -104,10 +104,19 @@ std::string interfaceNameOrAddress(const std::string& address) {
 
 std::string outputType(const StreamConfig& cfg) {
     std::string type = toLower(cfg.outputType);
-    if (type != "srt" && type != "http" && type != "hls") {
+    if (type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
         type = "udp";
     }
     return type;
+}
+
+bool isRtmpUri(const std::string& uriLower) {
+    return uriLower.rfind("rtmp://", 0) == 0 ||
+           uriLower.rfind("rtmps://", 0) == 0 ||
+           uriLower.rfind("rtmpt://", 0) == 0 ||
+           uriLower.rfind("rtmpe://", 0) == 0 ||
+           uriLower.rfind("rtmpte://", 0) == 0 ||
+           uriLower.rfind("rtmpts://", 0) == 0;
 }
 
 std::string hlsDirectory(const StreamConfig& cfg) {
@@ -194,6 +203,37 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
 
+    if (cfg.targetBitrate > 0) {
+        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
+    }
+}
+
+std::string rtmpOutputLocation(const StreamConfig& cfg) {
+    const std::string type = outputType(cfg);
+    const std::string host = cfg.outputHost;
+    const std::string hostLower = toLower(host);
+
+    if (isRtmpUri(hostLower)) {
+        return host;
+    }
+
+    if (type == "youtube") {
+        return "rtmp://a.rtmp.youtube.com/live2/" + host;
+    }
+
+    const std::string targetHost = host.empty() ? "127.0.0.1" : host;
+    return "rtmp://" + targetHost + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
+}
+
+void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
+    const std::string location = rtmpOutputLocation(cfg);
+    g_object_set(sink,
+        "location", location.c_str(),
+        "sync", FALSE,
+        "async", FALSE,
+        "qos", FALSE,
+        nullptr);
+    setInt64PropertyIfPresent(sink, "max-lateness", -1);
     if (cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
@@ -336,6 +376,10 @@ GstPad* requestMuxSinkPad(GstElement* mux, uint32_t requestedPid) {
     return pad;
 }
 
+GstPad* requestFlvMuxSinkPad(GstElement* mux, bool isVideo) {
+    return gst_element_request_pad_simple(mux, isVideo ? "video" : "audio");
+}
+
 uint32_t pidFromDemuxPadName(GstPad* pad) {
     const gchar* padName = pad ? GST_PAD_NAME(pad) : nullptr;
     if (!padName) {
@@ -400,6 +444,36 @@ std::string parserForCaps(const std::string& capsString) {
     return "";
 }
 
+GstElement* capsFilterForMux(bool flvMux, bool isVideo, bool isAudio, const std::string& capsString) {
+    std::string capsDescription;
+    if (flvMux && isVideo && capsString.find("video/x-h264") != std::string::npos) {
+        capsDescription = "video/x-h264,stream-format=(string)avc";
+    } else if (flvMux && isAudio && capsString.find("audio/mpeg") != std::string::npos &&
+               capsString.find("mpegversion=(int)4") != std::string::npos) {
+        capsDescription = "audio/mpeg,mpegversion=(int)4,stream-format=(string)raw";
+    } else if (!flvMux && isVideo && capsString.find("video/x-h264") != std::string::npos) {
+        capsDescription = "video/x-h264,stream-format=(string)byte-stream";
+    }
+
+    if (capsDescription.empty()) {
+        return nullptr;
+    }
+
+    GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
+    if (!filter) {
+        return nullptr;
+    }
+
+    GstCaps* caps = gst_caps_from_string(capsDescription.c_str());
+    if (!caps) {
+        gst_object_unref(filter);
+        return nullptr;
+    }
+    g_object_set(filter, "caps", caps, nullptr);
+    gst_caps_unref(caps);
+    return filter;
+}
+
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
@@ -426,6 +500,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->config = streamConfig;
     state->primaryInputUri = streamConfig.inputUri;
     state->activeInputUri = streamConfig.inputUri;
+    state->sourceContext = std::make_unique<RemapContext>();
+    state->sourceContext->config = streamConfig;
     if (streamConfig.remapEnabled) {
         state->remapContext = std::make_unique<RemapContext>();
         state->remapContext->config = streamConfig;
@@ -519,6 +595,7 @@ bool StreamManager::stopStream(const std::string& id) {
         state.pipeline = nullptr;
     }
     state.remapContext.reset();
+    state.sourceContext.reset();
 
     streams.erase(id);
     notifyStreamState(stoppedConfig, "⚪", "Поток остановлен", "Остановлен вручную");
@@ -543,6 +620,7 @@ void StreamManager::stopAll() {
             gst_object_unref(state.pipeline);
         }
         state.remapContext.reset();
+        state.sourceContext.reset();
     }
     streams.clear();
 }
@@ -650,6 +728,8 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     }
 
     state->config.inputUri = inputUri;
+    state->sourceContext = std::make_unique<RemapContext>();
+    state->sourceContext->config = state->config;
     state->remapContext.reset();
     if (state->config.remapEnabled) {
         state->remapContext = std::make_unique<RemapContext>();
@@ -715,9 +795,18 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     GstElement* sourceTail = nullptr;
-    if (!createSourceChain(cfg, pipeline, sourceTail) || !sourceTail) {
+    if (!createSourceChain(state, pipeline, sourceTail) || !sourceTail) {
         gst_object_unref(pipeline);
         return nullptr;
+    }
+
+    const std::string type = outputType(cfg);
+    if (type == "rtmp" || type == "youtube") {
+        if (!buildRtmpOutputPipeline(state, pipeline, sourceTail)) {
+            gst_object_unref(pipeline);
+            return nullptr;
+        }
+        return pipeline;
     }
 
     const bool needsRemux = cfg.remapEnabled || (cfg.cbr && cfg.targetBitrate > 0);
@@ -740,8 +829,12 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     return pipeline;
 }
 
-GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement) {
+GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pipeline, GstElement*& terminalElement) {
     terminalElement = nullptr;
+    if (!state) {
+        return nullptr;
+    }
+    const StreamConfig& cfg = state->config;
     const std::string input = cfg.inputUri;
     const std::string inputLower = toLower(input);
 
@@ -756,6 +849,50 @@ GstElement* StreamManager::createSourceChain(const StreamConfig& cfg, GstElement
 
     if (inputLower == "test://bars" || inputLower == "testsrc://bars" || inputLower == "bars://hd") {
         return createTestPatternChain(cfg, pipeline, terminalElement);
+    }
+
+    if (isRtmpUri(inputLower)) {
+        if (!hasElementFactory("rtmpsrc") || !hasElementFactory("flvdemux") || !hasElementFactory("mpegtsmux")) {
+            std::cerr << "missing RTMP input elements: rtmpsrc, flvdemux or mpegtsmux" << std::endl;
+            return nullptr;
+        }
+
+        GstElement* src = gst_element_factory_make("rtmpsrc", "input_src");
+        GstElement* inputQueue = addQueue("input_queue", 5000000000ULL);
+        GstElement* demux = gst_element_factory_make("flvdemux", "input_flv_demux");
+        GstElement* mux = gst_element_factory_make("mpegtsmux", "input_rtmp_ts_mux");
+        GstElement* outputQueue = gst_element_factory_make("queue", "input_rtmp_ts_queue");
+        if (!src || !inputQueue || !demux || !mux || !outputQueue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, demux) ||
+            !addElementOrFail(pipeline, mux) ||
+            !addElementOrFail(pipeline, outputQueue)) {
+            return nullptr;
+        }
+
+        g_object_set(src,
+            "location", input.c_str(),
+            "do-timestamp", TRUE,
+            "timeout", 15,
+            nullptr);
+        configureQueue(outputQueue);
+        configureTsMux(mux, cfg);
+
+        if (!gst_element_link_many(src, inputQueue, demux, nullptr) ||
+            !gst_element_link(mux, outputQueue)) {
+            return nullptr;
+        }
+
+        if (!state->sourceContext) {
+            state->sourceContext = std::make_unique<RemapContext>();
+        }
+        state->sourceContext->mux = mux;
+        state->sourceContext->config = cfg;
+        state->sourceContext->flvMux = false;
+        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onFlvDemuxPadAdded), state->sourceContext.get());
+
+        terminalElement = outputQueue;
+        return src;
     }
 
     if (inputLower.rfind("srt://", 0) == 0) {
@@ -1063,6 +1200,60 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     return true;
 }
 
+bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
+    if (!state) {
+        return false;
+    }
+    if (!hasElementFactory("tsparse") || !hasElementFactory("tsdemux") || !hasElementFactory("flvmux")) {
+        std::cerr << "missing RTMP output elements: tsparse, tsdemux or flvmux" << std::endl;
+        return false;
+    }
+
+    GstElement* tsparse = gst_element_factory_make("tsparse", "rtmp_tsparse");
+    GstElement* preDemuxQueue = gst_element_factory_make("queue", "rtmp_pre_demux_queue");
+    GstElement* demux = gst_element_factory_make("tsdemux", "rtmp_ts_demux");
+    GstElement* mux = gst_element_factory_make("flvmux", "rtmp_flv_mux");
+    GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
+    GstElement* sink = createOutputSink(state->config, pipeline);
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
+        return false;
+    }
+
+    if (!addElementOrFail(pipeline, tsparse) ||
+        !addElementOrFail(pipeline, preDemuxQueue) ||
+        !addElementOrFail(pipeline, demux) ||
+        !addElementOrFail(pipeline, mux) ||
+        !addElementOrFail(pipeline, outputQueue)) {
+        return false;
+    }
+
+    configureQueue(preDemuxQueue);
+    configureQueue(outputQueue);
+    configureTsPacketAlignment(tsparse);
+    g_object_set(mux,
+        "streamable", TRUE,
+        "enforce-increasing-timestamps", TRUE,
+        "skip-backwards-streams", TRUE,
+        nullptr);
+
+    if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
+        return false;
+    }
+    if (!gst_element_link_many(mux, outputQueue, sink, nullptr)) {
+        return false;
+    }
+
+    if (!state->remapContext) {
+        state->remapContext = std::make_unique<RemapContext>();
+    }
+    state->remapContext->mux = mux;
+    state->remapContext->sink = sink;
+    state->remapContext->config = state->config;
+    state->remapContext->flvMux = true;
+    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->remapContext.get());
+    return true;
+}
+
 GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline) {
     const std::string type = outputType(cfg);
     const char* factory = "udpsink";
@@ -1072,6 +1263,8 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         factory = "multifdsink";
     } else if (type == "hls") {
         factory = "hlssink";
+    } else if (type == "rtmp" || type == "youtube") {
+        factory = "rtmpsink";
     }
 
     if (!hasElementFactory(factory)) {
@@ -1090,6 +1283,8 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         configureHttpSink(sink, cfg);
     } else if (type == "hls") {
         configureHlsSink(sink, cfg);
+    } else if (type == "rtmp" || type == "youtube") {
+        configureRtmpSink(sink, cfg);
     } else {
         configureUdpSink(sink, cfg);
     }
@@ -1126,11 +1321,13 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     std::string parserFactory = parserForCaps(capsString);
     GstElement* queue = gst_element_factory_make("queue", nullptr);
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
+    GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString);
 
     if (!queue || !parser) {
         std::cerr << "remap skipped unsupported elementary stream caps: " << capsString << std::endl;
         if (queue) gst_object_unref(queue);
         if (parser) gst_object_unref(parser);
+        if (capsfilter) gst_object_unref(capsfilter);
         return;
     }
 
@@ -1141,9 +1338,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     if (!gst_bin_add(GST_BIN(pipeline), queue) ||
-        !gst_bin_add(GST_BIN(pipeline), parser)) {
+        !gst_bin_add(GST_BIN(pipeline), parser) ||
+        (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter))) {
         if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
         if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
+        if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
         gst_object_unref(pipeline);
         return;
     }
@@ -1154,8 +1353,14 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     gst_element_sync_state_with_parent(queue);
     gst_element_sync_state_with_parent(parser);
+    if (capsfilter) {
+        gst_element_sync_state_with_parent(capsfilter);
+    }
 
-    if (!gst_element_link(queue, parser)) {
+    const bool parserLinked = capsfilter
+        ? gst_element_link_many(queue, parser, capsfilter, nullptr)
+        : gst_element_link(queue, parser);
+    if (!parserLinked) {
         gst_object_unref(pipeline);
         return;
     }
@@ -1178,8 +1383,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         requestedPid = pidFromDemuxPadName(pad);
     }
 
-    GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
-    GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, requestedPid);
+    GstElement* muxSourceElement = capsfilter ? capsfilter : parser;
+    GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
+    GstPad* muxSinkPad = ctx->flvMux
+        ? requestFlvMuxSinkPad(ctx->mux, isVideo)
+        : requestMuxSinkPad(ctx->mux, requestedPid);
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
         if (muxSinkPad) gst_object_unref(muxSinkPad);
@@ -1203,6 +1411,10 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     gst_object_unref(parserSrcPad);
     gst_object_unref(muxSinkPad);
     gst_object_unref(pipeline);
+}
+
+void StreamManager::onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data) {
+    onDemuxPadAdded(demux, pad, user_data);
 }
 
 void StreamManager::attachBitrateProbes(StreamState* state) {
@@ -1275,6 +1487,7 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         if (!inputAttached && factoryName &&
             (g_strcmp0(factoryName, "srtsrc") == 0 ||
              g_strcmp0(factoryName, "srtclientsrc") == 0 ||
+             g_strcmp0(factoryName, "rtmpsrc") == 0 ||
              g_strcmp0(factoryName, "souphttpsrc") == 0 ||
              g_strcmp0(factoryName, "udpsrc") == 0 ||
              g_strcmp0(factoryName, "filesrc") == 0)) {
@@ -1294,6 +1507,7 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         if (!outputAttached && factoryName &&
             (g_strcmp0(factoryName, "udpsink") == 0 ||
              g_strcmp0(factoryName, "srtsink") == 0 ||
+             g_strcmp0(factoryName, "rtmpsink") == 0 ||
              g_strcmp0(factoryName, "multifdsink") == 0 ||
              g_strcmp0(factoryName, "hlssink") == 0)) {
             GstPad* sinkPad = gst_element_get_static_pad(element, "sink");

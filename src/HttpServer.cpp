@@ -115,6 +115,18 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
     if (type == "srt") {
         return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort);
     }
+    if (type == "youtube") {
+        const std::string hostLower = toLower(cfg.outputHost);
+        return hostLower.rfind("rtmp", 0) == 0
+            ? cfg.outputHost
+            : "rtmp://a.rtmp.youtube.com/live2/" + cfg.outputHost;
+    }
+    if (type == "rtmp") {
+        const std::string hostLower = toLower(cfg.outputHost);
+        return hostLower.rfind("rtmp", 0) == 0
+            ? cfg.outputHost
+            : "rtmp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
+    }
     if (type == "http") {
         return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/stream/" + cfg.id + ".ts";
     }
@@ -766,11 +778,11 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087 или https://host/live.m3u8" /></div>
+        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="udp://127.0.0.1:9087, rtmp://camera/live/stream или https://host/live.m3u8" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
-        <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp" ${outputType==='udp'?'selected':''}>UDP MPEG-TS</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option></select></div>
+        <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp" ${outputType==='udp'?'selected':''}>UDP MPEG-TS</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
         <div class="form-row"><label id="streamOutputHostLabel">Адрес выхода</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
         <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
         <div class="form-row full"><label>URL для плеера</label><input class="compact" id="streamPreviewUrl" readonly value="${stream.vlc_link||''}" placeholder="Ссылка появится после сохранения" /></div>
@@ -817,6 +829,16 @@ function updateOutputHints() {
     if (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1') {
       host.value = '0.0.0.0';
     }
+  } else if (type === 'youtube') {
+    hostLabel.textContent = 'YouTube key / URL';
+    portLabel.textContent = 'Порт';
+    port.disabled = true;
+    host.placeholder = 'xxxx-xxxx-xxxx-xxxx или rtmp://a.rtmp.youtube.com/live2/...';
+  } else if (type === 'rtmp') {
+    hostLabel.textContent = 'RTMP URL / host';
+    portLabel.textContent = 'RTMP порт';
+    port.disabled = false;
+    host.placeholder = 'rtmp://server/app/key или server.example.com';
   } else {
     hostLabel.textContent = 'Мультикаст / UDP IP';
     portLabel.textContent = 'UDP порт';
