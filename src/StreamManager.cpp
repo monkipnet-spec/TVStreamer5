@@ -17,6 +17,7 @@
 namespace {
 
 constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
+constexpr guint kTsSmoothingLatencyUsec = 700000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -154,13 +155,14 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
         "async", FALSE,
-        "sync", FALSE,
+        "sync", cfg.cbr ? TRUE : FALSE,
         "buffer-size", kUdpSocketBufferSize,
         nullptr);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
         setBooleanPropertyIfPresent(sink, "qos", FALSE);
         setInt64PropertyIfPresent(sink, "max-lateness", -1);
+        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
 
     if (!cfg.interfaceAddress.empty() && !multicastOutput) {
@@ -213,6 +215,15 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         "max-size-bytes", 0,
         "max-size-time", maxSizeTime,
         nullptr);
+}
+
+void configureTsParse(GstElement* tsparse, bool smoothTimestamps) {
+    if (!tsparse || !smoothTimestamps) {
+        return;
+    }
+
+    setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
+    setIntPropertyIfPresent(tsparse, "smoothing-latency", static_cast<gint>(kTsSmoothingLatencyUsec));
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
@@ -594,7 +605,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     state->config.inputUri = inputUri;
     state->remapContext.reset();
-    if (state->config.remapEnabled || state->config.cbr) {
+    if (state->config.remapEnabled) {
         state->remapContext = std::make_unique<RemapContext>();
         state->remapContext->config = state->config;
     }
@@ -664,7 +675,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     bool ok = false;
-    if (cfg.remapEnabled || cfg.cbr) {
+    if (cfg.remapEnabled) {
         if (!state->remapContext) {
             state->remapContext = std::make_unique<RemapContext>();
         }
@@ -942,6 +953,7 @@ bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement
         return false;
     }
 
+    configureTsParse(tsparse, cfg.cbr);
     configureQueue(queue);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
@@ -976,6 +988,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
 
     configureQueue(preDemuxQueue);
     configureQueue(outputQueue);
+    configureTsParse(tsparse, state->config.cbr);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
