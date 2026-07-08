@@ -60,6 +60,12 @@ void setIntPropertyIfPresent(GstElement* element, const char* propertyName, gint
     }
 }
 
+void setUIntPropertyIfPresent(GstElement* element, const char* propertyName, guint value) {
+    if (hasProperty(element, propertyName)) {
+        g_object_set(element, propertyName, value, nullptr);
+    }
+}
+
 void setUInt64PropertyIfPresent(GstElement* element, const char* propertyName, guint64 value) {
     if (hasProperty(element, propertyName)) {
         g_object_set(element, propertyName, value, nullptr);
@@ -195,7 +201,8 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         ? "127.0.0.1"
         : cfg.outputHost;
     const std::string bindHost = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
-    const std::string uri = "srt://" + (caller ? targetHost : bindHost) + ":" + std::to_string(cfg.outputPort);
+    const std::string uri = "srt://" + (caller ? targetHost : bindHost) + ":" +
+        std::to_string(cfg.outputPort) + "?mode=" + mode;
 
     g_object_set(sink,
         "uri", uri.c_str(),
@@ -208,6 +215,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     setBooleanPropertyIfPresent(sink, "wait-for-connection", FALSE);
     if (!caller) {
         setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
+        setUIntPropertyIfPresent(sink, "localport", static_cast<guint>(cfg.outputPort));
     }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
@@ -215,7 +223,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
     if (caller) {
-        setIntPropertyIfPresent(sink, "localport", 0);
+        setUIntPropertyIfPresent(sink, "localport", 0);
     }
 
     if (cfg.targetBitrate > 0) {
@@ -1028,7 +1036,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         } else {
             setIntPropertyIfPresent(src, "mode", 1);
             setBooleanPropertyIfPresent(src, "wait-for-connection", FALSE);
-            setIntPropertyIfPresent(src, "localport", 0);
+            setUIntPropertyIfPresent(src, "localport", 0);
         }
 
         if (!gst_element_link(src, queue)) {
