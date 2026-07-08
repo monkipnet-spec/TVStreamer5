@@ -20,7 +20,7 @@ constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
 constexpr guint64 kCbrInitialLatencyNs = 100 * GST_MSECOND;
 constexpr guint64 kCbrMaxLateNs = 25 * GST_MSECOND;
 constexpr guint64 kCbrMaxAheadNs = 500 * GST_MSECOND;
-constexpr auto kInputFailoverDelay = std::chrono::seconds(2);
+constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
 bool hasElementFactory(const char* name) {
@@ -1399,7 +1399,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     state->config,
                     "🟡",
                     "Основной поток пропал",
-                    "Нет входных данных 2 секунды\nПереключаюсь на резерв\nBackup: " + state->config.backupInputUri);
+                    "Нет входных данных 5 секунд\nПереключаюсь на резерв\nBackup: " + state->config.backupInputUri);
             if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
                 bus = state->bus;
                 state->inputLossNotified = false;
@@ -1447,7 +1447,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->config,
                 "🔴",
                 "Нет входного сигнала",
-                "Входных данных нет 2 секунды\nРезервная ссылка не задана\nURL: " + state->activeInputUri);
+                "Входных данных нет 5 секунд\nРезервная ссылка не задана\nURL: " + state->activeInputUri);
         }
 
         GstMessage* msg = gst_bus_timed_pop(bus, 500000000LL);
