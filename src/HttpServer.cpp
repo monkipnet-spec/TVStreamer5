@@ -113,7 +113,8 @@ std::string advertisedHost(const StreamConfig& cfg) {
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = toLower(cfg.outputType);
     if (type == "srt") {
-        return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort);
+        const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
+        return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
     }
     if (type == "youtube") {
         const std::string hostLower = toLower(cfg.outputHost);

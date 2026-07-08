@@ -205,7 +205,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         nullptr);
 
     setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
-    setBooleanPropertyIfPresent(sink, "wait-for-connection", caller ? FALSE : TRUE);
+    setBooleanPropertyIfPresent(sink, "wait-for-connection", FALSE);
     if (!caller) {
         setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
     }
