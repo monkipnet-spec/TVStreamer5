@@ -264,7 +264,7 @@ treated as `udp`.
 
 ```text
 udp   MPEG-TS over UDP unicast or multicast
-srt   MPEG-TS over SRT listener
+srt   MPEG-TS over SRT listener or caller
 http  MPEG-TS over HTTP at /stream/<stream-id>.ts
 hls   HLS playlist at /hls/<stream-id>/playlist.m3u8
 rtmp  FLV over RTMP push
@@ -286,8 +286,10 @@ Output host and port meaning depends on the selected format:
 
 ```text
 UDP:  output_host is the unicast/multicast destination, output_port is UDP port.
-SRT:  output_host is the address advertised in the SRT player URL; output_port is
-      the listener port. TVStreamer5 binds SRT to interface_address or 0.0.0.0.
+SRT:  output_mode selects listener or caller. In listener mode, output_host is
+      the address advertised in the SRT player URL and TVStreamer5 binds SRT to
+      interface_address or 0.0.0.0. In caller mode, output_host is the remote
+      SRT listener to connect to. output_port is the SRT port in both modes.
 HTTP: output_host is the address advertised in the player URL; port is web UI port.
 HLS:  output_host is the address advertised in the player URL; port is web UI port.
 RTMP: output_host is a full RTMP/RTMPS URL or host; output_port is used for host mode.
@@ -351,6 +353,7 @@ Minimal stream object:
   "backup_input_uri": "srt://192.168.1.10:9000",
   "input_mode": "auto",
   "output_type": "udp",
+  "output_mode": "listener",
   "output_host": "239.1.1.1",
   "output_port": 1234,
   "interface_address": "",

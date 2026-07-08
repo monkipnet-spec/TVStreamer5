@@ -764,7 +764,7 @@ function openTelegramModal() {
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
-    name:'', input_uri:'', backup_input_uri:'', output_type:'udp', output_host:'127.0.0.1', output_port:1234,
+    name:'', input_uri:'', backup_input_uri:'', output_type:'udp', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
     interface_address:'', input_mode:'auto', remap_enabled:false, cbr:true, target_bitrate:2000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:''
   });
@@ -783,6 +783,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
         <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp" ${outputType==='udp'?'selected':''}>UDP MPEG-TS</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
+        <div class="form-row" id="streamOutputModeRow"><label>Режим SRT выхода</label><select class="compact" id="streamOutputMode" onchange="updateOutputHints()"><option value="listener" ${(!stream.output_mode || stream.output_mode==='listener')?'selected':''}>SRT Listener</option><option value="caller" ${stream.output_mode==='caller'?'selected':''}>SRT Caller</option></select></div>
         <div class="form-row"><label id="streamOutputHostLabel">Адрес выхода</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
         <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
         <div class="form-row full"><label>URL для плеера</label><input class="compact" id="streamPreviewUrl" readonly value="${stream.vlc_link||''}" placeholder="Ссылка появится после сохранения" /></div>
@@ -814,7 +815,10 @@ function updateOutputHints() {
   const portLabel = document.getElementById('streamOutputPortLabel');
   const host = document.getElementById('streamOutputHost');
   const port = document.getElementById('streamOutputPort');
+  const outputModeRow = document.getElementById('streamOutputModeRow');
+  const outputMode = document.getElementById('streamOutputMode')?.value || 'listener';
   if (!hostLabel || !portLabel || !host || !port) return;
+  if (outputModeRow) outputModeRow.style.display = type === 'srt' ? '' : 'none';
   if (type === 'http' || type === 'hls') {
     hostLabel.textContent = 'Адрес для ссылки';
     portLabel.textContent = 'Порт панели';
@@ -822,12 +826,14 @@ function updateOutputHints() {
     port.disabled = true;
     host.placeholder = 'IP интерфейса или DNS';
   } else if (type === 'srt') {
-    hostLabel.textContent = 'SRT host';
+    hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';
     portLabel.textContent = 'SRT порт';
     port.disabled = false;
-    host.placeholder = '0.0.0.0 для listener';
-    if (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1') {
+    host.placeholder = outputMode === 'caller' ? 'server.example.com или IP' : '0.0.0.0 для listener';
+    if (outputMode === 'listener' && (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1')) {
       host.value = '0.0.0.0';
+    } else if (outputMode === 'caller' && (!host.value || host.value === '0.0.0.0' || host.value === '239.0.0.1')) {
+      host.value = '127.0.0.1';
     }
   } else if (type === 'youtube') {
     hostLabel.textContent = 'YouTube key / URL';
@@ -876,6 +882,7 @@ function saveStream(id) {
     name: document.getElementById('streamName').value,
     input_uri: document.getElementById('streamInput').value,
     output_type: document.getElementById('streamOutputType').value,
+    output_mode: document.getElementById('streamOutputMode')?.value || 'listener',
     output_host: document.getElementById('streamOutputHost').value,
     output_port: Number(document.getElementById('streamOutputPort').value),
     backup_input_uri: document.getElementById('streamBackupInput').value,

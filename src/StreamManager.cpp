@@ -110,6 +110,11 @@ std::string outputType(const StreamConfig& cfg) {
     return type;
 }
 
+std::string srtOutputMode(const StreamConfig& cfg) {
+    const std::string mode = toLower(cfg.outputMode);
+    return mode == "caller" ? "caller" : "listener";
+}
+
 bool isRtmpUri(const std::string& uriLower) {
     return uriLower.rfind("rtmp://", 0) == 0 ||
            uriLower.rfind("rtmps://", 0) == 0 ||
@@ -184,8 +189,13 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
 }
 
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
+    const std::string mode = srtOutputMode(cfg);
+    const bool caller = mode == "caller";
+    const std::string targetHost = cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::"
+        ? "127.0.0.1"
+        : cfg.outputHost;
     const std::string bindHost = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
-    const std::string uri = "srt://" + bindHost + ":" + std::to_string(cfg.outputPort);
+    const std::string uri = "srt://" + (caller ? targetHost : bindHost) + ":" + std::to_string(cfg.outputPort);
 
     g_object_set(sink,
         "uri", uri.c_str(),
@@ -194,14 +204,19 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         "blocksize", static_cast<guint>(kTsPacketsPerUdpBuffer * 188),
         nullptr);
 
-    setIntPropertyIfPresent(sink, "mode", 2);
-    setBooleanPropertyIfPresent(sink, "wait-for-connection", TRUE);
-    setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
+    setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
+    setBooleanPropertyIfPresent(sink, "wait-for-connection", caller ? FALSE : TRUE);
+    if (!caller) {
+        setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
+    }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
     setIntPropertyIfPresent(sink, "latency", 250);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
+    if (caller) {
+        setIntPropertyIfPresent(sink, "localport", 0);
+    }
 
     if (cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
@@ -708,6 +723,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " input_mode=" << cfg.inputMode
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
          << " output_type=" << outputType(cfg)
+         << " output_mode=" << srtOutputMode(cfg)
          << " output=" << cfg.outputHost << ":" << cfg.outputPort
          << " iface=" << cfg.interfaceAddress
          << " service_id=" << cfg.serviceId
@@ -1012,6 +1028,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         } else {
             setIntPropertyIfPresent(src, "mode", 1);
             setBooleanPropertyIfPresent(src, "wait-for-connection", FALSE);
+            setIntPropertyIfPresent(src, "localport", 0);
         }
 
         if (!gst_element_link(src, queue)) {

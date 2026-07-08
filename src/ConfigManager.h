@@ -12,6 +12,7 @@ struct StreamConfig {
     std::string inputUri;
     std::string backupInputUri;
     std::string outputType = "udp";
+    std::string outputMode = "listener";
     std::string outputHost = "127.0.0.1";
     int outputPort = 1234;
     std::string interfaceAddress;
