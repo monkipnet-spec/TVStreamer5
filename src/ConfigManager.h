@@ -32,6 +32,7 @@ struct StreamConfig {
 struct AppConfig {
     std::string login = "admin";
     std::string password = "admin";
+    std::string serverName = "TVStreamer5";
     int httpPort = 9000;
     std::string telegramToken;
     std::string telegramChatId;

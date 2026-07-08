@@ -558,8 +558,12 @@ void StreamManager::notifyStreamState(
     const std::string& color,
     const std::string& title,
     const std::string& details) {
+    const std::string serverName = configManager.config.serverName.empty()
+        ? "TVStreamer5"
+        : configManager.config.serverName;
     std::ostringstream message;
     message << color << " <b>" << telegramEscape(title) << "</b>\n"
+            << "Сервер: <b>" << telegramEscape(serverName) << "</b>\n"
             << "Канал: <b>" << telegramEscape(displayName(cfg)) << "</b>\n"
             << "ID: <code>" << telegramEscape(cfg.id) << "</code>";
     if (!details.empty()) {

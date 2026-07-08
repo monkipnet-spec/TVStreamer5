@@ -56,6 +56,46 @@ std::string cleanPathToken(const std::string& value, bool allowDot = false) {
     return cleaned;
 }
 
+std::string base64Decode(const std::string& value) {
+    static const std::string alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string decoded;
+    int buffer = 0;
+    int bits = -8;
+
+    for (unsigned char ch : value) {
+        if (std::isspace(ch)) {
+            continue;
+        }
+        if (ch == '=') {
+            break;
+        }
+        const auto pos = alphabet.find(static_cast<char>(ch));
+        if (pos == std::string::npos) {
+            return "";
+        }
+        buffer = (buffer << 6) + static_cast<int>(pos);
+        bits += 6;
+        if (bits >= 0) {
+            decoded.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return decoded;
+}
+
+bool constantTimeEquals(const std::string& left, const std::string& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    unsigned char diff = 0;
+    for (size_t i = 0; i < left.size(); ++i) {
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return diff == 0;
+}
+
 std::string advertisedHost(const StreamConfig& cfg) {
     if (cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::") {
         if (!cfg.interfaceAddress.empty()) {
@@ -121,6 +161,13 @@ void HttpServer::handleSession(tcp::socket socket) {
         res.keep_alive(req.keep_alive());
 
         const std::string target(req.target());
+        if (requiresAuthentication(target) && !isAuthorized(req)) {
+            writeUnauthorized(res);
+            res.content_length(res.body().size());
+            http::write(socket, res);
+            return;
+        }
+
         if (req.method() == http::verb::get) {
             if (target.rfind("/stream/", 0) == 0 && handleHttpStream(socket, target)) {
                 return;
@@ -173,6 +220,43 @@ void HttpServer::handleSession(tcp::socket socket) {
     }
 }
 
+bool HttpServer::requiresAuthentication(const std::string& target) const {
+    return target != "/health" &&
+           target.rfind("/stream/", 0) != 0 &&
+           target.rfind("/hls/", 0) != 0;
+}
+
+bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const {
+    const auto auth = req.find(http::field::authorization);
+    if (auth == req.end()) {
+        return false;
+    }
+
+    const std::string header(auth->value());
+    const std::string prefix = "Basic ";
+    if (header.size() <= prefix.size() || !boost::algorithm::istarts_with(header, prefix)) {
+        return false;
+    }
+
+    const std::string decoded = base64Decode(header.substr(prefix.size()));
+    const auto separator = decoded.find(':');
+    if (separator == std::string::npos) {
+        return false;
+    }
+
+    const std::string login = decoded.substr(0, separator);
+    const std::string password = decoded.substr(separator + 1);
+    return constantTimeEquals(login, configManager.config.login) &&
+           constantTimeEquals(password, configManager.config.password);
+}
+
+void HttpServer::writeUnauthorized(http::response<http::string_body>& res) const {
+    res.result(http::status::unauthorized);
+    res.set(http::field::www_authenticate, "Basic realm=\"TVStreamer5\"");
+    res.set(http::field::content_type, "text/plain; charset=UTF-8");
+    res.body() = "Unauthorized";
+}
+
 std::string HttpServer::listInterfaces() {
     Json::Value root;
     auto interfaces = enumerateNetworkInterfaces();
@@ -189,6 +273,7 @@ std::string HttpServer::listInterfaces() {
 std::string HttpServer::currentState() {
     Json::Value root;
     root["login"] = configManager.config.login;
+    root["server_name"] = configManager.config.serverName;
     root["http_port"] = configManager.config.httpPort;
     root["telegram_token"] = configManager.config.telegramToken;
     root["telegram_chat_id"] = configManager.config.telegramChatId;
@@ -405,7 +490,17 @@ void HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Invalid config payload: " << errs << std::endl;
         return;
     }
-    configManager.config = AppConfig::fromJson(root);
+    AppConfig nextConfig = AppConfig::fromJson(root);
+    if (!root.isMember("login") || root.get("login", "").asString().empty()) {
+        nextConfig.login = configManager.config.login;
+    }
+    if (!root.isMember("password") || root.get("password", "").asString().empty()) {
+        nextConfig.password = configManager.config.password;
+    }
+    if (!root.isMember("server_name") || root.get("server_name", "").asString().empty()) {
+        nextConfig.serverName = configManager.config.serverName;
+    }
+    configManager.config = nextConfig;
     configManager.save();
 }
 
@@ -628,7 +723,8 @@ function openLoginModal() {
     <h2>Пользователь</h2>
     <div class="form-grid full">
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
-      <div class="form-row"><label>Password</label><input id="password" type="password" value="${state.password||''}" /></div>
+      <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
+      <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
     </div>
     <div class="modal-actions">
       <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -734,12 +830,14 @@ function syncOutputHostWithInterface() {
 function saveSettings() {
   const payload = {
     login: document.getElementById('login')?.value || state.login,
-    password: document.getElementById('password')?.value || state.password,
+    server_name: document.getElementById('serverName')?.value || state.server_name,
     telegram_token: document.getElementById('telegramToken')?.value || state.telegram_token,
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
     http_port: state.http_port,
     streams: state.streams
   };
+  const password = document.getElementById('password')?.value;
+  if (password) payload.password = password;
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     .then(()=>{closeModal();fetchState();});
 }
@@ -771,7 +869,7 @@ function saveStream(id) {
   }
   const savePayload = {
     login: state.login,
-    password: state.password,
+    server_name: state.server_name,
     telegram_token: state.telegram_token,
     telegram_chat_id: state.telegram_chat_id,
     http_port: state.http_port,

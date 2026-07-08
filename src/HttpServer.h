@@ -37,6 +37,9 @@ private:
 
     void doAccept();
     void handleSession(tcp::socket socket);
+    bool requiresAuthentication(const std::string& target) const;
+    bool isAuthorized(const http::request<http::string_body>& req) const;
+    void writeUnauthorized(http::response<http::string_body>& res) const;
     std::string listInterfaces();
     std::string currentState();
     std::string qualityHistory(const std::string& target);
