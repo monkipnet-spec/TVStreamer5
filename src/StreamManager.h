@@ -79,6 +79,7 @@ private:
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
+    static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);

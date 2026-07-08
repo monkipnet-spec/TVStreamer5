@@ -184,9 +184,8 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
 }
 
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
-    const std::string host = cfg.outputHost.empty() ? "0.0.0.0" : cfg.outputHost;
-    const bool listener = host == "0.0.0.0" || host == "::";
-    const std::string uri = "srt://" + host + ":" + std::to_string(cfg.outputPort);
+    const std::string bindHost = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
+    const std::string uri = "srt://" + bindHost + ":" + std::to_string(cfg.outputPort);
 
     g_object_set(sink,
         "uri", uri.c_str(),
@@ -195,8 +194,9 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         "blocksize", static_cast<guint>(kTsPacketsPerUdpBuffer * 188),
         nullptr);
 
-    setIntPropertyIfPresent(sink, "mode", listener ? 2 : 1);
+    setIntPropertyIfPresent(sink, "mode", 2);
     setBooleanPropertyIfPresent(sink, "wait-for-connection", TRUE);
+    setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
     setIntPropertyIfPresent(sink, "latency", 250);
@@ -469,6 +469,55 @@ GstElement* capsFilterForMux(bool flvMux, bool isVideo, bool isAudio, const std:
         gst_object_unref(filter);
         return nullptr;
     }
+    g_object_set(filter, "caps", caps, nullptr);
+    gst_caps_unref(caps);
+    return filter;
+}
+
+struct RtspPayloadFactories {
+    const char* depay = nullptr;
+    const char* parser = nullptr;
+    const char* muxCaps = nullptr;
+    bool isVideo = false;
+    bool isAudio = false;
+};
+
+RtspPayloadFactories rtspPayloadFactories(const std::string& capsString) {
+    const std::string capsLower = toLower(capsString);
+    if (capsLower.find("media=(string)video") != std::string::npos &&
+        capsLower.find("encoding-name=(string)h264") != std::string::npos) {
+        return {"rtph264depay", "h264parse", "video/x-h264,stream-format=(string)byte-stream", true, false};
+    }
+    if (capsLower.find("media=(string)video") != std::string::npos &&
+        (capsLower.find("encoding-name=(string)h265") != std::string::npos ||
+         capsLower.find("encoding-name=(string)hevc") != std::string::npos)) {
+        return {"rtph265depay", "h265parse", "video/x-h265,stream-format=(string)byte-stream", true, false};
+    }
+    if (capsLower.find("media=(string)audio") != std::string::npos &&
+        (capsLower.find("encoding-name=(string)mpeg4-generic") != std::string::npos ||
+         capsLower.find("encoding-name=(string)mp4a-latm") != std::string::npos)) {
+        return {"rtpmp4gdepay", "aacparse", nullptr, false, true};
+    }
+    if (capsLower.find("media=(string)audio") != std::string::npos &&
+        capsLower.find("encoding-name=(string)mpa") != std::string::npos) {
+        return {"rtpmpadepay", "mpegaudioparse", nullptr, false, true};
+    }
+    return {};
+}
+
+GstElement* makeCapsFilter(const char* capsDescription) {
+    if (!capsDescription) {
+        return nullptr;
+    }
+
+    GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
+    GstCaps* caps = gst_caps_from_string(capsDescription);
+    if (!filter || !caps) {
+        if (filter) gst_object_unref(filter);
+        if (caps) gst_caps_unref(caps);
+        return nullptr;
+    }
+
     g_object_set(filter, "caps", caps, nullptr);
     gst_caps_unref(caps);
     return filter;
@@ -890,6 +939,48 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         state->sourceContext->config = cfg;
         state->sourceContext->flvMux = false;
         g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onFlvDemuxPadAdded), state->sourceContext.get());
+
+        terminalElement = outputQueue;
+        return src;
+    }
+
+    if (inputLower.rfind("rtsp://", 0) == 0 || inputLower.rfind("rtsps://", 0) == 0) {
+        if (!hasElementFactory("rtspsrc") || !hasElementFactory("mpegtsmux")) {
+            std::cerr << "missing RTSP input elements: rtspsrc or mpegtsmux" << std::endl;
+            return nullptr;
+        }
+
+        GstElement* src = gst_element_factory_make("rtspsrc", "input_src");
+        GstElement* mux = gst_element_factory_make("mpegtsmux", "input_rtsp_ts_mux");
+        GstElement* outputQueue = gst_element_factory_make("queue", "input_queue");
+        if (!src || !mux || !outputQueue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, mux) ||
+            !addElementOrFail(pipeline, outputQueue)) {
+            return nullptr;
+        }
+
+        g_object_set(src,
+            "location", input.c_str(),
+            "latency", 300,
+            "do-rtsp-keep-alive", TRUE,
+            nullptr);
+        setUInt64PropertyIfPresent(src, "timeout", 15000000);
+        setBooleanPropertyIfPresent(src, "ntp-sync", FALSE);
+        configureQueue(outputQueue, 5000000000ULL);
+        configureTsMux(mux, cfg);
+
+        if (!gst_element_link(mux, outputQueue)) {
+            return nullptr;
+        }
+
+        if (!state->sourceContext) {
+            state->sourceContext = std::make_unique<RemapContext>();
+        }
+        state->sourceContext->mux = mux;
+        state->sourceContext->config = cfg;
+        state->sourceContext->flvMux = false;
+        g_signal_connect(src, "pad-added", G_CALLBACK(StreamManager::onRtspPadAdded), state->sourceContext.get());
 
         terminalElement = outputQueue;
         return src;
@@ -1417,6 +1508,127 @@ void StreamManager::onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer 
     onDemuxPadAdded(demux, pad, user_data);
 }
 
+void StreamManager::onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data) {
+    (void)src;
+    auto* ctx = static_cast<RemapContext*>(user_data);
+    if (!ctx || !ctx->mux) {
+        return;
+    }
+
+    GstCaps* caps = gst_pad_get_current_caps(pad);
+    if (!caps) {
+        caps = gst_pad_query_caps(pad, nullptr);
+    }
+    std::string capsString = caps ? gst_caps_to_string(caps) : "unknown";
+    if (caps) {
+        gst_caps_unref(caps);
+    }
+
+    RtspPayloadFactories factories = rtspPayloadFactories(capsString);
+    if (!factories.depay || !factories.parser) {
+        std::cerr << "RTSP skipped unsupported RTP caps: " << capsString << std::endl;
+        return;
+    }
+    if ((factories.isVideo && ctx->videoLinked) || (factories.isAudio && ctx->audioLinked)) {
+        return;
+    }
+    if (!hasElementFactory(factories.depay) || !hasElementFactory(factories.parser)) {
+        std::cerr << "missing RTSP payload elements: " << factories.depay
+                  << " or " << factories.parser << std::endl;
+        return;
+    }
+
+    GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+    if (!pipeline) {
+        return;
+    }
+
+    GstElement* queue = gst_element_factory_make("queue", nullptr);
+    GstElement* depay = gst_element_factory_make(factories.depay, nullptr);
+    GstElement* parser = gst_element_factory_make(factories.parser, nullptr);
+    GstElement* capsfilter = makeCapsFilter(factories.muxCaps);
+    if (!queue || !depay || !parser) {
+        if (queue) gst_object_unref(queue);
+        if (depay) gst_object_unref(depay);
+        if (parser) gst_object_unref(parser);
+        if (capsfilter) gst_object_unref(capsfilter);
+        gst_object_unref(pipeline);
+        return;
+    }
+
+    if (!gst_bin_add(GST_BIN(pipeline), queue) ||
+        !gst_bin_add(GST_BIN(pipeline), depay) ||
+        !gst_bin_add(GST_BIN(pipeline), parser) ||
+        (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter))) {
+        if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+        if (depay && !GST_OBJECT_PARENT(depay)) gst_object_unref(depay);
+        if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
+        if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
+        gst_object_unref(pipeline);
+        return;
+    }
+
+    configureQueue(queue, 5000000000ULL);
+    if (g_strcmp0(factories.parser, "h264parse") == 0 || g_strcmp0(factories.parser, "h265parse") == 0) {
+        g_object_set(parser, "config-interval", 1, nullptr);
+    }
+
+    gst_element_sync_state_with_parent(queue);
+    gst_element_sync_state_with_parent(depay);
+    gst_element_sync_state_with_parent(parser);
+    if (capsfilter) {
+        gst_element_sync_state_with_parent(capsfilter);
+    }
+
+    const bool parserLinked = capsfilter
+        ? gst_element_link_many(queue, depay, parser, capsfilter, nullptr)
+        : gst_element_link_many(queue, depay, parser, nullptr);
+    if (!parserLinked) {
+        gst_object_unref(pipeline);
+        return;
+    }
+
+    GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
+    if (!queueSinkPad) {
+        gst_object_unref(pipeline);
+        return;
+    }
+    if (gst_pad_link(pad, queueSinkPad) != GST_PAD_LINK_OK) {
+        gst_object_unref(queueSinkPad);
+        gst_object_unref(pipeline);
+        return;
+    }
+    gst_object_unref(queueSinkPad);
+
+    const uint32_t requestedPid = factories.isVideo ? ctx->config.videoPid : ctx->config.audioPid;
+    GstElement* muxSourceElement = capsfilter ? capsfilter : parser;
+    GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
+    GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, requestedPid);
+    if (!parserSrcPad || !muxSinkPad) {
+        if (parserSrcPad) gst_object_unref(parserSrcPad);
+        if (muxSinkPad) gst_object_unref(muxSinkPad);
+        gst_object_unref(pipeline);
+        return;
+    }
+
+    if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+        const gchar* padName = GST_PAD_NAME(muxSinkPad);
+        if (factories.isVideo) {
+            ctx->videoLinked = true;
+            ctx->videoPadName = padName ? padName : "";
+        }
+        if (factories.isAudio) {
+            ctx->audioLinked = true;
+            ctx->audioPadName = padName ? padName : "";
+        }
+        updateMuxProgramMap(ctx);
+    }
+
+    gst_object_unref(parserSrcPad);
+    gst_object_unref(muxSinkPad);
+    gst_object_unref(pipeline);
+}
+
 void StreamManager::attachBitrateProbes(StreamState* state) {
     if (!state || !state->pipeline) {
         return;
@@ -1487,6 +1699,7 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         if (!inputAttached && factoryName &&
             (g_strcmp0(factoryName, "srtsrc") == 0 ||
              g_strcmp0(factoryName, "srtclientsrc") == 0 ||
+             g_strcmp0(factoryName, "rtspsrc") == 0 ||
              g_strcmp0(factoryName, "rtmpsrc") == 0 ||
              g_strcmp0(factoryName, "souphttpsrc") == 0 ||
              g_strcmp0(factoryName, "udpsrc") == 0 ||

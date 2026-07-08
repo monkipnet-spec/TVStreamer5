@@ -1,8 +1,9 @@
 # TVStreamer5
 
-TVStreamer5 receives SRT/HTTP/HLS/UDP/RTP MPEG-TS streams, optionally remaps
-service/PID metadata, monitors input quality, switches to a backup source when
-the primary source disappears, and outputs streams as UDP, SRT, HTTP TS, or HLS.
+TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS/UDP/RTP MPEG-TS
+streams, optionally remaps service/PID metadata, monitors input quality,
+switches to a backup source when the primary source disappears, and outputs
+streams as UDP, SRT listener, HTTP TS, HLS, RTMP, or YouTube Live.
 
 ## Build on the Host
 
@@ -89,8 +90,8 @@ chmod +x scripts/build_container.sh scripts/run_container.sh
 ./scripts/run_container.sh
 ```
 
-The run script uses `--network host` so SRT, UDP, RTP, multicast, HTTP TS, HLS,
-and the web UI can use the host network directly. The application reads
+The run script uses `--network host` so RTSP inputs, SRT, UDP, RTP, multicast,
+HTTP TS, HLS, and the web UI can use the host network directly. The application reads
 `tvstreamer5-config.json` from `/data` inside the container. If `CONFIG_FILE`
 points to a file with a different name, the run script mounts it as
 `/data/tvstreamer5-config.json` automatically.
@@ -232,6 +233,8 @@ GST_DEBUG=2 ./scripts/run_container.sh
 Examples:
 
 ```text
+rtsp://user:password@192.168.1.10:554/stream1
+rtsps://192.168.1.10/live
 srt://192.168.1.10:9000
 rtmp://192.168.1.10/live/camera1
 http://192.168.1.10:8080/stream.ts
@@ -240,6 +243,11 @@ udp://239.1.1.1:1234
 rtp://239.1.1.1:5004
 test://bars
 ```
+
+RTSP camera input is remuxed to MPEG-TS before the common output pipeline. The
+current RTSP path supports common camera payloads: H.264/H.265 video and
+AAC/MPA audio. Use the full camera URL, including username and password when the
+camera requires authentication.
 
 For SRT, set `input_mode` to:
 
@@ -256,7 +264,7 @@ treated as `udp`.
 
 ```text
 udp   MPEG-TS over UDP unicast or multicast
-srt   MPEG-TS over SRT
+srt   MPEG-TS over SRT listener
 http  MPEG-TS over HTTP at /stream/<stream-id>.ts
 hls   HLS playlist at /hls/<stream-id>/playlist.m3u8
 rtmp  FLV over RTMP push
@@ -278,7 +286,8 @@ Output host and port meaning depends on the selected format:
 
 ```text
 UDP:  output_host is the unicast/multicast destination, output_port is UDP port.
-SRT:  output_host is the SRT destination. Use 0.0.0.0 for listener mode.
+SRT:  output_host is the address advertised in the SRT player URL; output_port is
+      the listener port. TVStreamer5 binds SRT to interface_address or 0.0.0.0.
 HTTP: output_host is the address advertised in the player URL; port is web UI port.
 HLS:  output_host is the address advertised in the player URL; port is web UI port.
 RTMP: output_host is a full RTMP/RTMPS URL or host; output_port is used for host mode.
@@ -287,8 +296,9 @@ YouTube: output_host is the stream key or a full RTMP/RTMPS ingest URL.
 
 The web UI lets you choose the output interface. For UDP multicast it is used as
 the multicast interface. For UDP unicast it is used as the bind address. For SRT
-it is used as the local address when supported by the GStreamer SRT plugin.
-RTMP camera input and RTMP/YouTube output remux H.264/AAC without transcoding.
+it is used as the local listener address when supported by the GStreamer SRT
+plugin. RTSP and RTMP camera input and RTMP/YouTube output remux common
+H.264/H.265/AAC streams without transcoding where supported.
 
 ## Backup Failover
 
@@ -337,7 +347,7 @@ Minimal stream object:
 {
   "id": "channel-1",
   "name": "Channel 1",
-  "input_uri": "udp://@:1234",
+  "input_uri": "rtsp://user:password@192.168.1.10:554/stream1",
   "backup_input_uri": "srt://192.168.1.10:9000",
   "input_mode": "auto",
   "output_type": "udp",
