@@ -17,9 +17,6 @@
 namespace {
 
 constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
-constexpr guint64 kCbrInitialLatencyNs = 100 * GST_MSECOND;
-constexpr guint64 kCbrMaxLateNs = 25 * GST_MSECOND;
-constexpr guint64 kCbrMaxAheadNs = 500 * GST_MSECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -141,7 +138,7 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
         "async", FALSE,
-        "sync", FALSE,
+        "sync", cfg.cbr ? TRUE : FALSE,
         "buffer-size", kUdpSocketBufferSize,
         nullptr);
 
@@ -494,11 +491,6 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     for (auto& [id, statePtr] : streams) {
         if (statePtr->pipeline) {
             updateBitrateEstimates(statePtr.get());
-            if (statePtr->outputBitrate.load() == 0 &&
-                statePtr->config.targetBitrate > 0 &&
-                statePtr->config.cbr) {
-                statePtr->outputBitrate = statePtr->config.targetBitrate;
-            }
         }
         result[id] = statePtr.get();
     }
@@ -620,9 +612,6 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->lastInputBytesSeen = 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
-    state->cbrPacingStarted = false;
-    state->cbrNextPtsNs = 0;
-    state->cbrDurationRemainder = 0;
     attachBitrateProbes(state);
 
     GstStateChangeReturn ret = gst_element_set_state(newPipeline, GST_STATE_PLAYING);
@@ -1147,9 +1136,6 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
     if (outputSink) {
         GstPad* sinkPad = gst_element_get_static_pad(outputSink, "sink");
         if (sinkPad) {
-            if (state->config.cbr && state->config.targetBitrate > 0) {
-                gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, cbrPacingPadProbe, state, nullptr);
-            }
             gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
             gst_object_unref(sinkPad);
             outputAttached = TRUE;
@@ -1185,9 +1171,6 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
              g_strcmp0(factoryName, "hlssink") == 0)) {
             GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
             if (sinkPad) {
-                if (state->config.cbr && state->config.targetBitrate > 0) {
-                    gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, cbrPacingPadProbe, state, nullptr);
-                }
                 gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
                 gst_object_unref(sinkPad);
                 outputAttached = TRUE;
@@ -1222,11 +1205,7 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
-    if (state->config.cbr && state->config.targetBitrate > 0) {
-        state->outputBitrate = state->config.targetBitrate;
-    } else {
-        state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
-    }
+    state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
 
     state->lastInputBytesSample = currentInputBytes;
     state->lastOutputBytesSample = currentOutputBytes;
@@ -1245,104 +1224,6 @@ GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* inf
     }
 
     state->inputBytes += gst_buffer_get_size(buffer);
-    return GST_PAD_PROBE_OK;
-}
-
-GstPadProbeReturn StreamManager::cbrPacingPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
-    auto* state = static_cast<StreamState*>(user_data);
-    if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER) ||
-        !state->config.cbr || state->config.targetBitrate == 0) {
-        return GST_PAD_PROBE_OK;
-    }
-
-    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
-    if (!buffer) {
-        return GST_PAD_PROBE_OK;
-    }
-
-    const gsize size = gst_buffer_get_size(buffer);
-    if (size == 0) {
-        return GST_PAD_PROBE_OK;
-    }
-
-    const guint64 targetBitrate = state->config.targetBitrate;
-    const guint64 bits = static_cast<guint64>(size) * 8ULL;
-    guint64 ptsNs = 0;
-    guint64 durationNs = 1;
-    bool canWait = false;
-    GstClockTime targetClockTime = GST_CLOCK_TIME_NONE;
-    GstClockTime nowClockTime = GST_CLOCK_TIME_NONE;
-    GstClock* clock = nullptr;
-    GstElement* element = GST_ELEMENT(gst_pad_get_parent(pad));
-    GstClockTime baseTime = GST_CLOCK_TIME_NONE;
-
-    if (element) {
-        clock = gst_element_get_clock(element);
-        baseTime = gst_element_get_base_time(element);
-        if (clock && GST_CLOCK_TIME_IS_VALID(baseTime)) {
-            nowClockTime = gst_clock_get_time(clock);
-            canWait = GST_CLOCK_TIME_IS_VALID(nowClockTime) && nowClockTime >= baseTime;
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(state->cbrMutex);
-
-        const __uint128_t scaledDuration =
-            static_cast<__uint128_t>(bits) * GST_SECOND + state->cbrDurationRemainder;
-        durationNs = static_cast<guint64>(scaledDuration / targetBitrate);
-        state->cbrDurationRemainder = static_cast<uint64_t>(scaledDuration % targetBitrate);
-        durationNs = std::max<guint64>(durationNs, 1);
-
-        if (canWait) {
-            const guint64 nowRunningNs = static_cast<guint64>(nowClockTime - baseTime);
-            const bool scheduleIsLate =
-                state->cbrPacingStarted && state->cbrNextPtsNs + kCbrMaxLateNs < nowRunningNs;
-            const bool scheduleIsTooFarAhead =
-                state->cbrPacingStarted && state->cbrNextPtsNs > nowRunningNs + kCbrMaxAheadNs;
-
-            if (!state->cbrPacingStarted || scheduleIsLate || scheduleIsTooFarAhead) {
-                state->cbrNextPtsNs = nowRunningNs + kCbrInitialLatencyNs;
-                state->cbrDurationRemainder = 0;
-            }
-        } else if (!state->cbrPacingStarted) {
-            state->cbrNextPtsNs = 0;
-            state->cbrDurationRemainder = 0;
-        }
-
-        if (!state->cbrPacingStarted) {
-            state->cbrPacingStarted = true;
-        }
-
-        ptsNs = state->cbrNextPtsNs;
-        state->cbrNextPtsNs += durationNs;
-
-        if (canWait) {
-            targetClockTime = baseTime + ptsNs;
-        }
-    }
-
-    if (canWait && GST_CLOCK_TIME_IS_VALID(targetClockTime) && targetClockTime > nowClockTime) {
-        GstClockID clockId = gst_clock_new_single_shot_id(clock, targetClockTime);
-        if (clockId) {
-            gst_clock_id_wait(clockId, nullptr);
-            gst_clock_id_unref(clockId);
-        }
-    }
-
-    if (clock) {
-        gst_object_unref(clock);
-    }
-    if (element) {
-        gst_object_unref(element);
-    }
-
-    buffer = gst_buffer_make_writable(buffer);
-    GST_BUFFER_PTS(buffer) = ptsNs;
-    GST_BUFFER_DTS(buffer) = ptsNs;
-    GST_BUFFER_DURATION(buffer) = durationNs;
-    GST_PAD_PROBE_INFO_DATA(info) = buffer;
-
     return GST_PAD_PROBE_OK;
 }
 
