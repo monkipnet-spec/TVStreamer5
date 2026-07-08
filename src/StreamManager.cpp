@@ -17,7 +17,7 @@
 namespace {
 
 constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
-constexpr guint kTsSmoothingLatencyUsec = 700000;
+constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -155,14 +155,13 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", cfg.outputHost.c_str(),
         "port", cfg.outputPort,
         "async", FALSE,
-        "sync", cfg.cbr ? TRUE : FALSE,
+        "sync", FALSE,
         "buffer-size", kUdpSocketBufferSize,
         nullptr);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
         setBooleanPropertyIfPresent(sink, "qos", FALSE);
         setInt64PropertyIfPresent(sink, "max-lateness", -1);
-        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
 
     if (!cfg.interfaceAddress.empty() && !multicastOutput) {
@@ -217,13 +216,8 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         nullptr);
 }
 
-void configureTsParse(GstElement* tsparse, bool smoothTimestamps) {
-    if (!tsparse || !smoothTimestamps) {
-        return;
-    }
-
-    setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
-    setIntPropertyIfPresent(tsparse, "smoothing-latency", static_cast<gint>(kTsSmoothingLatencyUsec));
+void configureTsPacketAlignment(GstElement* element) {
+    setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
@@ -250,7 +244,7 @@ void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
     g_object_set(mux,
-        "alignment", 7,
+        "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer),
         "pcr-interval", 1800U,
         "pat-interval", 9000U,
         "pmt-interval", 9000U,
@@ -953,8 +947,8 @@ bool StreamManager::buildPassthroughPipeline(const StreamConfig& cfg, GstElement
         return false;
     }
 
-    configureTsParse(tsparse, cfg.cbr);
     configureQueue(queue);
+    configureTsPacketAlignment(tsparse);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
@@ -988,7 +982,6 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
 
     configureQueue(preDemuxQueue);
     configureQueue(outputQueue);
-    configureTsParse(tsparse, state->config.cbr);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
