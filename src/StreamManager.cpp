@@ -16,7 +16,8 @@
 
 namespace {
 
-constexpr gint kUdpSocketBufferSize = 16 * 1024 * 1024;
+constexpr gint kUdpInputSocketBufferSize = 16 * 1024 * 1024;
+constexpr gint kUdpOutputSocketBufferSize = 64 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
@@ -176,7 +177,7 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "port", cfg.outputPort,
         "async", FALSE,
         "sync", FALSE,
-        "buffer-size", kUdpSocketBufferSize,
+        "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
@@ -1131,7 +1132,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             "port", port,
             "reuse", TRUE,
             "do-timestamp", TRUE,
-            "buffer-size", kUdpSocketBufferSize,
+            "buffer-size", kUdpInputSocketBufferSize,
             nullptr);
 
         if (isMulticastHost(host) && !cfg.interfaceAddress.empty()) {

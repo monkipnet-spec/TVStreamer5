@@ -180,6 +180,10 @@ sudo sysctl -w net.ipv4.udp_wmem_min=131072
 sudo sysctl -w net.core.netdev_max_backlog=50000
 ```
 
+TVStreamer5 requests a 64 MiB UDP send socket buffer for MPEG-TS output, so
+`net.core.wmem_max` must be at least `67108864` for the full outgoing buffer to
+be applied.
+
 Persist the tuning after reboot:
 
 ```bash
