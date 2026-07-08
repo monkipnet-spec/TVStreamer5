@@ -131,6 +131,22 @@ std::string displayName(const StreamConfig& cfg) {
     return cfg.name.empty() ? cfg.id : cfg.name;
 }
 
+uint64_t bufferListSize(GstBufferList* list) {
+    if (!list) {
+        return 0;
+    }
+
+    uint64_t total = 0;
+    const guint length = gst_buffer_list_length(list);
+    for (guint i = 0; i < length; ++i) {
+        GstBuffer* buffer = gst_buffer_list_get(list, i);
+        if (buffer) {
+            total += gst_buffer_get_size(buffer);
+        }
+    }
+    return total;
+}
+
 void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
     const bool multicastOutput = isMulticastHost(cfg.outputHost);
 
@@ -376,6 +392,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
+    state->lastBitrateSample = state->lastInputActivity;
     attachBitrateProbes(state.get());
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -607,11 +624,13 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->inputBytes = 0;
     state->outputBytes = 0;
     state->inputBitrate = 0;
+    state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastInputBytesSeen = 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
+    state->lastBitrateSample = state->lastInputActivity;
     attachBitrateProbes(state);
 
     GstStateChangeReturn ret = gst_element_set_state(newPipeline, GST_STATE_PLAYING);
@@ -1125,21 +1144,49 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
     if (inputQueue) {
         GstPad* sinkPad = gst_element_get_static_pad(inputQueue, "sink");
         if (sinkPad) {
-            gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, inputPadProbe, state, nullptr);
+            gst_pad_add_probe(
+                sinkPad,
+                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                inputPadProbe,
+                state,
+                nullptr);
             gst_object_unref(sinkPad);
             inputAttached = TRUE;
         }
         gst_object_unref(inputQueue);
     }
 
+    GstElement* outputQueue = gst_bin_get_by_name(GST_BIN(state->pipeline), "output_queue");
+    if (outputQueue) {
+        GstPad* srcPad = gst_element_get_static_pad(outputQueue, "src");
+        if (srcPad) {
+            gst_pad_add_probe(
+                srcPad,
+                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                outputPadProbe,
+                state,
+                nullptr);
+            gst_object_unref(srcPad);
+            outputAttached = TRUE;
+        }
+        gst_object_unref(outputQueue);
+    }
+
     GstElement* outputSink = gst_bin_get_by_name(GST_BIN(state->pipeline), "output_sink");
-    if (outputSink) {
+    if (!outputAttached && outputSink) {
         GstPad* sinkPad = gst_element_get_static_pad(outputSink, "sink");
         if (sinkPad) {
-            gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
+            gst_pad_add_probe(
+                sinkPad,
+                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                outputPadProbe,
+                state,
+                nullptr);
             gst_object_unref(sinkPad);
             outputAttached = TRUE;
         }
+    }
+    if (outputSink) {
         gst_object_unref(outputSink);
     }
 
@@ -1158,7 +1205,12 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
              g_strcmp0(factoryName, "filesrc") == 0)) {
             GstPad* srcPad = gst_element_get_static_pad(element, "src");
             if (srcPad) {
-                gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER, inputPadProbe, state, nullptr);
+                gst_pad_add_probe(
+                    srcPad,
+                    static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                    inputPadProbe,
+                    state,
+                    nullptr);
                 gst_object_unref(srcPad);
                 inputAttached = TRUE;
             }
@@ -1171,7 +1223,12 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
              g_strcmp0(factoryName, "hlssink") == 0)) {
             GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
             if (sinkPad) {
-                gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER, outputPadProbe, state, nullptr);
+                gst_pad_add_probe(
+                    sinkPad,
+                    static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                    outputPadProbe,
+                    state,
+                    nullptr);
                 gst_object_unref(sinkPad);
                 outputAttached = TRUE;
             }
@@ -1214,32 +1271,42 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
 GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
     (void)pad;
     auto* state = static_cast<StreamState*>(user_data);
-    if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+    if (!state) {
         return GST_PAD_PROBE_OK;
     }
 
-    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
-    if (!buffer) {
-        return GST_PAD_PROBE_OK;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+        if (buffer) {
+            state->inputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
+        }
+    } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        state->inputBytes.fetch_add(
+            bufferListSize(gst_pad_probe_info_get_buffer_list(info)),
+            std::memory_order_relaxed);
     }
 
-    state->inputBytes += gst_buffer_get_size(buffer);
     return GST_PAD_PROBE_OK;
 }
 
 GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
     (void)pad;
     auto* state = static_cast<StreamState*>(user_data);
-    if (!state || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+    if (!state) {
         return GST_PAD_PROBE_OK;
     }
 
-    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
-        if (!buffer) {
-        return GST_PAD_PROBE_OK;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+        if (buffer) {
+            state->outputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
+        }
+    } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        state->outputBytes.fetch_add(
+            bufferListSize(gst_pad_probe_info_get_buffer_list(info)),
+            std::memory_order_relaxed);
     }
 
-    state->outputBytes += gst_buffer_get_size(buffer);
     return GST_PAD_PROBE_OK;
 }
 
