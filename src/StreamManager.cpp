@@ -373,6 +373,7 @@ void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
 }
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
+    (void)cfg;
     g_object_set(mux,
         "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer),
         "pcr-interval", 1800U,
@@ -380,9 +381,6 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    if (cfg.cbr && cfg.targetBitrate > 0) {
-        setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
-    }
 }
 
 void sendServiceDescription(GstElement* mux, const StreamConfig& cfg) {
@@ -917,7 +915,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return pipeline;
     }
 
-    const bool needsRemux = cfg.remapEnabled || (cfg.cbr && cfg.targetBitrate > 0);
+    const bool needsRemux = cfg.remapEnabled;
     bool ok = false;
     if (needsRemux) {
         if (!state->remapContext) {
