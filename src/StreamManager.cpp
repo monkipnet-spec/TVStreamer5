@@ -227,7 +227,7 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", endpoint.host.c_str(),
         "port", endpoint.port,
         "async", FALSE,
-        "sync", TRUE,
+        "sync", FALSE,
         "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
     setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
@@ -346,6 +346,15 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 
 void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
     configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
+}
+
+void configureUdpPacer(GstElement* pacer) {
+    if (!pacer) {
+        return;
+    }
+
+    setBooleanPropertyIfPresent(pacer, "sync", TRUE);
+    setBooleanPropertyIfPresent(pacer, "single-segment", TRUE);
 }
 
 void configureTsPacketAlignment(GstElement* element) {
@@ -1289,21 +1298,26 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
     const StreamConfig& cfg = state->config;
     GstElement* tsparse = gst_element_factory_make("tsparse", "tsparse");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
+    GstElement* udpPacer = outputType(cfg) == "udp" ? gst_element_factory_make("identity", "udp_pacer") : nullptr;
     GstElement* sink = createOutputSink(cfg, pipeline);
 
-    if (!tsparse || !queue || !sink) {
+    if (!tsparse || !queue || (outputType(cfg) == "udp" && !udpPacer) || !sink) {
         return false;
     }
 
     if (!addElementOrFail(pipeline, tsparse) ||
-        !addElementOrFail(pipeline, queue)) {
+        !addElementOrFail(pipeline, queue) ||
+        (udpPacer && !addElementOrFail(pipeline, udpPacer))) {
         return false;
     }
 
     configureOutputQueue(queue, cfg);
+    configureUdpPacer(udpPacer);
     configureTsPacketAlignment(tsparse);
 
-    return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
+    return udpPacer
+        ? gst_element_link_many(sourceTail, tsparse, queue, udpPacer, sink, nullptr)
+        : gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
 
 bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
@@ -1320,8 +1334,10 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
+    GstElement* udpPacer = outputType(state->config) == "udp" ? gst_element_factory_make("identity", "udp_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
-    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue ||
+        (outputType(state->config) == "udp" && !udpPacer) || !sink) {
         return false;
     }
 
@@ -1329,19 +1345,24 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, outputQueue)) {
+        !addElementOrFail(pipeline, outputQueue) ||
+        (udpPacer && !addElementOrFail(pipeline, udpPacer))) {
         return false;
     }
 
     configureQueue(preDemuxQueue);
     configureOutputQueue(outputQueue, state->config);
+    configureUdpPacer(udpPacer);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    if (!gst_element_link_many(mux, outputQueue, sink, nullptr)) {
+    const bool outputLinked = udpPacer
+        ? gst_element_link_many(mux, outputQueue, udpPacer, sink, nullptr)
+        : gst_element_link_many(mux, outputQueue, sink, nullptr);
+    if (!outputLinked) {
         return false;
     }
 
