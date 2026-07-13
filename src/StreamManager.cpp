@@ -21,7 +21,6 @@ constexpr gint kUdpOutputSocketBufferSize = 128 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
 constexpr guint kTsSmoothingLatencyUs = 300'000;
-constexpr guint64 kUdpQueueLatency = 2 * GST_SECOND;
 constexpr guint64 kDefaultCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
@@ -230,7 +229,6 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "sync", FALSE,
         "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
-    setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
 
@@ -342,10 +340,6 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         "max-size-bytes", 0,
         "max-size-time", maxSizeTime,
         nullptr);
-}
-
-void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
-    configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
 }
 
 void configureTsPacketAlignment(GstElement* element) {
@@ -1167,8 +1161,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make("udpsrc", "input_src");
-        GstElement* queue = addQueue("input_queue");
-        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+        if (!src || !addElementOrFail(pipeline, src)) {
             return nullptr;
         }
 
@@ -1182,7 +1175,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             "address", listenAddress.c_str(),
             "port", endpoint.port,
             "reuse", TRUE,
-            "do-timestamp", TRUE,
+            "do-timestamp", FALSE,
             "buffer-size", kUdpInputSocketBufferSize,
             nullptr);
 
@@ -1195,8 +1188,9 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         if (endpoint.scheme == "rtp") {
+            GstElement* queue = addQueue("input_queue");
             GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");
-            if (!depay || !addElementOrFail(pipeline, depay)) {
+            if (!queue || !depay || !addElementOrFail(pipeline, depay)) {
                 return nullptr;
             }
 
@@ -1207,17 +1201,14 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             if (!gst_element_link_many(src, depay, queue, nullptr)) {
                 return nullptr;
             }
+            terminalElement = queue;
         } else {
             GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
             g_object_set(src, "caps", caps, nullptr);
             gst_caps_unref(caps);
-
-            if (!gst_element_link(src, queue)) {
-                return nullptr;
-            }
+            terminalElement = src;
         }
 
-        terminalElement = queue;
         return src;
     }
         GstElement* src = gst_element_factory_make("filesrc", "input_src");
@@ -1300,23 +1291,13 @@ bool StreamManager::buildUdpOutputPipeline(StreamState* state, GstElement* pipel
         return false;
     }
 
-    const StreamConfig& cfg = state->config;
-    const std::vector<const char*> required = {"queue", "udpsink"};
-    for (const char* factory : required) {
-        if (!hasElementFactory(factory)) {
-            std::cerr << missingElementStatus(factory) << std::endl;
-            return false;
-        }
-    }
-
-    GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
-    GstElement* sink = createOutputSink(cfg, pipeline);
-    if (!outputQueue || !sink || !addElementOrFail(pipeline, outputQueue)) {
+    if (!hasElementFactory("udpsink")) {
+        std::cerr << missingElementStatus("udpsink") << std::endl;
         return false;
     }
 
-    configureQueue(outputQueue, kUdpQueueLatency);
-    return gst_element_link_many(sourceTail, outputQueue, sink, nullptr);
+    GstElement* sink = createOutputSink(state->config, pipeline);
+    return sink && gst_element_link(sourceTail, sink);
 }
 
 bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
@@ -1337,7 +1318,7 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
         return false;
     }
 
-    configureOutputQueue(queue, cfg);
+    configureQueue(queue);
     configureTsPacketAlignment(tsparse);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
@@ -1371,7 +1352,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     }
 
     configureQueue(preDemuxQueue);
-    configureOutputQueue(outputQueue, state->config);
+    configureQueue(outputQueue);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
@@ -1417,7 +1398,7 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
     }
 
     configureQueue(preDemuxQueue);
-    configureOutputQueue(outputQueue, state->config);
+    configureQueue(outputQueue);
     configureTsPacketAlignment(tsparse);
     g_object_set(mux,
         "streamable", TRUE,
