@@ -144,26 +144,25 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamM
 }
 
 bool HttpServer::start() {
-    try {
-        tcp::endpoint endpoint(tcp::v4(), configManager.config.httpPort);
-        acceptor.open(endpoint.protocol());
-        acceptor.set_option(boost::asio::socket_base::reuse_address(true));
-        acceptor.bind(endpoint);
-        acceptor.listen();
-        doAccept();
-        return true;
-    } catch (const std::exception& ex) {
-        std::cerr << "HTTP server failed to start: " << ex.what() << std::endl;
-        return false;
-    }
+    return bindHttpPort(configManager.config.httpPort);
 }
 
 void HttpServer::doAccept() {
-    acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
+    if (!acceptor.is_open()) {
+        return;
+    }
+
+    const uint64_t generation = acceptGeneration.load();
+    acceptor.async_accept([this, generation](boost::system::error_code ec, tcp::socket socket) {
+        if (generation != acceptGeneration.load()) {
+            return;
+        }
         if (!ec) {
             std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
         }
-        doAccept();
+        if (acceptor.is_open()) {
+            doAccept();
+        }
     });
 }
 
@@ -272,6 +271,52 @@ void HttpServer::writeUnauthorized(http::response<http::string_body>& res) const
     res.set(http::field::www_authenticate, "Basic realm=\"TVStreamer5\"");
     res.set(http::field::content_type, "text/plain; charset=UTF-8");
     res.body() = "Unauthorized";
+}
+
+bool HttpServer::bindHttpPort(int port) {
+    if (port <= 0 || port > 65535) {
+        std::cerr << "Invalid HTTP port: " << port << std::endl;
+        return false;
+    }
+
+    boost::system::error_code ec;
+    ++acceptGeneration;
+    if (acceptor.is_open()) {
+        acceptor.cancel(ec);
+        acceptor.close(ec);
+    }
+
+    tcp::endpoint endpoint(tcp::v4(), static_cast<unsigned short>(port));
+    acceptor.open(endpoint.protocol(), ec);
+    if (ec) {
+        std::cerr << "HTTP server failed to open port " << port << ": " << ec.message() << std::endl;
+        return false;
+    }
+    acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
+    if (ec) {
+        std::cerr << "HTTP server failed to set reuse_address: " << ec.message() << std::endl;
+        return false;
+    }
+    acceptor.bind(endpoint, ec);
+    if (ec) {
+        std::cerr << "HTTP server failed to bind port " << port << ": " << ec.message() << std::endl;
+        return false;
+    }
+    acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+        std::cerr << "HTTP server failed to listen on port " << port << ": " << ec.message() << std::endl;
+        return false;
+    }
+
+    doAccept();
+    std::cerr << "HTTP server listening on port " << port << std::endl;
+    return true;
+}
+
+void HttpServer::rebindHttpPort(int port) {
+    boost::asio::post(acceptor.get_executor(), [this, port]() {
+        bindHttpPort(port);
+    });
 }
 
 std::string HttpServer::listInterfaces() {
@@ -507,6 +552,7 @@ void HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Invalid config payload: " << errs << std::endl;
         return;
     }
+    const int previousHttpPort = configManager.config.httpPort;
     AppConfig nextConfig = AppConfig::fromJson(root);
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
@@ -517,8 +563,14 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("server_name") || root.get("server_name", "").asString().empty()) {
         nextConfig.serverName = configManager.config.serverName;
     }
+    if (!root.isMember("http_port") || nextConfig.httpPort <= 0 || nextConfig.httpPort > 65535) {
+        nextConfig.httpPort = configManager.config.httpPort;
+    }
     configManager.config = nextConfig;
     configManager.save();
+    if (configManager.config.httpPort != previousHttpPort) {
+        rebindHttpPort(configManager.config.httpPort);
+    }
 }
 
 void HttpServer::handleStartStream(const std::string& body) {
@@ -671,10 +723,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 </div>
 </div>
 <div class="header-right">
-<button class="button-secondary" onclick="openAboutModal()">ABOUT</button>
 <button class="button-secondary" onclick="openLoginModal()">Пользователь</button>
 <button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
 <button class="button-primary" onclick="openStreamModal()">+ Добавить поток</button>
+<button class="button-secondary" onclick="openAboutModal()">About</button>
 </div>
 </header>
 <div class="container">
@@ -744,7 +796,7 @@ function editStream(id) {
 }
 function openAboutModal() {
   openModal(`
-    <h2>ABOUT</h2>
+    <h2>About</h2>
     <div class="about-list">
       <div class="about-row"><strong>Имя</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>Страна</strong><span>Беларусь, г. Борисов</span></div>
@@ -762,6 +814,7 @@ function openLoginModal() {
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
       <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
       <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
+      <div class="form-row"><label>Порт web-интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
     </div>
     <div class="modal-actions">
       <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -885,18 +938,30 @@ function syncOutputHostWithInterface() {
   }
 }
 function saveSettings() {
+  const httpPortInput = document.getElementById('httpPort');
+  const httpPort = httpPortInput ? Number(httpPortInput.value || 9000) : state.http_port;
+  const previousHttpPort = Number(state.http_port || window.location.port || 9000);
   const payload = {
     login: document.getElementById('login')?.value || state.login,
     server_name: document.getElementById('serverName')?.value || state.server_name,
     telegram_token: document.getElementById('telegramToken')?.value || state.telegram_token,
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
-    http_port: state.http_port,
+    http_port: httpPort,
     streams: state.streams
   };
   const password = document.getElementById('password')?.value;
   if (password) payload.password = password;
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    .then(()=>{closeModal();fetchState();});
+    .then(()=>{
+      if (httpPortInput && httpPort && httpPort !== previousHttpPort) {
+        const nextUrl = new URL(window.location.href);
+        nextUrl.port = String(httpPort);
+        setTimeout(() => { window.location.href = nextUrl.toString(); }, 400);
+        return;
+      }
+      closeModal();
+      fetchState();
+    });
 }
 function saveStream(id) {
   const payload = {

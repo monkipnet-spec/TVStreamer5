@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 #include <boost/beast/http.hpp>
 #include <jsoncpp/json/json.h>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <filesystem>
@@ -40,6 +41,8 @@ private:
     bool requiresAuthentication(const std::string& target) const;
     bool isAuthorized(const http::request<http::string_body>& req) const;
     void writeUnauthorized(http::response<http::string_body>& res) const;
+    bool bindHttpPort(int port);
+    void rebindHttpPort(int port);
     std::string listInterfaces();
     std::string currentState();
     std::string qualityHistory(const std::string& target);
@@ -52,6 +55,7 @@ private:
     void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 
     tcp::acceptor acceptor;
+    std::atomic<uint64_t> acceptGeneration{0};
     ConfigManager& configManager;
     StreamManager& streamManager;
     std::mutex qualityMutex;
