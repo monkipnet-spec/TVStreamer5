@@ -4,12 +4,10 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <regex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -44,8 +42,7 @@ std::string interfaceAddressFor(const std::string& address) {
 class UdpTsSender {
 public:
     UdpTsSender(const StreamConfig& cfg, std::string& error)
-        : targetBitrate(cfg.targetBitrate),
-          nextSend(std::chrono::steady_clock::now()) {
+    {
         socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (socketFd < 0) {
             error = std::string("failed to create UDP socket: ") + std::strerror(errno);
@@ -131,53 +128,44 @@ private:
             return;
         }
 
-        if (!pending.empty()) {
-            const std::size_t needed = kUdpPayloadSize - pending.size();
-            const std::size_t copied = std::min(needed, size);
-            pending.insert(pending.end(), data, data + copied);
-            data += copied;
-            size -= copied;
-            if (pending.size() == kUdpPayloadSize) {
-                sendDatagram(pending.data(), pending.size());
-                pending.clear();
+        pending.insert(pending.end(), data, data + size);
+        resyncPending();
+
+        while (pending.size() >= kUdpPayloadSize) {
+            if (!isAlignedDatagram(pending.data())) {
+                pending.erase(pending.begin());
+                resyncPending();
+                continue;
             }
-        }
 
-        while (size >= kUdpPayloadSize) {
-            sendDatagram(data, kUdpPayloadSize);
-            data += kUdpPayloadSize;
-            size -= kUdpPayloadSize;
-        }
-
-        if (size > 0) {
-            pending.assign(data, data + size);
+            sendDatagram(pending.data(), kUdpPayloadSize);
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(kUdpPayloadSize));
         }
     }
 
+    void resyncPending() {
+        while (pending.size() >= kTsPacketSize && pending.front() != 0x47) {
+            auto found = std::find(pending.begin() + 1, pending.end(), 0x47);
+            pending.erase(pending.begin(), found);
+        }
+    }
+
+    bool isAlignedDatagram(const guint8* data) const {
+        for (std::size_t offset = 0; offset < kUdpPayloadSize; offset += kTsPacketSize) {
+            if (data[offset] != 0x47) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void sendDatagram(const guint8* data, std::size_t size) {
-        pace(size);
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
         const socklen_t destinationSize = sizeof(destinationAddress);
         ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
         if (sent < 0) {
             std::cerr << "UDP output send failed: " << std::strerror(errno) << std::endl;
         }
-    }
-
-    void pace(std::size_t bytes) {
-        if (targetBitrate == 0) {
-            return;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (nextSend > now) {
-            std::this_thread::sleep_until(nextSend);
-        } else if (now - nextSend > std::chrono::seconds(1)) {
-            nextSend = now;
-        }
-
-        const uint64_t nanos = static_cast<uint64_t>(bytes) * 8ULL * 1000000000ULL / targetBitrate;
-        nextSend += std::chrono::nanoseconds(nanos);
     }
 
     void closeSocket() {
@@ -190,10 +178,8 @@ private:
 
     int socketFd = -1;
     bool ready = false;
-    uint64_t targetBitrate = 0;
     sockaddr_in destinationAddress {};
     std::vector<guint8> pending;
-    std::chrono::steady_clock::time_point nextSend;
 };
 
 GstFlowReturn onNewSample(GstAppSink* sink, gpointer userData) {
@@ -241,7 +227,7 @@ GstElement* createSink(
     g_object_set(sink,
         "caps", caps,
         "emit-signals", FALSE,
-        "sync", TRUE,
+        "sync", FALSE,
         "async", FALSE,
         "qos", FALSE,
         "max-lateness", static_cast<gint64>(-1),
