@@ -1134,7 +1134,8 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
         return nullptr;
     }
 
-    GstCaps* caps = gst_caps_from_string("video/x-raw,width=1920,height=1080,framerate=25/1");
+    GstCaps* caps = gst_caps_from_string(
+        "video/x-raw,format=I420,width=1920,height=1080,framerate=25/1,pixel-aspect-ratio=1/1");
     g_object_set(capsfilter, "caps", caps, nullptr);
     gst_caps_unref(caps);
 

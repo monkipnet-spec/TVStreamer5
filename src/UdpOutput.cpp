@@ -7,8 +7,6 @@
 namespace {
 
 constexpr gint kSocketBufferSize = 64 * 1024 * 1024;
-constexpr guint kTsPacketsPerDatagram = 7;
-constexpr guint kSmoothingLatencyUs = 100'000;
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
@@ -32,52 +30,14 @@ GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
     std::string& error) {
-    GstElement* outputBin = gst_bin_new("output_sink");
-    GstElement* packetizer = gst_element_factory_make("tsparse", "udp_packetizer");
-    GstElement* queue = gst_element_factory_make("queue", "udp_output_queue");
-    GstElement* pacer = gst_element_factory_make("clocksync", "udp_pacer");
-    GstElement* sink = gst_element_factory_make("udpsink", "udp_socket_sink");
-    if (!outputBin || !packetizer || !queue || !pacer || !sink) {
-        error = "missing UDP output elements";
-        return nullptr;
-    }
-
-    gst_bin_add_many(GST_BIN(outputBin), packetizer, queue, pacer, sink, nullptr);
-    if (!gst_element_link_many(packetizer, queue, pacer, sink, nullptr)) {
-        error = "failed to link UDP output elements";
-        gst_object_unref(outputBin);
-        return nullptr;
-    }
-
-    GstPad* packetizerSinkPad = gst_element_get_static_pad(packetizer, "sink");
-    GstPad* ghostSinkPad = packetizerSinkPad ? gst_ghost_pad_new("sink", packetizerSinkPad) : nullptr;
-    if (packetizerSinkPad) {
-        gst_object_unref(packetizerSinkPad);
-    }
-    if (!ghostSinkPad || !gst_element_add_pad(outputBin, ghostSinkPad)) {
-        if (ghostSinkPad) {
-            gst_object_unref(ghostSinkPad);
+    GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
+    if (!sink || !gst_bin_add(GST_BIN(pipeline), sink)) {
+        if (sink) {
+            gst_object_unref(sink);
         }
-        error = "failed to expose UDP output sink pad";
-        gst_object_unref(outputBin);
+        error = "failed to create UDP output sink";
         return nullptr;
     }
-
-    g_object_set(packetizer,
-        "alignment", kTsPacketsPerDatagram,
-        "set-timestamps", TRUE,
-        "smoothing-latency", kSmoothingLatencyUs,
-        nullptr);
-    g_object_set(queue,
-        "max-size-buffers", 0,
-        "max-size-bytes", 0,
-        "max-size-time", static_cast<guint64>(3 * GST_SECOND),
-        nullptr);
-    g_object_set(pacer,
-        "sync", TRUE,
-        "sync-to-first", TRUE,
-        "qos", FALSE,
-        nullptr);
 
     const bool multicastOutput = isMulticastHost(config.outputHost);
     g_object_set(sink,
@@ -102,12 +62,7 @@ GstElement* createSink(
             g_object_set(sink, "multicast-iface", iface.c_str(), nullptr);
         }
     }
-    if (!gst_bin_add(GST_BIN(pipeline), outputBin)) {
-        error = "failed to add UDP output module to pipeline";
-        gst_object_unref(outputBin);
-        return nullptr;
-    }
-    return outputBin;
+    return sink;
 }
 
 } // namespace UdpOutput
