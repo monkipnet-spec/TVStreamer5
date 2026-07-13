@@ -7,7 +7,7 @@
 namespace {
 
 constexpr guint kTsPacketsPerDatagram = 7;
-constexpr guint kSmoothingLatencyUs = 300'000;
+constexpr guint kSmoothingLatencyUs = 100'000;
 constexpr gint kSocketBufferSize = 16 * 1024 * 1024;
 constexpr guint64 kQueueLatency = 2 * GST_SECOND;
 
@@ -47,8 +47,8 @@ bool build(
         error = "invalid UDP pipeline";
         return false;
     }
-    if (!hasFactory("tsparse") || !hasFactory("queue") || !hasFactory("identity") || !hasFactory("udpsink")) {
-        error = "missing UDP elements: tsparse, queue, identity or udpsink";
+    if (!hasFactory("tsparse") || !hasFactory("queue") || !hasFactory("clocksync") || !hasFactory("udpsink")) {
+        error = "missing UDP elements: tsparse, queue, clocksync or udpsink";
         return false;
     }
     if (config.outputHost.empty() || config.outputPort <= 0 || config.outputPort > 65535) {
@@ -58,7 +58,7 @@ bool build(
 
     GstElement* packetizer = gst_element_factory_make("tsparse", "udp_packetizer");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
-    GstElement* pacer = gst_element_factory_make("identity", "udp_pacer");
+    GstElement* pacer = gst_element_factory_make("clocksync", "udp_pacer");
     GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
     if (!packetizer || !queue || !pacer || !sink ||
         !gst_bin_add(GST_BIN(pipeline), packetizer) ||
@@ -81,8 +81,8 @@ bool build(
         nullptr);
     g_object_set(pacer,
         "sync", TRUE,
-        "single-segment", TRUE,
-        "signal-handoffs", FALSE,
+        "sync-to-first", TRUE,
+        "qos", FALSE,
         nullptr);
     g_object_set(sink,
         "host", config.outputHost.c_str(),
