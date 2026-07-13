@@ -16,11 +16,9 @@
 
 namespace {
 
-constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
+constexpr gint kUdpInputSocketBufferSize = 16 * 1024 * 1024;
 constexpr gint kUdpOutputSocketBufferSize = 64 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
-constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
-constexpr guint64 kMinCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -227,7 +225,6 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "sync", FALSE,
         "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
-    setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
 
     if (cfg.cbr && cfg.targetBitrate > 0) {
         setBooleanPropertyIfPresent(sink, "qos", FALSE);
@@ -258,7 +255,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         "uri", uri.c_str(),
         "sync", FALSE,
         "async", FALSE,
-        "blocksize", kTsUdpBlockSize,
+        "blocksize", static_cast<guint>(kTsPacketsPerUdpBuffer * 188),
         nullptr);
 
     setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
@@ -346,6 +343,23 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
+}
+
+void configureCbrPacer(GstElement* pacer, const StreamConfig& cfg) {
+    if (!pacer || !cfg.cbr || cfg.targetBitrate == 0) {
+        return;
+    }
+
+    g_object_set(pacer,
+        "sync", TRUE,
+        "silent", TRUE,
+        "single-segment", TRUE,
+        nullptr);
+
+    const uint64_t bytesPerSecond = cfg.targetBitrate / 8;
+    if (bytesPerSecond > 0 && bytesPerSecond <= static_cast<uint64_t>(G_MAXINT)) {
+        setIntPropertyIfPresent(pacer, "datarate", static_cast<gint>(bytesPerSecond));
+    }
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
@@ -1312,9 +1326,12 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
+    const bool cbrActive = state->config.cbr && state->config.targetBitrate > 0;
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
+    GstElement* pacer = cbrActive ? gst_element_factory_make("identity", "cbr_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
-    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
+        (cbrActive && !pacer)) {
         return false;
     }
 
@@ -1322,19 +1339,24 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, outputQueue)) {
+        !addElementOrFail(pipeline, outputQueue) ||
+        (pacer && !addElementOrFail(pipeline, pacer))) {
         return false;
     }
 
     configureQueue(preDemuxQueue);
     configureQueue(outputQueue);
+    configureCbrPacer(pacer, state->config);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    if (!gst_element_link_many(mux, outputQueue, sink, nullptr)) {
+    const bool outputLinked = pacer
+        ? gst_element_link_many(mux, outputQueue, pacer, sink, nullptr)
+        : gst_element_link_many(mux, outputQueue, sink, nullptr);
+    if (!outputLinked) {
         return false;
     }
 
