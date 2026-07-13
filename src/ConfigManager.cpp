@@ -19,7 +19,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
     config.cbr = root.get("cbr", true).asBool();
-    config.targetBitrate = root.get("target_bitrate", Json::UInt64(8000000)).asUInt64();
+    config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();
     config.audioPid = root.get("audio_pid", 0).asUInt();
     config.videoPid = root.get("video_pid", 0).asUInt();
     config.serviceId = root.get("service_id", 1).asUInt();
