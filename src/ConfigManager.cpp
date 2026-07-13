@@ -74,6 +74,9 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     config.password = root.get("password", "admin").asString();
     config.serverName = root.get("server_name", "TVStreamer5").asString();
     config.httpPort = root.get("http_port", 9000).asInt();
+    if (config.httpPort <= 0 || config.httpPort > 65535) {
+        config.httpPort = 9000;
+    }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
     if (root.isMember("streams") && root["streams"].isArray()) {

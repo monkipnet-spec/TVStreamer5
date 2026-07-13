@@ -36,6 +36,7 @@ private:
     };
 
     void doAccept();
+    void restartListener();
     void handleSession(tcp::socket socket);
     bool requiresAuthentication(const std::string& target) const;
     bool isAuthorized(const http::request<http::string_body>& req) const;

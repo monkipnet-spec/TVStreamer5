@@ -149,6 +149,11 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamM
 
 bool HttpServer::start() {
     try {
+        if (acceptor.is_open()) {
+            boost::system::error_code ec;
+            acceptor.cancel(ec);
+            acceptor.close(ec);
+        }
         tcp::endpoint endpoint(tcp::v4(), configManager.config.httpPort);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(boost::asio::socket_base::reuse_address(true));
@@ -162,10 +167,27 @@ bool HttpServer::start() {
     }
 }
 
+void HttpServer::restartListener() {
+    boost::asio::post(acceptor.get_executor(), [this]() {
+        if (!start()) {
+            std::cerr << "HTTP server restart failed on port "
+                      << configManager.config.httpPort << std::endl;
+        } else {
+            std::cerr << "HTTP server restarted on port "
+                      << configManager.config.httpPort << std::endl;
+        }
+    });
+}
+
 void HttpServer::doAccept() {
     acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
         if (!ec) {
             std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
+        }
+        if (!acceptor.is_open() ||
+            ec == boost::asio::error::operation_aborted ||
+            ec == boost::asio::error::bad_descriptor) {
+            return;
         }
         doAccept();
     });
@@ -511,6 +533,7 @@ void HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Invalid config payload: " << errs << std::endl;
         return;
     }
+    const int oldHttpPort = configManager.config.httpPort;
     AppConfig nextConfig = AppConfig::fromJson(root);
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
@@ -523,6 +546,9 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     }
     configManager.config = nextConfig;
     configManager.save();
+    if (configManager.config.httpPort != oldHttpPort) {
+        restartListener();
+    }
 }
 
 void HttpServer::handleStartStream(const std::string& body) {
@@ -766,6 +792,7 @@ function openLoginModal() {
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
       <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
       <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
+      <div class="form-row"><label>Порт интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
     </div>
     <div class="modal-actions">
       <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -889,18 +916,27 @@ function syncOutputHostWithInterface() {
   }
 }
 function saveSettings() {
+  const httpPort = Number(document.getElementById('httpPort')?.value || state.http_port || 9000);
+  const oldHttpPort = Number(state.http_port || 9000);
   const payload = {
     login: document.getElementById('login')?.value || state.login,
     server_name: document.getElementById('serverName')?.value || state.server_name,
     telegram_token: document.getElementById('telegramToken')?.value || state.telegram_token,
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
-    http_port: state.http_port,
+    http_port: httpPort > 0 && httpPort <= 65535 ? httpPort : state.http_port,
     streams: state.streams
   };
   const password = document.getElementById('password')?.value;
   if (password) payload.password = password;
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    .then(()=>{closeModal();fetchState();});
+    .then(()=>{
+      closeModal();
+      if (payload.http_port !== oldHttpPort) {
+        window.location.href = window.location.protocol + '//' + window.location.hostname + ':' + payload.http_port + '/';
+      } else {
+        fetchState();
+      }
+    });
 }
 function saveStream(id) {
   const payload = {
