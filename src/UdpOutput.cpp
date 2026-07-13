@@ -7,7 +7,7 @@
 namespace {
 
 constexpr guint kTsPacketsPerDatagram = 7;
-constexpr guint kSmoothingLatencyUs = 100'000;
+constexpr guint kSmoothingLatencyUs = 300'000;
 constexpr gint kSocketBufferSize = 16 * 1024 * 1024;
 constexpr guint64 kQueueLatency = 2 * GST_SECOND;
 
@@ -47,8 +47,8 @@ bool build(
         error = "invalid UDP pipeline";
         return false;
     }
-    if (!hasFactory("tsparse") || !hasFactory("queue") || !hasFactory("udpsink")) {
-        error = "missing UDP elements: tsparse, queue or udpsink";
+    if (!hasFactory("tsparse") || !hasFactory("queue") || !hasFactory("identity") || !hasFactory("udpsink")) {
+        error = "missing UDP elements: tsparse, queue, identity or udpsink";
         return false;
     }
     if (config.outputHost.empty() || config.outputPort <= 0 || config.outputPort > 65535) {
@@ -58,10 +58,12 @@ bool build(
 
     GstElement* packetizer = gst_element_factory_make("tsparse", "udp_packetizer");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
+    GstElement* pacer = gst_element_factory_make("identity", "udp_pacer");
     GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
-    if (!packetizer || !queue || !sink ||
+    if (!packetizer || !queue || !pacer || !sink ||
         !gst_bin_add(GST_BIN(pipeline), packetizer) ||
         !gst_bin_add(GST_BIN(pipeline), queue) ||
+        !gst_bin_add(GST_BIN(pipeline), pacer) ||
         !gst_bin_add(GST_BIN(pipeline), sink)) {
         error = "failed to create UDP output elements";
         return false;
@@ -77,13 +79,20 @@ bool build(
         "max-size-bytes", 0,
         "max-size-time", kQueueLatency,
         nullptr);
+    g_object_set(pacer,
+        "sync", TRUE,
+        "single-segment", TRUE,
+        "signal-handoffs", FALSE,
+        nullptr);
     g_object_set(sink,
         "host", config.outputHost.c_str(),
         "port", config.outputPort,
-        "sync", TRUE,
+        "sync", FALSE,
         "async", FALSE,
         "qos", FALSE,
         "max-lateness", static_cast<gint64>(-1),
+        "processing-deadline", static_cast<guint64>(0),
+        "enable-last-sample", FALSE,
         "buffer-size", kSocketBufferSize,
         nullptr);
 
@@ -98,7 +107,7 @@ bool build(
         g_object_set(sink, "bind-address", config.interfaceAddress.c_str(), nullptr);
     }
 
-    if (!gst_element_link_many(sourceTail, packetizer, queue, sink, nullptr)) {
+    if (!gst_element_link_many(sourceTail, packetizer, queue, pacer, sink, nullptr)) {
         error = "failed to link UDP output pipeline";
         return false;
     }
