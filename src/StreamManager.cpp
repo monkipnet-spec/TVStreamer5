@@ -20,8 +20,7 @@ constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
 constexpr gint kUdpOutputSocketBufferSize = 128 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
-// tsparse::smoothing-latency is expressed in microseconds, not GstClockTime.
-constexpr guint kTsSmoothingLatencyUs = 300'000;
+constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kDefaultCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(15);
@@ -277,7 +276,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         setUIntPropertyIfPresent(sink, "localport", 0);
     }
 
-    if (cfg.cbr && cfg.targetBitrate > 0) {
+    if (cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
 }
@@ -308,7 +307,7 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
         "qos", FALSE,
         nullptr);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
-    if (cfg.cbr && cfg.targetBitrate > 0) {
+    if (cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
 }
@@ -349,19 +348,10 @@ void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
     configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
 }
 
-void configureUdpPacer(GstElement* pacer) {
-    if (!pacer) {
-        return;
-    }
-
-    setBooleanPropertyIfPresent(pacer, "sync", TRUE);
-    setBooleanPropertyIfPresent(pacer, "single-segment", TRUE);
-}
-
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
     setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
-    setUIntPropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatencyUs);
+    setUInt64PropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatency);
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
@@ -1299,26 +1289,21 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
     const StreamConfig& cfg = state->config;
     GstElement* tsparse = gst_element_factory_make("tsparse", "tsparse");
     GstElement* queue = gst_element_factory_make("queue", "output_queue");
-    GstElement* udpPacer = outputType(cfg) == "udp" ? gst_element_factory_make("identity", "udp_pacer") : nullptr;
     GstElement* sink = createOutputSink(cfg, pipeline);
 
-    if (!tsparse || !queue || (outputType(cfg) == "udp" && !udpPacer) || !sink) {
+    if (!tsparse || !queue || !sink) {
         return false;
     }
 
     if (!addElementOrFail(pipeline, tsparse) ||
-        !addElementOrFail(pipeline, queue) ||
-        (udpPacer && !addElementOrFail(pipeline, udpPacer))) {
+        !addElementOrFail(pipeline, queue)) {
         return false;
     }
 
     configureOutputQueue(queue, cfg);
-    configureUdpPacer(udpPacer);
     configureTsPacketAlignment(tsparse);
 
-    return udpPacer
-        ? gst_element_link_many(sourceTail, tsparse, queue, udpPacer, sink, nullptr)
-        : gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
+    return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
 
 bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
@@ -1335,10 +1320,8 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
-    GstElement* udpPacer = outputType(state->config) == "udp" ? gst_element_factory_make("identity", "udp_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
-    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue ||
-        (outputType(state->config) == "udp" && !udpPacer) || !sink) {
+    if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
         return false;
     }
 
@@ -1346,24 +1329,19 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, outputQueue) ||
-        (udpPacer && !addElementOrFail(pipeline, udpPacer))) {
+        !addElementOrFail(pipeline, outputQueue)) {
         return false;
     }
 
     configureQueue(preDemuxQueue);
     configureOutputQueue(outputQueue, state->config);
-    configureUdpPacer(udpPacer);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    const bool outputLinked = udpPacer
-        ? gst_element_link_many(mux, outputQueue, udpPacer, sink, nullptr)
-        : gst_element_link_many(mux, outputQueue, sink, nullptr);
-    if (!outputLinked) {
+    if (!gst_element_link_many(mux, outputQueue, sink, nullptr)) {
         return false;
     }
 
