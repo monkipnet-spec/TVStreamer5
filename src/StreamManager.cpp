@@ -21,6 +21,7 @@ constexpr gint kUdpOutputSocketBufferSize = 64 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
 constexpr guint64 kTsSmoothingLatency = 700 * GST_MSECOND;
+constexpr guint64 kMinCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -373,7 +374,6 @@ void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
 }
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
-    (void)cfg;
     g_object_set(mux,
         "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer),
         "pcr-interval", 1800U,
@@ -381,6 +381,10 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
+    if (cfg.cbr) {
+        const guint64 bitrate = std::max<guint64>(cfg.targetBitrate, kMinCbrBitrate);
+        setUInt64PropertyIfPresent(mux, "bitrate", bitrate);
+    }
 }
 
 void sendServiceDescription(GstElement* mux, const StreamConfig& cfg) {
@@ -915,7 +919,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return pipeline;
     }
 
-    const bool needsRemux = cfg.remapEnabled;
+    const bool needsRemux = cfg.remapEnabled || cfg.cbr;
     bool ok = false;
     if (needsRemux) {
         if (!state->remapContext) {

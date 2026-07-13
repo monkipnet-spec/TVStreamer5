@@ -184,8 +184,10 @@ TVStreamer5 requests a 64 MiB UDP send socket buffer for MPEG-TS output, so
 `net.core.wmem_max` must be at least `67108864` for the full outgoing buffer to
 be applied.
 
-If VLC reports skipped frames or the picture breaks up with remap/CBR enabled,
-make sure `target_bitrate` is not lower than the real input bitrate.
+If VLC reports skipped frames or the picture breaks up, enable CBR and keep
+`target_bitrate` above the real input bitrate. TVStreamer5 uses at least
+8 Mbit/s for CBR MPEG-TS output to avoid starving bursty UDP players; disable
+CBR for pure passthrough.
 
 Persist the tuning after reboot:
 
@@ -311,6 +313,9 @@ the multicast interface. For UDP unicast it is used as the bind address. For SRT
 it is used as the local listener address when supported by the GStreamer SRT
 plugin. RTSP and RTMP camera input and RTMP/YouTube output remux common
 H.264/H.265/AAC streams without transcoding where supported.
+
+Enable `auto_start` in a stream's settings to start that stream automatically
+after TVStreamer5 restarts. Streams with `auto_start` disabled stay stopped.
 
 ## Backup Failover
 

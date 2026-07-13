@@ -30,6 +30,12 @@ int main() {
     }
 
     std::cerr << "HTTP server started" << std::endl;
+    for (const auto& stream : configManager.config.streams) {
+        if (stream.autoStart) {
+            std::cerr << "Auto-starting stream: " << stream.id << std::endl;
+            streamManager.startStream(stream);
+        }
+    }
     std::cout << "TVStreamer5 running on port " << configManager.config.httpPort << std::endl;
     std::cerr << "Calling ioc.run()" << std::endl;
 

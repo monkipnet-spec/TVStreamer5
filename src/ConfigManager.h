@@ -17,9 +17,10 @@ struct StreamConfig {
     int outputPort = 1234;
     std::string interfaceAddress;
     std::string inputMode = "auto";
+    bool autoStart = false;
     bool remapEnabled = false;
     bool cbr = true;
-    uint64_t targetBitrate = 2000000;
+    uint64_t targetBitrate = 8000000;
     uint32_t audioPid = 0;
     uint32_t videoPid = 0;
     uint32_t serviceId = 1;
