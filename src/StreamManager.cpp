@@ -20,6 +20,7 @@ constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
 constexpr gint kUdpOutputSocketBufferSize = 64 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
+constexpr guint64 kTsSmoothingLatency = 700 * GST_MSECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -223,7 +224,7 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", endpoint.host.c_str(),
         "port", endpoint.port,
         "async", FALSE,
-        "sync", FALSE,
+        "sync", TRUE,
         "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
     setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
@@ -345,6 +346,8 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
+    setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
+    setUInt64PropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatency);
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
