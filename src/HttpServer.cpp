@@ -354,6 +354,8 @@ std::string HttpServer::currentState() {
             item["active_input_label"] = streamState->usingBackup ? "Резерв" : "Основной";
             item["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
             item["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
+            item["cc_errors"] = Json::UInt64(streamState->ccErrorsDelta.load());
+            item["cc_errors_total"] = Json::UInt64(streamState->ccErrors.load());
         } else {
             item["active"] = false;
             item["status"] = "stopped";
@@ -362,6 +364,8 @@ std::string HttpServer::currentState() {
             item["active_input_label"] = "Основной";
             item["bitrate_in_kbps"] = Json::UInt64(0);
             item["bitrate_out_kbps"] = Json::UInt64(0);
+            item["cc_errors"] = Json::UInt64(0);
+            item["cc_errors_total"] = Json::UInt64(0);
         }
         item["vlc_link"] = streamLink(cfg, configManager.config.httpPort);
         recordQualitySample(cfg, item);
@@ -471,6 +475,7 @@ std::string HttpServer::qualityHistory(const std::string& target) {
                 item["input_kbps"] = Json::UInt64(sample.inputKbps);
                 item["output_kbps"] = Json::UInt64(sample.outputKbps);
                 item["target_kbps"] = Json::UInt64(sample.targetKbps);
+                item["cc_errors"] = Json::UInt64(sample.ccErrors);
                 item["status"] = sample.status;
                 item["level"] = sample.level;
                 item["message"] = sample.message;
@@ -486,6 +491,11 @@ std::string HttpServer::qualityHistory(const std::string& target) {
     summary["warn"] = Json::UInt(totals["warn"]);
     summary["error"] = Json::UInt(totals["error"]);
     summary["offline"] = Json::UInt(totals["offline"]);
+    uint64_t ccErrorsTotal = 0;
+    for (const auto& sample : samples) {
+        ccErrorsTotal += sample.get("cc_errors", Json::UInt64(0)).asUInt64();
+    }
+    summary["cc_errors"] = Json::UInt64(ccErrorsTotal);
     root["summary"] = summary;
 
     Json::StreamWriterBuilder writer;
@@ -500,6 +510,7 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
     sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
     sample.targetKbps = cfg.targetBitrate / 1000;
+    sample.ccErrors = state.get("cc_errors", Json::UInt64(0)).asUInt64();
     sample.status = state.get("status", "").asString();
 
     const std::string statusLower = toLower(sample.status);
@@ -514,6 +525,9 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     } else if (sample.inputKbps == 0) {
         sample.level = "warn";
         sample.message = "Нет входного битрейта при активном потоке";
+    } else if (sample.ccErrors > 0) {
+        sample.level = "error";
+        sample.message = "CC-errors на входе MPEG-TS: " + std::to_string(sample.ccErrors);
     } else if (sample.targetKbps > 0 && sample.outputKbps > 0) {
         const double diff = std::abs(static_cast<double>(sample.outputKbps) - static_cast<double>(sample.targetKbps));
         const double deviation = diff / static_cast<double>(sample.targetKbps);
@@ -679,6 +693,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .quality-legend span{display:flex;align-items:center;gap:5px}
 .quality-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
 .quality-ok{background:#17c261}.quality-warn{background:#ffbd4a}.quality-error{background:#ff5f5f}.quality-offline{background:#7c879b}
+.quality-line{width:22px;height:3px;border-radius:999px;display:inline-block}
+.quality-input{background:#58a6ff}.quality-output{background:#17c261}.quality-cc{background:#ff5f5f}
+.quality-decode{display:grid;gap:5px;margin:8px 0 10px;padding:8px 10px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:8px;color:#cfd8ea;font-size:.78rem;line-height:1.35}
+.quality-decode strong{color:#fff}
 .quality-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:10px}
 .quality-card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:8px;color:#cfd8ea;font-size:.78rem}
 .quality-card strong{display:block;color:#fff;margin-bottom:4px}
@@ -1087,11 +1105,16 @@ function openQualityModal(id, periodSeconds=3600) {
       <canvas id="qualityCanvas" width="860" height="320"></canvas>
     </div>
     <div class="quality-legend">
-      <span><i class="quality-dot quality-ok"></i>Норма</span>
-      <span><i class="quality-dot quality-warn"></i>Предупреждение</span>
-      <span><i class="quality-dot quality-error"></i>Ошибка</span>
-      <span><i class="quality-dot quality-offline"></i>Остановлен</span>
+      <span><i class="quality-line quality-input"></i>Входной битрейт</span>
+      <span><i class="quality-line quality-output"></i>Исходящий битрейт</span>
+      <span><i class="quality-line quality-cc"></i>CC-errors</span>
       <span>Клик по графику копирует измерение в буфер</span>
+    </div>
+    <div class="quality-decode">
+      <strong>Расшифровка</strong>
+      <span>Синий - входной битрейт MPEG-TS на входе приложения.</span>
+      <span>Зеленый - исходящий битрейт после обработки и отправки.</span>
+      <span>Красный - CC-errors: разрывы continuity counter во входном MPEG-TS, обычно означают потерю/перестановку TS-пакетов.</span>
     </div>
     <div id="qualityCopyNotice" class="quality-copy"></div>
     <div id="qualityDetails" class="quality-details"></div>
@@ -1142,12 +1165,13 @@ function drawQualityChart(data) {
     qualityChart.points = [];
     return;
   }
-  const left = 54, right = 14, top = 16, bottom = 34;
+  const left = 54, right = 46, top = 16, bottom = 34;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
   const endTs = data.generated_at || Math.floor(Date.now()/1000);
   const startTs = endTs - (data.period_seconds || qualityChart.period);
-  const maxBitrate = Math.max(1000, ...samples.map(s=>Math.max(s.input_kbps || 0, s.output_kbps || 0, s.target_kbps || 0))) * 1.15;
+  const maxBitrate = Math.max(1000, ...samples.map(s=>Math.max(s.input_kbps || 0, s.output_kbps || 0))) * 1.15;
+  const maxCcErrors = Math.max(1, ...samples.map(s=>s.cc_errors || 0));
   ctx.strokeStyle = 'rgba(255,255,255,.09)';
   ctx.fillStyle = '#8e99aa';
   ctx.font = '9px Arial';
@@ -1158,7 +1182,15 @@ function drawQualityChart(data) {
     const kbps = Math.round(maxBitrate * (1 - i / 4));
     ctx.fillText(kbps + 'k', left - 7, y + 4);
   }
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#ff9c9c';
+  for (let i=0;i<=4;i++) {
+    const y = top + plotH * i / 4;
+    const value = Math.round(maxCcErrors * (1 - i / 4));
+    ctx.fillText(value + ' cc', width - right + 8, y + 4);
+  }
   ctx.textAlign = 'center';
+  ctx.fillStyle = '#8e99aa';
   for (let i=0;i<=6;i++) {
     const x = left + plotW * i / 6;
     const ts = startTs + (endTs - startTs) * i / 6;
@@ -1167,6 +1199,7 @@ function drawQualityChart(data) {
   }
   const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
   const yFor = kbps => top + plotH - (Math.min(kbps, maxBitrate) / maxBitrate) * plotH;
+  const ccYFor = value => top + plotH - (Math.min(value, maxCcErrors) / maxCcErrors) * plotH;
   const drawLine = (field, color) => {
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
@@ -1181,14 +1214,33 @@ function drawQualityChart(data) {
     ctx.stroke();
   };
   drawLine('input_kbps', '#58a6ff');
-  drawLine('output_kbps', '#b7f58b');
+  drawLine('output_kbps', '#17c261');
+  const drawCcErrors = () => {
+    ctx.strokeStyle = '#ff5f5f';
+    ctx.fillStyle = 'rgba(255,95,95,.28)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    samples.forEach(s => {
+      const value = s.cc_errors || 0;
+      const x = xFor(s.ts);
+      const y = ccYFor(value);
+      if (value > 0) {
+        ctx.fillRect(x - 2, y, 4, top + plotH - y);
+      }
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    });
+    ctx.stroke();
+  };
+  drawCcErrors();
   qualityChart.points = [];
+  const lastSample = samples[samples.length - 1] || {};
   samples.forEach(s => {
     const x = xFor(s.ts);
-    const y = yFor(s.output_kbps || s.input_kbps || 0);
-    ctx.fillStyle = qualityColor(s.level);
+    const y = (s.cc_errors || 0) > 0 ? ccYFor(s.cc_errors || 0) : yFor(s.output_kbps || s.input_kbps || 0);
+    ctx.fillStyle = (s.cc_errors || 0) > 0 ? '#ff5f5f' : qualityColor(s.level);
     ctx.beginPath();
-    ctx.arc(x, y, s.level === 'ok' ? 3 : 5, 0, Math.PI * 2);
+    ctx.arc(x, y, (s.cc_errors || 0) > 0 || s.level !== 'ok' ? 5 : 3, 0, Math.PI * 2);
     ctx.fill();
     qualityChart.points.push({x, y, sample:s});
   });
@@ -1196,13 +1248,13 @@ function drawQualityChart(data) {
   details.innerHTML = `
     <div class="quality-card"><strong>Период</strong>${formatTime(startTs, data.period_seconds)} — ${formatTime(endTs, data.period_seconds)}</div>
     <div class="quality-card"><strong>Сэмплы</strong>${samples.length}</div>
-    <div class="quality-card"><strong>Норма</strong>${summary.ok || 0}</div>
-    <div class="quality-card"><strong>Ошибки</strong>${summary.error || 0} ошибок, ${summary.warn || 0} предупреждений, ${summary.offline || 0} offline</div>
+    <div class="quality-card"><strong>Вход / выход</strong>${Math.round(lastSample.input_kbps || 0)} / ${Math.round(lastSample.output_kbps || 0)} kbps</div>
+    <div class="quality-card"><strong>CC-errors</strong>${summary.cc_errors || 0} за период</div>
   `;
-  const bad = samples.filter(s=>s.level !== 'ok').slice(-30).reverse();
+  const bad = samples.filter(s=>s.level !== 'ok' || (s.cc_errors || 0) > 0).slice(-30).reverse();
   errors.innerHTML = bad.length
-    ? bad.map(s=>`<div><span style="color:${qualityColor(s.level)}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message}</span></div>`).join('')
-    : '<div><span style="color:#17c261">●</span><span>За выбранный период ошибок нет</span></div>';
+    ? bad.map(s=>`<div><span style="color:${(s.cc_errors || 0) > 0 ? '#ff5f5f' : qualityColor(s.level)}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message} · CC: ${s.cc_errors || 0}</span></div>`).join('')
+    : '<div><span style="color:#17c261">●</span><span>За выбранный период CC-errors и других ошибок нет</span></div>';
   canvas.onclick = ev => copyQualityPoint(ev, canvas);
 }
 function copyQualityPoint(ev, canvas) {
@@ -1222,7 +1274,7 @@ function copyQualityPoint(ev, canvas) {
     `Уровень: ${s.level}`,
     `Вход: ${s.input_kbps} kbps`,
     `Выход: ${s.output_kbps} kbps`,
-    `Цель: ${s.target_kbps} kbps`,
+    `CC-errors: ${s.cc_errors || 0}`,
     `Статус: ${s.status}`,
     `Расшифровка: ${s.message}`
   ].join('\n');

@@ -17,6 +17,7 @@
 
 namespace {
 
+constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
@@ -144,6 +145,100 @@ uint64_t bufferListSize(GstBufferList* list) {
         }
     }
     return total;
+}
+
+std::size_t findTsAlignment(const guint8* data, std::size_t size) {
+    if (!data || size < kTsPacketSize) {
+        return std::string::npos;
+    }
+
+    const std::size_t maxOffset = std::min<std::size_t>(kTsPacketSize, size - kTsPacketSize + 1);
+    for (std::size_t offset = 0; offset < maxOffset; ++offset) {
+        if (data[offset] != 0x47) {
+            continue;
+        }
+        if (offset + kTsPacketSize >= size || data[offset + kTsPacketSize] == 0x47) {
+            return offset;
+        }
+    }
+    return std::string::npos;
+}
+
+uint64_t countContinuityErrors(StreamState* state, const guint8* data, std::size_t size) {
+    if (!state || !data || size < kTsPacketSize) {
+        return 0;
+    }
+
+    const std::size_t start = findTsAlignment(data, size);
+    if (start == std::string::npos) {
+        return 0;
+    }
+
+    uint64_t errors = 0;
+    std::lock_guard<std::mutex> lock(state->inputContinuityMutex);
+    for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
+        const guint8* packet = data + offset;
+        if (packet[0] != 0x47) {
+            continue;
+        }
+
+        if ((packet[1] & 0x80) != 0) {
+            ++errors;
+        }
+
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1f) << 8) | packet[2]);
+        if (pid == 0x1fff) {
+            continue;
+        }
+
+        const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+        const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
+        if (adaptationControl == 0) {
+            ++errors;
+            continue;
+        }
+        if (!hasPayload) {
+            continue;
+        }
+
+        const guint8 continuity = static_cast<guint8>(packet[3] & 0x0f);
+        if (state->inputContinuityValid[pid]) {
+            const guint8 expected = static_cast<guint8>((state->inputContinuity[pid] + 1) & 0x0f);
+            if (continuity != expected) {
+                ++errors;
+            }
+        }
+        state->inputContinuity[pid] = continuity;
+        state->inputContinuityValid[pid] = true;
+    }
+    return errors;
+}
+
+void updateContinuityErrors(StreamState* state, GstBuffer* buffer) {
+    if (!state || !buffer) {
+        return;
+    }
+
+    GstMapInfo map {};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        return;
+    }
+    const uint64_t errors = countContinuityErrors(state, map.data, map.size);
+    gst_buffer_unmap(buffer, &map);
+    if (errors > 0) {
+        state->ccErrors.fetch_add(errors, std::memory_order_relaxed);
+    }
+}
+
+void updateContinuityErrors(StreamState* state, GstBufferList* list) {
+    if (!state || !list) {
+        return;
+    }
+
+    const guint length = gst_buffer_list_length(list);
+    for (guint i = 0; i < length; ++i) {
+        updateContinuityErrors(state, gst_buffer_list_get(list, i));
+    }
 }
 
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
@@ -788,11 +883,18 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
     state->inputBytes = 0;
     state->outputBytes = 0;
+    state->ccErrors = 0;
+    state->ccErrorsDelta = 0;
     state->inputBitrate = 0;
     state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
+    state->lastCcErrorsSample = 0;
     state->lastInputBytesSeen = 0;
+    {
+        std::lock_guard<std::mutex> lock(state->inputContinuityMutex);
+        state->inputContinuityValid.fill(false);
+    }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -1740,15 +1842,19 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
 
     uint64_t currentInputBytes = state->inputBytes.load();
     uint64_t currentOutputBytes = state->outputBytes.load();
+    uint64_t currentCcErrors = state->ccErrors.load();
     uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
     uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
+    uint64_t ccDelta = currentCcErrors - state->lastCcErrorsSample;
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
     state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
+    state->ccErrorsDelta = ccDelta;
 
     state->lastInputBytesSample = currentInputBytes;
     state->lastOutputBytesSample = currentOutputBytes;
+    state->lastCcErrorsSample = currentCcErrors;
     state->lastBitrateSample = now;
 }
 GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
@@ -1762,11 +1868,12 @@ GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* inf
         GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
         if (buffer) {
             state->inputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
+            updateContinuityErrors(state, buffer);
         }
     } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
-        state->inputBytes.fetch_add(
-            bufferListSize(gst_pad_probe_info_get_buffer_list(info)),
-            std::memory_order_relaxed);
+        GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
+        state->inputBytes.fetch_add(bufferListSize(list), std::memory_order_relaxed);
+        updateContinuityErrors(state, list);
     }
 
     return GST_PAD_PROBE_OK;

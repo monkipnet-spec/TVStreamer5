@@ -2,6 +2,7 @@
 
 #include <gst/gst.h>
 #include <jsoncpp/json/json.h>
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -43,12 +44,18 @@ struct StreamState {
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};
     std::atomic<uint64_t> outputBytes{0};
+    std::atomic<uint64_t> ccErrors{0};
+    std::atomic<uint64_t> ccErrorsDelta{0};
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
+    uint64_t lastCcErrorsSample = 0;
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
+    std::array<uint8_t, 8192> inputContinuity {};
+    std::array<bool, 8192> inputContinuityValid {};
+    std::mutex inputContinuityMutex;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<RemapContext> remapContext;
 };

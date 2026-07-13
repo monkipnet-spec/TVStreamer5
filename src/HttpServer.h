@@ -31,6 +31,7 @@ private:
         uint64_t inputKbps = 0;
         uint64_t outputKbps = 0;
         uint64_t targetKbps = 0;
+        uint64_t ccErrors = 0;
         std::string status;
         std::string level;
         std::string message;
