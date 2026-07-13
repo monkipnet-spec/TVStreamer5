@@ -13,7 +13,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.backupInputUri = root.get("backup_input_uri", "").asString();
     config.outputType = root.get("output_type", "srt").asString();
     const std::string outputTypeLower = toLower(config.outputType);
-    if (outputTypeLower != "srt" && outputTypeLower != "http" && outputTypeLower != "hls" &&
+    if (outputTypeLower != "udp" && outputTypeLower != "srt" && outputTypeLower != "http" && outputTypeLower != "hls" &&
         outputTypeLower != "rtmp" && outputTypeLower != "youtube") {
         config.outputType = "srt";
     }

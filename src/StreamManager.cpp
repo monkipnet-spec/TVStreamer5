@@ -1,4 +1,5 @@
 #include "StreamManager.h"
+#include "UdpOutput.h"
 
 #include <algorithm>
 #include <chrono>
@@ -88,7 +89,7 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
 
 std::string outputType(const StreamConfig& cfg) {
     std::string type = toLower(cfg.outputType);
-    if (type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
+    if (type != "udp" && type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
         type = "srt";
     }
     return type;
@@ -531,7 +532,9 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
+    state->outputBitrate = outputType(streamConfig) != "udp" && streamConfig.cbr
+        ? streamConfig.targetBitrate
+        : 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -771,7 +774,9 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->inputBytes = 0;
     state->outputBytes = 0;
     state->inputBitrate = 0;
-    state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
+    state->outputBitrate = outputType(state->config) != "udp" && state->config.cbr
+        ? state->config.targetBitrate
+        : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastInputBytesSeen = 0;
@@ -812,6 +817,16 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     const std::string type = outputType(cfg);
+    if (type == "udp") {
+        std::string error;
+        if (!UdpOutput::build(pipeline, sourceTail, cfg, error)) {
+            std::cerr << error << std::endl;
+            gst_object_unref(pipeline);
+            return nullptr;
+        }
+        return pipeline;
+    }
+
     if (type == "rtmp" || type == "youtube") {
         if (!buildRtmpOutputPipeline(state, pipeline, sourceTail)) {
             gst_object_unref(pipeline);
@@ -1637,7 +1652,8 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         }
 
         if (!outputAttached && factoryName &&
-            (g_strcmp0(factoryName, "srtsink") == 0 ||
+            (g_strcmp0(factoryName, "udpsink") == 0 ||
+             g_strcmp0(factoryName, "srtsink") == 0 ||
              g_strcmp0(factoryName, "rtmpsink") == 0 ||
              g_strcmp0(factoryName, "multifdsink") == 0 ||
              g_strcmp0(factoryName, "hlssink") == 0)) {

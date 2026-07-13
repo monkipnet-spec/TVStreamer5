@@ -3,7 +3,7 @@
 TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS MPEG-TS
 streams, optionally remaps service/PID metadata, monitors input quality,
 switches to a backup source when the primary source disappears, and outputs
-streams as SRT, HTTP TS, HLS, RTMP, or YouTube Live.
+streams as UDP, SRT, HTTP TS, HLS, RTMP, or YouTube Live.
 
 ## Build on the Host
 
@@ -205,6 +205,7 @@ Each stream has an `output_type` field. Existing configs without this field are
 treated as `srt`.
 
 ```text
+udp   MPEG-TS over UDP unicast or multicast
 srt   MPEG-TS over SRT listener or caller
 http  MPEG-TS over HTTP at /stream/<stream-id>.ts
 hls   HLS playlist at /hls/<stream-id>/playlist.m3u8
@@ -215,6 +216,7 @@ youtube  FLV over RTMP push to YouTube Live
 Examples of player URLs shown by the UI:
 
 ```text
+udp://@239.1.1.1:1234
 srt://192.168.1.20:9000
 rtmp://live.example.com:1935/live/channel-1
 rtmp://a.rtmp.youtube.com/live2/<stream-key>
@@ -225,6 +227,10 @@ http://192.168.1.20:9000/hls/channel-1/playlist.m3u8
 Output host and port meaning depends on the selected format:
 
 ```text
+UDP:  output_host is the unicast or multicast destination and output_port is
+      the destination port. UDP output is implemented by the isolated
+      `UdpOutput` module, packetized as seven TS packets per datagram and paced
+      using MPEG-TS timestamps. CBR and PID remap are not applied in this mode.
 SRT:  output_mode selects listener or caller. In listener mode, output_host is
       the address advertised in the SRT player URL and TVStreamer5 binds SRT to
       interface_address or 0.0.0.0. In caller mode, output_host is the remote

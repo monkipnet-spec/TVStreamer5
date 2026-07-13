@@ -112,6 +112,9 @@ std::string advertisedHost(const StreamConfig& cfg) {
 
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = toLower(cfg.outputType);
+    if (type == "udp") {
+        return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
+    }
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
         return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
@@ -476,7 +479,7 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     sample.active = state.get("active", false).asBool();
     sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
     sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
-    sample.targetKbps = cfg.targetBitrate / 1000;
+    sample.targetKbps = toLower(cfg.outputType) == "udp" ? 0 : cfg.targetBitrate / 1000;
     sample.status = state.get("status", "").asString();
 
     const std::string statusLower = toLower(sample.status);
@@ -830,7 +833,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
-        <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
+        <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp" ${outputType==='udp'?'selected':''}>UDP MPEG-TS</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
         <div class="form-row" id="streamOutputModeRow"><label>Режим SRT выхода</label><select class="compact" id="streamOutputMode" onchange="updateOutputHints()"><option value="listener" ${(!stream.output_mode || stream.output_mode==='listener')?'selected':''}>SRT Listener</option><option value="caller" ${stream.output_mode==='caller'?'selected':''}>SRT Caller</option></select></div>
         <div class="form-row"><label id="streamOutputHostLabel">Адрес выхода</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
         <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
@@ -866,8 +869,14 @@ function updateOutputHints() {
   const port = document.getElementById('streamOutputPort');
   const outputModeRow = document.getElementById('streamOutputModeRow');
   const outputMode = document.getElementById('streamOutputMode')?.value || 'listener';
+  const cbr = document.getElementById('streamCbr');
+  const remap = document.getElementById('streamRemapEnabled');
+  const bitrate = document.getElementById('streamBitrate');
   if (!hostLabel || !portLabel || !host || !port) return;
   if (outputModeRow) outputModeRow.style.display = type === 'srt' ? '' : 'none';
+  if (cbr) cbr.disabled = type === 'udp';
+  if (remap) remap.disabled = type === 'udp';
+  if (bitrate) bitrate.disabled = type === 'udp';
   if (type === 'http' || type === 'hls') {
     hostLabel.textContent = 'Адрес для ссылки';
     portLabel.textContent = 'Порт панели';
@@ -894,6 +903,11 @@ function updateOutputHints() {
     portLabel.textContent = 'RTMP порт';
     port.disabled = false;
     host.placeholder = 'rtmp://server/app/key или server.example.com';
+  } else if (type === 'udp') {
+    hostLabel.textContent = 'UDP адрес назначения';
+    portLabel.textContent = 'UDP порт';
+    port.disabled = false;
+    host.placeholder = '239.0.0.1 или 192.168.1.20';
   }
   syncOutputHostWithInterface();
 }
