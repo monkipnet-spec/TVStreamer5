@@ -1,25 +1,216 @@
 #include "UdpOutput.h"
 
+#include <gst/app/gstappsink.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <iostream>
 #include <regex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "utils.h"
 
 namespace {
 
-constexpr gint kSocketBufferSize = 64 * 1024 * 1024;
+constexpr std::size_t kTsPacketSize = 188;
+constexpr std::size_t kTsPacketsPerDatagram = 7;
+constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
+constexpr int kSocketBufferSize = 64 * 1024 * 1024;
+constexpr int kMulticastTtl = 32;
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
     return std::regex_search(host, pattern);
 }
 
-std::string interfaceNameOrAddress(const std::string& address) {
+std::string interfaceAddressFor(const std::string& address) {
     for (const auto& iface : enumerateNetworkInterfaces()) {
-        if (iface.address == address) {
-            return iface.name;
+        if (iface.name == address || iface.address == address) {
+            return iface.address;
         }
     }
     return address;
+}
+
+class UdpTsSender {
+public:
+    UdpTsSender(const StreamConfig& cfg, std::string& error)
+        : targetBitrate(cfg.targetBitrate),
+          nextSend(std::chrono::steady_clock::now()) {
+        socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (socketFd < 0) {
+            error = std::string("failed to create UDP socket: ") + std::strerror(errno);
+            return;
+        }
+
+        int sendBufferSize = kSocketBufferSize;
+        ::setsockopt(socketFd, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize));
+
+        sockaddr_in destination {};
+        destination.sin_family = AF_INET;
+        destination.sin_port = htons(static_cast<uint16_t>(cfg.outputPort));
+        if (::inet_pton(AF_INET, cfg.outputHost.c_str(), &destination.sin_addr) != 1) {
+            error = "invalid UDP output host: " + cfg.outputHost;
+            closeSocket();
+            return;
+        }
+        destinationAddress = destination;
+
+        const bool multicastOutput = isMulticastHost(cfg.outputHost);
+        if (!cfg.interfaceAddress.empty()) {
+            const std::string ifaceAddress = interfaceAddressFor(cfg.interfaceAddress);
+            in_addr localAddress {};
+            if (::inet_pton(AF_INET, ifaceAddress.c_str(), &localAddress) != 1) {
+                error = "invalid UDP interface address: " + cfg.interfaceAddress;
+                closeSocket();
+                return;
+            }
+
+            if (multicastOutput) {
+                if (::setsockopt(socketFd, IPPROTO_IP, IP_MULTICAST_IF, &localAddress, sizeof(localAddress)) != 0) {
+                    error = std::string("failed to set multicast interface: ") + std::strerror(errno);
+                    closeSocket();
+                    return;
+                }
+            } else {
+                sockaddr_in bindAddress {};
+                bindAddress.sin_family = AF_INET;
+                bindAddress.sin_port = 0;
+                bindAddress.sin_addr = localAddress;
+                if (::bind(socketFd, reinterpret_cast<sockaddr*>(&bindAddress), sizeof(bindAddress)) != 0) {
+                    error = std::string("failed to bind UDP output interface: ") + std::strerror(errno);
+                    closeSocket();
+                    return;
+                }
+            }
+        }
+
+        if (multicastOutput) {
+            unsigned char ttl = kMulticastTtl;
+            ::setsockopt(socketFd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        }
+
+        ready = true;
+    }
+
+    ~UdpTsSender() {
+        closeSocket();
+    }
+
+    bool isReady() const {
+        return ready;
+    }
+
+    GstFlowReturn pushBuffer(GstBuffer* buffer) {
+        if (!ready || !buffer) {
+            return GST_FLOW_ERROR;
+        }
+
+        GstMapInfo map {};
+        if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+            return GST_FLOW_ERROR;
+        }
+
+        appendAndSend(map.data, map.size);
+        gst_buffer_unmap(buffer, &map);
+        return GST_FLOW_OK;
+    }
+
+private:
+    void appendAndSend(const guint8* data, std::size_t size) {
+        if (!data || size == 0) {
+            return;
+        }
+
+        if (!pending.empty()) {
+            const std::size_t needed = kUdpPayloadSize - pending.size();
+            const std::size_t copied = std::min(needed, size);
+            pending.insert(pending.end(), data, data + copied);
+            data += copied;
+            size -= copied;
+            if (pending.size() == kUdpPayloadSize) {
+                sendDatagram(pending.data(), pending.size());
+                pending.clear();
+            }
+        }
+
+        while (size >= kUdpPayloadSize) {
+            sendDatagram(data, kUdpPayloadSize);
+            data += kUdpPayloadSize;
+            size -= kUdpPayloadSize;
+        }
+
+        if (size > 0) {
+            pending.assign(data, data + size);
+        }
+    }
+
+    void sendDatagram(const guint8* data, std::size_t size) {
+        pace(size);
+        const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
+        const socklen_t destinationSize = sizeof(destinationAddress);
+        ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
+        if (sent < 0) {
+            std::cerr << "UDP output send failed: " << std::strerror(errno) << std::endl;
+        }
+    }
+
+    void pace(std::size_t bytes) {
+        if (targetBitrate == 0) {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (nextSend > now) {
+            std::this_thread::sleep_until(nextSend);
+        } else if (now - nextSend > std::chrono::seconds(1)) {
+            nextSend = now;
+        }
+
+        const uint64_t nanos = static_cast<uint64_t>(bytes) * 8ULL * 1000000000ULL / targetBitrate;
+        nextSend += std::chrono::nanoseconds(nanos);
+    }
+
+    void closeSocket() {
+        if (socketFd >= 0) {
+            ::close(socketFd);
+            socketFd = -1;
+        }
+        ready = false;
+    }
+
+    int socketFd = -1;
+    bool ready = false;
+    uint64_t targetBitrate = 0;
+    sockaddr_in destinationAddress {};
+    std::vector<guint8> pending;
+    std::chrono::steady_clock::time_point nextSend;
+};
+
+GstFlowReturn onNewSample(GstAppSink* sink, gpointer userData) {
+    auto* sender = static_cast<UdpTsSender*>(userData);
+    GstSample* sample = gst_app_sink_pull_sample(sink);
+    if (!sample) {
+        return GST_FLOW_ERROR;
+    }
+
+    GstBuffer* buffer = gst_sample_get_buffer(sample);
+    GstFlowReturn result = sender ? sender->pushBuffer(buffer) : GST_FLOW_ERROR;
+    gst_sample_unref(sample);
+    return result;
+}
+
+void destroySender(gpointer data) {
+    delete static_cast<UdpTsSender*>(data);
 }
 
 } // namespace
@@ -30,38 +221,39 @@ GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
     std::string& error) {
-    GstElement* sink = gst_element_factory_make("udpsink", "output_sink");
+    GstElement* sink = gst_element_factory_make("appsink", "output_sink");
     if (!sink || !gst_bin_add(GST_BIN(pipeline), sink)) {
         if (sink) {
             gst_object_unref(sink);
         }
-        error = "failed to create UDP output sink";
+        error = "failed to create UDP appsink";
         return nullptr;
     }
 
-    const bool multicastOutput = isMulticastHost(config.outputHost);
+    auto* sender = new UdpTsSender(config, error);
+    if (!sender->isReady()) {
+        delete sender;
+        gst_bin_remove(GST_BIN(pipeline), sink);
+        return nullptr;
+    }
+
+    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true");
     g_object_set(sink,
-        "host", config.outputHost.c_str(),
-        "port", config.outputPort,
-        "async", FALSE,
+        "caps", caps,
+        "emit-signals", FALSE,
         "sync", TRUE,
+        "async", FALSE,
         "qos", FALSE,
         "max-lateness", static_cast<gint64>(-1),
-        "processing-deadline", static_cast<guint64>(0),
         "enable-last-sample", FALSE,
-        "buffer-size", kSocketBufferSize,
+        "drop", FALSE,
+        "max-buffers", static_cast<guint>(0),
         nullptr);
+    gst_caps_unref(caps);
 
-    if (!config.interfaceAddress.empty() && !multicastOutput) {
-        g_object_set(sink, "bind-address", config.interfaceAddress.c_str(), nullptr);
-    }
-    if (multicastOutput) {
-        g_object_set(sink, "auto-multicast", TRUE, nullptr);
-        if (!config.interfaceAddress.empty()) {
-            const std::string iface = interfaceNameOrAddress(config.interfaceAddress);
-            g_object_set(sink, "multicast-iface", iface.c_str(), nullptr);
-        }
-    }
+    GstAppSinkCallbacks callbacks {};
+    callbacks.new_sample = onNewSample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
     return sink;
 }
 
