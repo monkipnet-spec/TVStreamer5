@@ -31,7 +31,7 @@ constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrWrap = 1ULL << 42;
 constexpr uint64_t kMinPacedBitrate = 512000ULL;
 constexpr uint64_t kMaxPacedBitrate = 200000000ULL;
-constexpr uint64_t kPaceHeadroomPercent = 105ULL;
+constexpr uint64_t kPaceHeadroomPercent = 125ULL;
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
@@ -60,8 +60,7 @@ void setUInt64PropertyIfPresent(GstElement* element, const char* propertyName, g
 class UdpTsSender {
 public:
     UdpTsSender(const StreamConfig& cfg, std::string& error)
-        : pacedBitrate(cfg.cbr ? cfg.targetBitrate : 0),
-          nextSend(std::chrono::steady_clock::now())
+        : nextSend(std::chrono::steady_clock::now())
     {
         socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (socketFd < 0) {
@@ -249,7 +248,11 @@ private:
             return;
         }
 
-        pacedBitrate = (pacedBitrate * 7ULL + estimatedBitrate * 3ULL) / 10ULL;
+        if (estimatedBitrate > pacedBitrate) {
+            pacedBitrate = estimatedBitrate;
+        } else {
+            pacedBitrate = (pacedBitrate * 9ULL + estimatedBitrate) / 10ULL;
+        }
     }
 
     void sendDatagram(const guint8* data, std::size_t size) {
@@ -351,7 +354,7 @@ GstElement* createSink(
     g_object_set(sink,
         "caps", caps,
         "emit-signals", FALSE,
-        "sync", TRUE,
+        "sync", FALSE,
         "async", FALSE,
         "qos", FALSE,
         "max-lateness", static_cast<gint64>(-1),
