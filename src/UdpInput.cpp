@@ -60,7 +60,17 @@ GstElement* build(
     }
     configureQueue(queue);
 
-    const int port = std::stoi(match[3].str());
+    int port = 0;
+    try {
+        port = std::stoi(match[3].str());
+    } catch (...) {
+        error = "invalid UDP/RTP input port";
+        return nullptr;
+    }
+    if (port <= 0 || port > 65535) {
+        error = "UDP/RTP input port is out of range";
+        return nullptr;
+    }
     std::string host = match[2].str();
     if (host.empty() || host == "@") {
         host = "0.0.0.0";
@@ -74,9 +84,12 @@ GstElement* build(
         "buffer-size", kSocketBufferSize,
         nullptr);
 
-    if (isMulticastHost(host) && !config.interfaceAddress.empty()) {
-        const std::string iface = interfaceNameOrAddress(config.interfaceAddress);
-        g_object_set(src, "multicast-iface", iface.c_str(), nullptr);
+    if (isMulticastHost(host)) {
+        g_object_set(src, "auto-multicast", TRUE, nullptr);
+        if (!config.interfaceAddress.empty()) {
+            const std::string iface = interfaceNameOrAddress(config.interfaceAddress);
+            g_object_set(src, "multicast-iface", iface.c_str(), nullptr);
+        }
     }
 
     if (toLower(match[1].str()) == "rtp") {

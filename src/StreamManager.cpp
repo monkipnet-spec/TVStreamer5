@@ -1177,7 +1177,8 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
-    const bool cbrActive = state->config.cbr && state->config.targetBitrate > 0;
+    const bool cbrActive = outputType(state->config) != "udp" &&
+        state->config.cbr && state->config.targetBitrate > 0;
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
     GstElement* pacer = cbrActive ? gst_element_factory_make("identity", "cbr_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
