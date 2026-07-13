@@ -44,7 +44,7 @@ GstElement* createSink(
         "host", config.outputHost.c_str(),
         "port", config.outputPort,
         "async", FALSE,
-        "sync", FALSE,
+        "sync", TRUE,
         "qos", FALSE,
         "max-lateness", static_cast<gint64>(-1),
         "processing-deadline", static_cast<guint64>(0),

@@ -1199,6 +1199,10 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
 
     configureQueue(queue);
     configureTsPacketAlignment(tsparse);
+    if (outputType(cfg) == "udp") {
+        setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
+        setUIntPropertyIfPresent(tsparse, "smoothing-latency", 100000);
+    }
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
