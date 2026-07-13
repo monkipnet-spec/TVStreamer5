@@ -1291,13 +1291,21 @@ bool StreamManager::buildUdpOutputPipeline(StreamState* state, GstElement* pipel
         return false;
     }
 
-    if (!hasElementFactory("udpsink")) {
-        std::cerr << missingElementStatus("udpsink") << std::endl;
+    if (!hasElementFactory("tsparse") || !hasElementFactory("udpsink")) {
+        std::cerr << "missing UDP output element: tsparse or udpsink" << std::endl;
         return false;
     }
 
+    GstElement* packetizer = gst_element_factory_make("tsparse", "udp_packetizer");
     GstElement* sink = createOutputSink(state->config, pipeline);
-    return sink && gst_element_link(sourceTail, sink);
+    if (!packetizer || !sink || !addElementOrFail(pipeline, packetizer)) {
+        return false;
+    }
+
+    setUIntPropertyIfPresent(packetizer, "alignment", kTsPacketsPerUdpBuffer);
+    setBooleanPropertyIfPresent(packetizer, "set-timestamps", FALSE);
+    setUIntPropertyIfPresent(packetizer, "smoothing-latency", 0);
+    return gst_element_link_many(sourceTail, packetizer, sink, nullptr);
 }
 
 bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {

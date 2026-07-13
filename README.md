@@ -189,14 +189,14 @@ If VLC reports skipped frames or the picture breaks up, enable CBR and keep
 20-30% above the measured input bitrate; disable CBR for pure passthrough.
 
 UDP output is a transparent pass-through for a clean input stream. It does not
-parse, pace, demux, remux, rewrite PID or service information, or add CBR null
-packets. The CBR and remap settings are therefore ignored for UDP output. With a
-UDP input, each datagram is forwarded directly from `udpsrc` to `udpsink` without
-an intermediate queue or forced packet size. SRT input/output latency is 2000 ms,
-and input failover waits 15 seconds before declaring the source lost. If
-GStreamer reports EOS or a stream error, TVStreamer5 attempts to rebuild the
-current pipeline before marking the stream failed or switching to the configured
-backup source.
+pace, demux, remux, rewrite PID or service information, or add CBR null packets.
+The CBR and remap settings are therefore ignored for UDP output. Before
+`udpsink`, unchanged TS packets are grouped into seven-packet (1316-byte) UDP
+datagrams to avoid IP fragmentation on a standard 1500-byte MTU. SRT input/output
+latency is 2000 ms, and input failover waits 15 seconds before declaring the
+source lost. If GStreamer reports EOS or a stream error, TVStreamer5 attempts to
+rebuild the current pipeline before marking the stream failed or switching to
+the configured backup source.
 
 Persist the tuning after reboot:
 
