@@ -20,7 +20,8 @@ constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
 constexpr gint kUdpOutputSocketBufferSize = 128 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
-constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
+// tsparse::smoothing-latency is expressed in microseconds, not GstClockTime.
+constexpr guint kTsSmoothingLatencyUs = 300'000;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kDefaultCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(15);
@@ -360,7 +361,7 @@ void configureUdpPacer(GstElement* pacer) {
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
     setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
-    setUInt64PropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatency);
+    setUIntPropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatencyUs);
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
