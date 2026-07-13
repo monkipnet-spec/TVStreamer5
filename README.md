@@ -5,6 +5,10 @@ streams, optionally remaps service/PID metadata, monitors input quality,
 switches to a backup source when the primary source disappears, and outputs
 streams as UDP, SRT listener, HTTP TS, HLS, RTMP, or YouTube Live.
 
+UDP protocol handling is isolated in `src/UdpInput.cpp` and
+`src/UdpOutput.cpp`. The stream manager only dispatches construction to these
+modules; shared MPEG-TS remap and CBR processing remains in the common pipeline.
+
 ## Build on the Host
 
 ```bash
