@@ -18,6 +18,8 @@
 namespace {
 
 constexpr guint kTsPacketsPerUdpBuffer = 7;
+constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
+constexpr guint64 kUdpQueueLatency = 5 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -242,6 +244,10 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         "max-size-bytes", 0,
         "max-size-time", maxSizeTime,
         nullptr);
+}
+
+void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
+    configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
 }
 
 void configureTsPacketAlignment(GstElement* element) {
@@ -1197,11 +1203,11 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
         return false;
     }
 
-    configureQueue(queue);
+    configureOutputQueue(queue, cfg);
     configureTsPacketAlignment(tsparse);
     if (outputType(cfg) == "udp") {
         setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
-        setUIntPropertyIfPresent(tsparse, "smoothing-latency", 100000);
+        setUInt64PropertyIfPresent(tsparse, "smoothing-latency", kTsSmoothingLatency);
     }
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
@@ -1220,8 +1226,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
-    const bool cbrActive = outputType(state->config) != "udp" &&
-        state->config.cbr && state->config.targetBitrate > 0;
+    const bool cbrActive = state->config.cbr && state->config.targetBitrate > 0;
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
     GstElement* pacer = cbrActive ? gst_element_factory_make("identity", "cbr_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
@@ -1240,7 +1245,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     }
 
     configureQueue(preDemuxQueue);
-    configureQueue(outputQueue);
+    configureOutputQueue(outputQueue, state->config);
     configureCbrPacer(pacer, state->config);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
