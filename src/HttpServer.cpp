@@ -112,9 +112,6 @@ std::string advertisedHost(const StreamConfig& cfg) {
 
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = toLower(cfg.outputType);
-    if (type == "udp") {
-        return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
-    }
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
         return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
@@ -137,7 +134,11 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
     if (type == "hls") {
         return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/hls/" + cfg.id + "/playlist.m3u8";
     }
-    return "";
+    const std::string outputHostLower = toLower(cfg.outputHost);
+    if (outputHostLower.rfind("udp://", 0) == 0) {
+        return cfg.outputHost;
+    }
+    return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
 }
 
 } // namespace
@@ -148,11 +149,6 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamM
 
 bool HttpServer::start() {
     try {
-        if (acceptor.is_open()) {
-            boost::system::error_code ec;
-            acceptor.cancel(ec);
-            acceptor.close(ec);
-        }
         tcp::endpoint endpoint(tcp::v4(), configManager.config.httpPort);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(boost::asio::socket_base::reuse_address(true));
@@ -166,27 +162,10 @@ bool HttpServer::start() {
     }
 }
 
-void HttpServer::restartListener() {
-    boost::asio::post(acceptor.get_executor(), [this]() {
-        if (!start()) {
-            std::cerr << "HTTP server restart failed on port "
-                      << configManager.config.httpPort << std::endl;
-        } else {
-            std::cerr << "HTTP server restarted on port "
-                      << configManager.config.httpPort << std::endl;
-        }
-    });
-}
-
 void HttpServer::doAccept() {
     acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
         if (!ec) {
             std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
-        }
-        if (!acceptor.is_open() ||
-            ec == boost::asio::error::operation_aborted ||
-            ec == boost::asio::error::bad_descriptor) {
-            return;
         }
         doAccept();
     });
@@ -479,7 +458,7 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     sample.active = state.get("active", false).asBool();
     sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
     sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
-    sample.targetKbps = toLower(cfg.outputType) == "udp" ? 0 : cfg.targetBitrate / 1000;
+    sample.targetKbps = cfg.targetBitrate / 1000;
     sample.status = state.get("status", "").asString();
 
     const std::string statusLower = toLower(sample.status);
@@ -532,7 +511,6 @@ void HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Invalid config payload: " << errs << std::endl;
         return;
     }
-    const int oldHttpPort = configManager.config.httpPort;
     AppConfig nextConfig = AppConfig::fromJson(root);
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
@@ -545,9 +523,6 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     }
     configManager.config = nextConfig;
     configManager.save();
-    if (configManager.config.httpPort != oldHttpPort) {
-        restartListener();
-    }
 }
 
 void HttpServer::handleStartStream(const std::string& body) {
@@ -739,7 +714,7 @@ function render() {
         <div class="badge">${stream.cbr ? 'CBR' : 'VBR'}</div>
       </div>
       <div class="info">
-        <div class="info-row"><strong>Вывод</strong><span>${(stream.output_type || 'srt').toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
+        <div class="info-row"><strong>Вывод</strong><span>${(stream.output_type || 'udp').toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
         <div class="info-row"><strong>Активный вход</strong><span>${stream.active_input_label || 'Основной'} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>Основной</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>Резерв</strong><span>${stream.backup_input_uri || '—'}</span></div>
@@ -791,7 +766,6 @@ function openLoginModal() {
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
       <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
       <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
-      <div class="form-row"><label>Порт интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
     </div>
     <div class="modal-actions">
       <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -815,7 +789,7 @@ function openTelegramModal() {
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
-    name:'', input_uri:'', backup_input_uri:'', output_type:'srt', output_mode:'listener', output_host:'0.0.0.0', output_port:1234,
+    name:'', input_uri:'', backup_input_uri:'', output_type:'udp', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
     interface_address:'', input_mode:'auto', auto_start:false, remap_enabled:false, cbr:true, target_bitrate:8000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:''
   });
@@ -824,12 +798,12 @@ function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
     const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
-    const outputType = stream.output_type || 'srt';
+    const outputType = stream.output_type || 'udp';
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, srt://host:9000 или https://host/live.m3u8" /></div>
+        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
@@ -862,21 +836,15 @@ function openStreamForm(stream) {
   }
 }
 function updateOutputHints() {
-  const type = document.getElementById('streamOutputType')?.value || 'srt';
+  const type = document.getElementById('streamOutputType')?.value || 'udp';
   const hostLabel = document.getElementById('streamOutputHostLabel');
   const portLabel = document.getElementById('streamOutputPortLabel');
   const host = document.getElementById('streamOutputHost');
   const port = document.getElementById('streamOutputPort');
   const outputModeRow = document.getElementById('streamOutputModeRow');
   const outputMode = document.getElementById('streamOutputMode')?.value || 'listener';
-  const cbr = document.getElementById('streamCbr');
-  const remap = document.getElementById('streamRemapEnabled');
-  const bitrate = document.getElementById('streamBitrate');
   if (!hostLabel || !portLabel || !host || !port) return;
   if (outputModeRow) outputModeRow.style.display = type === 'srt' ? '' : 'none';
-  if (cbr) cbr.disabled = type === 'udp';
-  if (remap) remap.disabled = type === 'udp';
-  if (bitrate) bitrate.disabled = type === 'udp';
   if (type === 'http' || type === 'hls') {
     hostLabel.textContent = 'Адрес для ссылки';
     portLabel.textContent = 'Порт панели';
@@ -903,16 +871,16 @@ function updateOutputHints() {
     portLabel.textContent = 'RTMP порт';
     port.disabled = false;
     host.placeholder = 'rtmp://server/app/key или server.example.com';
-  } else if (type === 'udp') {
-    hostLabel.textContent = 'UDP адрес назначения';
+  } else {
+    hostLabel.textContent = 'Мультикаст / UDP IP';
     portLabel.textContent = 'UDP порт';
     port.disabled = false;
-    host.placeholder = '239.0.0.1 или 192.168.1.20';
+    host.placeholder = '239.0.0.1 или udp://@239.0.0.1:1234';
   }
   syncOutputHostWithInterface();
 }
 function syncOutputHostWithInterface() {
-  const type = document.getElementById('streamOutputType')?.value || 'srt';
+  const type = document.getElementById('streamOutputType')?.value || 'udp';
   const iface = document.getElementById('streamInterface')?.value || '';
   const host = document.getElementById('streamOutputHost');
   if (!host || !iface || (type !== 'http' && type !== 'hls')) return;
@@ -921,27 +889,18 @@ function syncOutputHostWithInterface() {
   }
 }
 function saveSettings() {
-  const httpPort = Number(document.getElementById('httpPort')?.value || state.http_port || 9000);
-  const oldHttpPort = Number(state.http_port || 9000);
   const payload = {
     login: document.getElementById('login')?.value || state.login,
     server_name: document.getElementById('serverName')?.value || state.server_name,
     telegram_token: document.getElementById('telegramToken')?.value || state.telegram_token,
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
-    http_port: httpPort > 0 && httpPort <= 65535 ? httpPort : state.http_port,
+    http_port: state.http_port,
     streams: state.streams
   };
   const password = document.getElementById('password')?.value;
   if (password) payload.password = password;
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    .then(()=>{
-      closeModal();
-      if (payload.http_port !== oldHttpPort) {
-        window.location.href = window.location.protocol + '//' + window.location.hostname + ':' + payload.http_port + '/';
-      } else {
-        fetchState();
-      }
-    });
+    .then(()=>{closeModal();fetchState();});
 }
 function saveStream(id) {
   const payload = {

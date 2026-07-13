@@ -1,5 +1,4 @@
 #include "ConfigManager.h"
-#include "utils.h"
 
 #include <fstream>
 #include <iostream>
@@ -11,12 +10,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.name = root.get("name", "").asString();
     config.inputUri = root.get("input_uri", "").asString();
     config.backupInputUri = root.get("backup_input_uri", "").asString();
-    config.outputType = root.get("output_type", "srt").asString();
-    const std::string outputTypeLower = toLower(config.outputType);
-    if (outputTypeLower != "udp" && outputTypeLower != "srt" && outputTypeLower != "http" && outputTypeLower != "hls" &&
-        outputTypeLower != "rtmp" && outputTypeLower != "youtube") {
-        config.outputType = "srt";
-    }
+    config.outputType = root.get("output_type", "udp").asString();
     config.outputMode = root.get("output_mode", "listener").asString();
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
     config.outputPort = root.get("output_port", 1234).asInt();
@@ -80,9 +74,6 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     config.password = root.get("password", "admin").asString();
     config.serverName = root.get("server_name", "TVStreamer5").asString();
     config.httpPort = root.get("http_port", 9000).asInt();
-    if (config.httpPort <= 0 || config.httpPort > 65535) {
-        config.httpPort = 9000;
-    }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
     if (root.isMember("streams") && root["streams"].isArray()) {

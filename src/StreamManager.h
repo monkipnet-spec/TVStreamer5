@@ -23,8 +23,6 @@ struct RemapContext {
     bool flvMux = false;
     std::string videoPadName;
     std::string audioPadName;
-    std::string inputVideoPadName;
-    std::string inputAudioPadName;
 };
 
 struct StreamState {
@@ -80,7 +78,6 @@ private:
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
-    static void onDemuxPadRemoved(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);

@@ -1,10 +1,10 @@
 #include "StreamManager.h"
-#include "UdpOutput.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <regex>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -16,13 +16,21 @@
 
 namespace {
 
-constexpr guint kTsPacketsPerBuffer = 7;
-constexpr guint kTsBlockSize = kTsPacketsPerBuffer * 188;
-constexpr guint kTsSmoothingLatencyUs = 300'000;
-constexpr guint64 kDefaultCbrBitrate = 8'000'000;
-constexpr auto kInputFailoverDelay = std::chrono::seconds(15);
+constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
+constexpr gint kUdpOutputSocketBufferSize = 64 * 1024 * 1024;
+constexpr guint kTsPacketsPerUdpBuffer = 7;
+constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
+constexpr guint64 kTsSmoothingLatency = 700 * GST_MSECOND;
+constexpr guint64 kMinCbrBitrate = 8'000'000;
+constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
-constexpr gint kSrtLatencyMs = 2000;
+
+struct UdpEndpoint {
+    std::string scheme = "udp";
+    std::string host;
+    int port = 0;
+    bool explicitListen = false;
+};
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -87,10 +95,72 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
     }
 }
 
+bool isMulticastHost(const std::string& host) {
+    std::regex re(R"(^((22[4-9])|(23[0-9]))\.)");
+    return std::regex_search(host, re);
+}
+
+bool parseUdpEndpoint(const std::string& uri, UdpEndpoint& endpoint) {
+    std::regex re(R"(^(udp|rtp)://(@)?\[?([^\]/:?]*)\]?:([0-9]+)(?:[/?#].*)?$)", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_match(uri, match, re) || match.size() < 5) {
+        return false;
+    }
+
+    endpoint.scheme = toLower(match[1].str());
+    endpoint.explicitListen = match[2].matched;
+    endpoint.host = match[3].str();
+    try {
+        endpoint.port = std::stoi(match[4].str());
+    } catch (...) {
+        return false;
+    }
+
+    return endpoint.port > 0 && endpoint.port <= 65535;
+}
+
+UdpEndpoint udpOutputEndpoint(const StreamConfig& cfg) {
+    UdpEndpoint endpoint;
+    endpoint.host = cfg.outputHost;
+    endpoint.port = cfg.outputPort;
+
+    const std::string outputHostLower = toLower(cfg.outputHost);
+    if (outputHostLower.rfind("udp://", 0) == 0) {
+        UdpEndpoint parsed;
+        if (parseUdpEndpoint(cfg.outputHost, parsed)) {
+            endpoint = parsed;
+        }
+    }
+
+    if (endpoint.host.empty() || endpoint.host == "@") {
+        endpoint.host = "127.0.0.1";
+    }
+    return endpoint;
+}
+
+std::string interfaceNameForAddress(const std::string& address) {
+    if (address.empty()) {
+        return "";
+    }
+
+    for (const auto& iface : enumerateNetworkInterfaces()) {
+        if (iface.address == address) {
+            return iface.name;
+        }
+    }
+
+    return "";
+}
+
+std::string interfaceNameOrAddress(const std::string& address) {
+    const std::string ifaceName = interfaceNameForAddress(address);
+    return ifaceName.empty() ? address : ifaceName;
+}
+
 std::string outputType(const StreamConfig& cfg) {
     std::string type = toLower(cfg.outputType);
-    if (type != "udp" && type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
-        type = "srt";
+    if (type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
+        type = "udp";
     }
     return type;
 }
@@ -147,6 +217,34 @@ uint64_t bufferListSize(GstBufferList* list) {
     return total;
 }
 
+void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
+    const UdpEndpoint endpoint = udpOutputEndpoint(cfg);
+    const bool multicastOutput = isMulticastHost(endpoint.host);
+
+    g_object_set(sink,
+        "host", endpoint.host.c_str(),
+        "port", endpoint.port,
+        "async", FALSE,
+        "sync", TRUE,
+        "buffer-size", kUdpOutputSocketBufferSize,
+        nullptr);
+    setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
+
+    if (cfg.cbr && cfg.targetBitrate > 0) {
+        setBooleanPropertyIfPresent(sink, "qos", FALSE);
+        setInt64PropertyIfPresent(sink, "max-lateness", -1);
+    }
+
+    if (!cfg.interfaceAddress.empty() && !multicastOutput) {
+        setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
+    }
+
+    if (multicastOutput) {
+        g_object_set(sink, "auto-multicast", TRUE, nullptr);
+        setStringPropertyIfPresent(sink, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress));
+    }
+}
+
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
@@ -161,7 +259,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         "uri", uri.c_str(),
         "sync", FALSE,
         "async", FALSE,
-        "blocksize", kTsBlockSize,
+        "blocksize", kTsUdpBlockSize,
         nullptr);
 
     setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
@@ -172,7 +270,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "latency", kSrtLatencyMs);
+    setIntPropertyIfPresent(sink, "latency", 250);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
     if (caller) {
@@ -248,9 +346,9 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 }
 
 void configureTsPacketAlignment(GstElement* element) {
-    setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerBuffer));
+    setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
     setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
-    setUIntPropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatencyUs);
+    setUInt64PropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatency);
 }
 
 void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
@@ -277,15 +375,14 @@ void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
     g_object_set(mux,
-        "alignment", static_cast<gint>(kTsPacketsPerBuffer),
+        "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer),
         "pcr-interval", 1800U,
         "pat-interval", 9000U,
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    if (cfg.cbr) {
-        const guint64 bitrate = cfg.targetBitrate > 0 ? cfg.targetBitrate : kDefaultCbrBitrate;
-        setUInt64PropertyIfPresent(mux, "bitrate", bitrate);
+    if (cfg.cbr && cfg.targetBitrate > 0) {
+        setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
 }
 
@@ -532,9 +629,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = outputType(streamConfig) != "udp" && streamConfig.cbr
-        ? streamConfig.targetBitrate
-        : 0;
+    state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -774,9 +869,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->inputBytes = 0;
     state->outputBytes = 0;
     state->inputBitrate = 0;
-    state->outputBitrate = outputType(state->config) != "udp" && state->config.cbr
-        ? state->config.targetBitrate
-        : 0;
+    state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastInputBytesSeen = 0;
@@ -817,16 +910,6 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     const std::string type = outputType(cfg);
-    if (type == "udp") {
-        std::string error;
-        if (!UdpOutput::build(pipeline, sourceTail, cfg, error)) {
-            std::cerr << error << std::endl;
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-        return pipeline;
-    }
-
     if (type == "rtmp" || type == "youtube") {
         if (!buildRtmpOutputPipeline(state, pipeline, sourceTail)) {
             gst_object_unref(pipeline);
@@ -835,7 +918,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return pipeline;
     }
 
-    const bool needsRemux = cfg.remapEnabled || cfg.cbr;
+    const bool needsRemux = cfg.remapEnabled || (cfg.cbr && cfg.targetBitrate > 0);
     bool ok = false;
     if (needsRemux) {
         if (!state->remapContext) {
@@ -916,7 +999,6 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         state->sourceContext->config = cfg;
         state->sourceContext->flvMux = false;
         g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onFlvDemuxPadAdded), state->sourceContext.get());
-        g_signal_connect(demux, "pad-removed", G_CALLBACK(StreamManager::onDemuxPadRemoved), state->sourceContext.get());
 
         terminalElement = outputQueue;
         return src;
@@ -973,7 +1055,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make(factory, "input_src");
-        GstElement* queue = addQueue("input_queue", 10000000000ULL);
+        GstElement* queue = addQueue("input_queue");
         if (!src || !queue || !addElementOrFail(pipeline, src)) {
             return nullptr;
         }
@@ -981,7 +1063,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         g_object_set(src, "uri", input.c_str(), nullptr);
         setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
         setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
-        setIntPropertyIfPresent(src, "latency", kSrtLatencyMs);
+        setIntPropertyIfPresent(src, "latency", 500);
         setStringPropertyIfPresent(src, "localaddress", cfg.interfaceAddress);
         if (mode == "listener") {
             setIntPropertyIfPresent(src, "mode", 2);
@@ -1061,7 +1143,67 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    GstElement* src = gst_element_factory_make("filesrc", "input_src");
+    if (inputLower.rfind("udp://", 0) == 0 || inputLower.rfind("rtp://", 0) == 0) {
+        UdpEndpoint endpoint;
+        if (!parseUdpEndpoint(input, endpoint)) {
+            return nullptr;
+        }
+
+        GstElement* src = gst_element_factory_make("udpsrc", "input_src");
+        GstElement* queue = addQueue("input_queue");
+        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+            return nullptr;
+        }
+
+        const bool multicastInput = isMulticastHost(endpoint.host);
+        std::string listenAddress = endpoint.host;
+        if (listenAddress.empty() || (endpoint.explicitListen && !multicastInput)) {
+            listenAddress = "0.0.0.0";
+        }
+
+        g_object_set(src,
+            "address", listenAddress.c_str(),
+            "port", endpoint.port,
+            "reuse", TRUE,
+            "do-timestamp", TRUE,
+            "buffer-size", kUdpInputSocketBufferSize,
+            nullptr);
+
+        if (multicastInput) {
+            g_object_set(src, "auto-multicast", TRUE, nullptr);
+        }
+
+        if (multicastInput && !cfg.interfaceAddress.empty()) {
+            g_object_set(src, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress).c_str(), nullptr);
+        }
+
+        if (endpoint.scheme == "rtp") {
+            GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");
+            if (!depay || !addElementOrFail(pipeline, depay)) {
+                return nullptr;
+            }
+
+            GstCaps* caps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=MP2T,clock-rate=90000");
+            g_object_set(src, "caps", caps, nullptr);
+            gst_caps_unref(caps);
+
+            if (!gst_element_link_many(src, depay, queue, nullptr)) {
+                return nullptr;
+            }
+        } else {
+            GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+            g_object_set(src, "caps", caps, nullptr);
+            gst_caps_unref(caps);
+
+            if (!gst_element_link(src, queue)) {
+                return nullptr;
+            }
+        }
+
+        terminalElement = queue;
+        return src;
+    }
+        GstElement* src = gst_element_factory_make("filesrc", "input_src");
     GstElement* queue = addQueue("input_queue");
     if (!src || !queue || !addElementOrFail(pipeline, src)) {
         return nullptr;
@@ -1202,7 +1344,6 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     state->remapContext->mux = mux;
     state->remapContext->sink = sink;
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->remapContext.get());
-    g_signal_connect(demux, "pad-removed", G_CALLBACK(StreamManager::onDemuxPadRemoved), state->remapContext.get());
     return true;
 }
 
@@ -1262,8 +1403,10 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
 
 GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline) {
     const std::string type = outputType(cfg);
-    const char* factory = "srtsink";
-    if (type == "http") {
+    const char* factory = "udpsink";
+    if (type == "srt") {
+        factory = "srtsink";
+    } else if (type == "http") {
         factory = "multifdsink";
     } else if (type == "hls") {
         factory = "hlssink";
@@ -1289,6 +1432,8 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         configureHlsSink(sink, cfg);
     } else if (type == "rtmp" || type == "youtube") {
         configureRtmpSink(sink, cfg);
+    } else {
+        configureUdpSink(sink, cfg);
     }
 
     return sink;
@@ -1399,16 +1544,13 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
-        const gchar* inputPadName = GST_PAD_NAME(pad);
         if (isVideo) {
             ctx->videoLinked = true;
             ctx->videoPadName = padName ? padName : "";
-            ctx->inputVideoPadName = inputPadName ? inputPadName : "";
         }
         if (isAudio) {
             ctx->audioLinked = true;
             ctx->audioPadName = padName ? padName : "";
-            ctx->inputAudioPadName = inputPadName ? inputPadName : "";
         }
         updateMuxProgramMap(ctx);
     }
@@ -1416,27 +1558,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     gst_object_unref(parserSrcPad);
     gst_object_unref(muxSinkPad);
     gst_object_unref(pipeline);
-}
-
-void StreamManager::onDemuxPadRemoved(GstElement* demux, GstPad* pad, gpointer user_data) {
-    (void)demux;
-    auto* ctx = static_cast<RemapContext*>(user_data);
-    const gchar* padName = pad ? GST_PAD_NAME(pad) : nullptr;
-    if (!ctx || !padName) {
-        return;
-    }
-
-    if (ctx->inputVideoPadName == padName) {
-        ctx->videoLinked = false;
-        ctx->videoPadName.clear();
-        ctx->inputVideoPadName.clear();
-    }
-    if (ctx->inputAudioPadName == padName) {
-        ctx->audioLinked = false;
-        ctx->audioPadName.clear();
-        ctx->inputAudioPadName.clear();
-    }
-    updateMuxProgramMap(ctx);
 }
 
 void StreamManager::onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data) {
@@ -1637,6 +1758,7 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
              g_strcmp0(factoryName, "rtspsrc") == 0 ||
              g_strcmp0(factoryName, "rtmpsrc") == 0 ||
              g_strcmp0(factoryName, "souphttpsrc") == 0 ||
+             g_strcmp0(factoryName, "udpsrc") == 0 ||
              g_strcmp0(factoryName, "filesrc") == 0)) {
             GstPad* srcPad = gst_element_get_static_pad(element, "src");
             if (srcPad) {
@@ -1854,65 +1976,18 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
                 g_free(dbg);
 
-                gst_message_unref(msg);
-                state->statusMessage = "recovering after error";
-                notifyStreamState(
-                    state->config,
-                    "🟡",
-                    "Сбой потока",
-                    "Причина: " + message + "\nПробую восстановить текущий источник\nURL: " + state->activeInputUri);
-                if (restartPipelineWithInput(state, state->activeInputUri, state->usingBackup)) {
-                    bus = state->bus;
-                    notifyStreamState(
-                        state->config,
-                        "🟢",
-                        "Поток восстановлен",
-                        "Активный источник: " + std::string(state->usingBackup ? "резерв" : "основной") +
-                            "\nURL: " + state->activeInputUri);
-                    continue;
-                }
-                if (!state->usingBackup && !state->config.backupInputUri.empty() &&
-                    restartPipelineWithInput(state, state->config.backupInputUri, true)) {
-                    bus = state->bus;
-                    notifyStreamState(
-                        state->config,
-                        "🟠",
-                        "Переключился на резерв",
-                        "Основной источник дал ошибку\nBackup: " + state->activeInputUri);
-                    continue;
-                }
                 state->statusMessage = "error: " + message;
                 state->active = false;
-                notifyStreamState(state->config, "🔴", "Ошибка потока", "Автовосстановление не удалось\nПричина: " + message);
+                notifyStreamState(state->config, "🔴", "Ошибка потока", "Причина: " + message);
+                gst_message_unref(msg);
                 return;
             }
-            case GST_MESSAGE_EOS: {
-                gst_message_unref(msg);
-                state->statusMessage = "recovering after eos";
-                notifyStreamState(
-                    state->config,
-                    "🟡",
-                    "Источник закрыл соединение",
-                    "GStreamer получил EOS\nПробую подключиться снова\nURL: " + state->activeInputUri);
-                if (restartPipelineWithInput(state, state->activeInputUri, state->usingBackup)) {
-                    bus = state->bus;
-                    continue;
-                }
-                if (!state->usingBackup && !state->config.backupInputUri.empty() &&
-                    restartPipelineWithInput(state, state->config.backupInputUri, true)) {
-                    bus = state->bus;
-                    notifyStreamState(
-                        state->config,
-                        "🟠",
-                        "Переключился на резерв",
-                        "Основной источник завершился\nBackup: " + state->activeInputUri);
-                    continue;
-                }
+            case GST_MESSAGE_EOS:
                 state->statusMessage = "ended";
                 state->active = false;
-                notifyStreamState(state->config, "⚫", "Поток завершился", "Автовосстановление не удалось");
+                notifyStreamState(state->config, "⚫", "Поток завершился", "GStreamer получил EOS");
+                gst_message_unref(msg);
                 return;
-            }
             default:
                 gst_message_unref(msg);
                 break;
