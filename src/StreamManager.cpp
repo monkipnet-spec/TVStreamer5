@@ -19,7 +19,7 @@ namespace {
 
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
-constexpr guint64 kUdpQueueLatency = 5 * GST_SECOND;
+constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 

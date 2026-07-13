@@ -22,7 +22,7 @@ namespace {
 constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kTsPacketsPerDatagram = 7;
 constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
-constexpr int kSocketBufferSize = 64 * 1024 * 1024;
+constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 
 bool isMulticastHost(const std::string& host) {
