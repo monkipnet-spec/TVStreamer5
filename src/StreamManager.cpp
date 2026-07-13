@@ -17,11 +17,12 @@
 namespace {
 
 constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
-constexpr gint kUdpOutputSocketBufferSize = 64 * 1024 * 1024;
+constexpr gint kUdpOutputSocketBufferSize = 128 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
-constexpr guint64 kTsSmoothingLatency = 700 * GST_MSECOND;
-constexpr guint64 kMinCbrBitrate = 8'000'000;
+constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
+constexpr guint64 kUdpQueueLatency = 5 * GST_SECOND;
+constexpr guint64 kDefaultCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
@@ -225,15 +226,12 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", endpoint.host.c_str(),
         "port", endpoint.port,
         "async", FALSE,
-        "sync", TRUE,
+        "sync", FALSE,
         "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
     setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
-
-    if (cfg.cbr && cfg.targetBitrate > 0) {
-        setBooleanPropertyIfPresent(sink, "qos", FALSE);
-        setInt64PropertyIfPresent(sink, "max-lateness", -1);
-    }
+    setBooleanPropertyIfPresent(sink, "qos", FALSE);
+    setInt64PropertyIfPresent(sink, "max-lateness", -1);
 
     if (!cfg.interfaceAddress.empty() && !multicastOutput) {
         setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
@@ -345,6 +343,10 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         nullptr);
 }
 
+void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
+    configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
+}
+
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
     setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
@@ -382,7 +384,7 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "si-interval", 9000U,
         nullptr);
     if (cfg.cbr) {
-        const guint64 bitrate = std::max<guint64>(cfg.targetBitrate, kMinCbrBitrate);
+        const guint64 bitrate = cfg.targetBitrate > 0 ? cfg.targetBitrate : kDefaultCbrBitrate;
         setUInt64PropertyIfPresent(mux, "bitrate", bitrate);
     }
 }
@@ -1297,7 +1299,7 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
         return false;
     }
 
-    configureQueue(queue);
+    configureOutputQueue(queue, cfg);
     configureTsPacketAlignment(tsparse);
 
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
@@ -1331,7 +1333,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     }
 
     configureQueue(preDemuxQueue);
-    configureQueue(outputQueue);
+    configureOutputQueue(outputQueue, state->config);
     configureTsMux(mux, state->config);
     sendServiceDescription(mux, state->config);
 
@@ -1376,7 +1378,7 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
     }
 
     configureQueue(preDemuxQueue);
-    configureQueue(outputQueue);
+    configureOutputQueue(outputQueue, state->config);
     configureTsPacketAlignment(tsparse);
     g_object_set(mux,
         "streamable", TRUE,
