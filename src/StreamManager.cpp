@@ -227,7 +227,7 @@ void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
         "host", endpoint.host.c_str(),
         "port", endpoint.port,
         "async", FALSE,
-        "sync", FALSE,
+        "sync", TRUE,
         "buffer-size", kUdpOutputSocketBufferSize,
         nullptr);
     setUIntPropertyIfPresent(sink, "blocksize", kTsUdpBlockSize);
@@ -276,7 +276,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         setUIntPropertyIfPresent(sink, "localport", 0);
     }
 
-    if (cfg.targetBitrate > 0) {
+    if (cfg.cbr && cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
 }
@@ -307,7 +307,7 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
         "qos", FALSE,
         nullptr);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
-    if (cfg.targetBitrate > 0) {
+    if (cfg.cbr && cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
 }
