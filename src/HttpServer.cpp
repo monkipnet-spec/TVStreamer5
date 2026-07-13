@@ -652,6 +652,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .form-row .checkbox-inline input{width:16px;height:16px}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
 .modal-actions button{min-width:100px;padding:8px 12px}
+.about-list{display:grid;gap:10px;margin:4px 0 0}
+.about-row{display:grid;grid-template-columns:120px 1fr;gap:12px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:.9rem}
+.about-row:last-child{border-bottom:none}
+.about-row strong{color:#9aa3b1;font-weight:600}
+.about-row span,.about-row a{color:#fff;text-decoration:none;overflow-wrap:anywhere}
+.about-row a:hover{color:#7dd1ff}
 </style>
 </head>
 <body>
@@ -669,6 +675,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 </div>
 </div>
 <div class="header-right">
+<button class="button-secondary" onclick="openAboutModal()">ABOUT</button>
 <button class="button-secondary" onclick="openLoginModal()">Пользователь</button>
 <button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
 <button class="button-primary" onclick="openStreamModal()">+ Добавить поток</button>
@@ -738,6 +745,19 @@ function editStream(id) {
   const stream = state.streams.find(s=>s.id===id);
   if (!stream) return;
   openStreamForm(stream);
+}
+function openAboutModal() {
+  openModal(`
+    <h2>ABOUT</h2>
+    <div class="about-list">
+      <div class="about-row"><strong>Имя</strong><span>Лукомский Виталий</span></div>
+      <div class="about-row"><strong>Страна</strong><span>Беларусь, г. Борисов</span></div>
+      <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
+    </div>
+    <div class="modal-actions">
+      <button class="button-primary" onclick="closeModal()">Закрыть</button>
+    </div>
+  `);
 }
 function openLoginModal() {
   openModal(`
