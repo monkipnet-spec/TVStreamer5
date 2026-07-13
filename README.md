@@ -188,11 +188,11 @@ If VLC reports skipped frames or the picture breaks up, enable CBR and keep
 `target_bitrate` above the real input bitrate. A good starting point is
 20-30% above the measured input bitrate; disable CBR for pure passthrough.
 
-UDP output assumes a clean MPEG-TS input. Both VBR and CBR output demux and remux
-the elementary streams so PID and service settings are applied. CBR additionally
-inserts null packets up to `target_bitrate`; VBR does not add bitrate padding.
-Both modes use a two-second output queue and MPEG-TS clock pacing before the
-socket sender. SRT input/output latency is 2000 ms, and input failover waits 15
+UDP output is a transparent pass-through for a clean input stream. It does not
+parse, pace, demux, remux, rewrite PID or service information, or add CBR null
+packets. The CBR and remap settings are therefore ignored for UDP output. A
+two-second queue only separates input processing from socket writes and does not
+modify buffers. SRT input/output latency is 2000 ms, and input failover waits 15
 seconds before declaring the source lost. If GStreamer reports EOS or a stream
 error, TVStreamer5 attempts to rebuild the current pipeline before marking the
 stream failed or switching to the configured backup source.

@@ -348,21 +348,6 @@ void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
     configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
 }
 
-void configureUdpPacer(GstElement* pacer) {
-    if (!pacer) {
-        return;
-    }
-
-    setBooleanPropertyIfPresent(pacer, "sync", TRUE);
-    setBooleanPropertyIfPresent(pacer, "single-segment", TRUE);
-}
-
-void configureCleanUdpTsParser(GstElement* parser) {
-    setUIntPropertyIfPresent(parser, "alignment", kTsPacketsPerUdpBuffer);
-    setBooleanPropertyIfPresent(parser, "set-timestamps", TRUE);
-    setUIntPropertyIfPresent(parser, "smoothing-latency", 0);
-}
-
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
     setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
@@ -629,7 +614,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->activeInputUri = streamConfig.inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
-    if (streamConfig.remapEnabled) {
+    if (streamConfig.remapEnabled && outputType(streamConfig) != "udp") {
         state->remapContext = std::make_unique<RemapContext>();
         state->remapContext->config = streamConfig;
     }
@@ -648,7 +633,9 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
+    state->outputBitrate = outputType(streamConfig) != "udp" && streamConfig.cbr
+        ? streamConfig.targetBitrate
+        : 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -888,7 +875,9 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->inputBytes = 0;
     state->outputBytes = 0;
     state->inputBitrate = 0;
-    state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
+    state->outputBitrate = outputType(state->config) != "udp" && state->config.cbr
+        ? state->config.targetBitrate
+        : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastInputBytesSeen = 0;
@@ -1312,9 +1301,7 @@ bool StreamManager::buildUdpOutputPipeline(StreamState* state, GstElement* pipel
     }
 
     const StreamConfig& cfg = state->config;
-    const std::vector<const char*> required = {
-        "tsparse", "tsdemux", "mpegtsmux", "queue", "identity", "udpsink"
-    };
+    const std::vector<const char*> required = {"queue", "udpsink"};
     for (const char* factory : required) {
         if (!hasElementFactory(factory)) {
             std::cerr << missingElementStatus(factory) << std::endl;
@@ -1322,46 +1309,14 @@ bool StreamManager::buildUdpOutputPipeline(StreamState* state, GstElement* pipel
         }
     }
 
-    GstElement* parser = gst_element_factory_make("tsparse", "udp_tsparse");
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
-    GstElement* pacer = gst_element_factory_make("identity", "udp_pacer");
     GstElement* sink = createOutputSink(cfg, pipeline);
-    if (!parser || !outputQueue || !pacer || !sink ||
-        !addElementOrFail(pipeline, parser) ||
-        !addElementOrFail(pipeline, outputQueue) ||
-        !addElementOrFail(pipeline, pacer)) {
+    if (!outputQueue || !sink || !addElementOrFail(pipeline, outputQueue)) {
         return false;
     }
 
-    configureCleanUdpTsParser(parser);
     configureQueue(outputQueue, kUdpQueueLatency);
-    configureUdpPacer(pacer);
-
-    GstElement* demux = gst_element_factory_make("tsdemux", "udp_demux");
-    GstElement* mux = gst_element_factory_make("mpegtsmux", "udp_mux");
-    if (!demux || !mux ||
-        !addElementOrFail(pipeline, demux) ||
-        !addElementOrFail(pipeline, mux)) {
-        return false;
-    }
-
-    configureTsMux(mux, cfg);
-    sendServiceDescription(mux, cfg);
-    if (!gst_element_link_many(sourceTail, parser, demux, nullptr) ||
-        !gst_element_link_many(mux, outputQueue, pacer, sink, nullptr)) {
-        return false;
-    }
-
-    if (!state->remapContext) {
-        state->remapContext = std::make_unique<RemapContext>();
-    }
-    state->remapContext->mux = mux;
-    state->remapContext->sink = sink;
-    state->remapContext->config = cfg;
-    state->remapContext->flvMux = false;
-    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->remapContext.get());
-    g_signal_connect(demux, "pad-removed", G_CALLBACK(StreamManager::onDemuxPadRemoved), state->remapContext.get());
-    return true;
+    return gst_element_link_many(sourceTail, outputQueue, sink, nullptr);
 }
 
 bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {

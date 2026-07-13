@@ -480,7 +480,7 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     sample.active = state.get("active", false).asBool();
     sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
     sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
-    sample.targetKbps = cfg.targetBitrate / 1000;
+    sample.targetKbps = toLower(cfg.outputType) == "udp" ? 0 : cfg.targetBitrate / 1000;
     sample.status = state.get("status", "").asString();
 
     const std::string statusLower = toLower(sample.status);
