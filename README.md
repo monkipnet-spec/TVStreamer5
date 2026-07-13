@@ -243,6 +243,7 @@ srt://192.168.1.10:9000
 rtmp://192.168.1.10/live/camera1
 http://192.168.1.10:8080/stream.ts
 udp://@:1234
+udp://@239.1.1.1:1234
 udp://239.1.1.1:1234
 rtp://239.1.1.1:5004
 test://bars
@@ -289,7 +290,9 @@ http://192.168.1.20:9000/hls/channel-1/playlist.m3u8
 Output host and port meaning depends on the selected format:
 
 ```text
-UDP:  output_host is the unicast/multicast destination, output_port is UDP port.
+UDP:  output_host is the unicast/multicast destination and output_port is UDP
+      port. Flussonic-style full URLs like udp://@239.1.1.1:1234 are also
+      accepted in output_host; in that case the URL port overrides output_port.
 SRT:  output_mode selects listener or caller. In listener mode, output_host is
       the address advertised in the SRT player URL and TVStreamer5 binds SRT to
       interface_address or 0.0.0.0. In caller mode, output_host is the remote

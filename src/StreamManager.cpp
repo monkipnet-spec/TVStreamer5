@@ -22,6 +22,13 @@ constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 
+struct UdpEndpoint {
+    std::string scheme = "udp";
+    std::string host;
+    int port = 0;
+    bool explicitListen = false;
+};
+
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
     if (!factory) {
@@ -88,6 +95,44 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
 bool isMulticastHost(const std::string& host) {
     std::regex re(R"(^((22[4-9])|(23[0-9]))\.)");
     return std::regex_search(host, re);
+}
+
+bool parseUdpEndpoint(const std::string& uri, UdpEndpoint& endpoint) {
+    std::regex re(R"(^(udp|rtp)://(@)?\[?([^\]/:?]*)\]?:([0-9]+)(?:[/?#].*)?$)", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_match(uri, match, re) || match.size() < 5) {
+        return false;
+    }
+
+    endpoint.scheme = toLower(match[1].str());
+    endpoint.explicitListen = match[2].matched;
+    endpoint.host = match[3].str();
+    try {
+        endpoint.port = std::stoi(match[4].str());
+    } catch (...) {
+        return false;
+    }
+
+    return endpoint.port > 0 && endpoint.port <= 65535;
+}
+
+UdpEndpoint udpOutputEndpoint(const StreamConfig& cfg) {
+    UdpEndpoint endpoint;
+    endpoint.host = cfg.outputHost;
+    endpoint.port = cfg.outputPort;
+
+    const std::string outputHostLower = toLower(cfg.outputHost);
+    if (outputHostLower.rfind("udp://", 0) == 0) {
+        UdpEndpoint parsed;
+        if (parseUdpEndpoint(cfg.outputHost, parsed)) {
+            endpoint = parsed;
+        }
+    }
+
+    if (endpoint.host.empty() || endpoint.host == "@") {
+        endpoint.host = "127.0.0.1";
+    }
+    return endpoint;
 }
 
 std::string interfaceNameForAddress(const std::string& address) {
@@ -170,11 +215,12 @@ uint64_t bufferListSize(GstBufferList* list) {
 }
 
 void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
-    const bool multicastOutput = isMulticastHost(cfg.outputHost);
+    const UdpEndpoint endpoint = udpOutputEndpoint(cfg);
+    const bool multicastOutput = isMulticastHost(endpoint.host);
 
     g_object_set(sink,
-        "host", cfg.outputHost.c_str(),
-        "port", cfg.outputPort,
+        "host", endpoint.host.c_str(),
+        "port", endpoint.port,
         "async", FALSE,
         "sync", FALSE,
         "buffer-size", kUdpOutputSocketBufferSize,
@@ -1109,9 +1155,8 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     }
 
     if (inputLower.rfind("udp://", 0) == 0 || inputLower.rfind("rtp://", 0) == 0) {
-        std::regex re(R"(^(udp|rtp)://@?([^:/]*):(\d+).*$)", std::regex::icase);
-        std::smatch match;
-        if (!std::regex_match(input, match, re) || match.size() < 4) {
+        UdpEndpoint endpoint;
+        if (!parseUdpEndpoint(input, endpoint)) {
             return nullptr;
         }
 
@@ -1121,25 +1166,29 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
-        int port = std::stoi(match[3].str());
-        std::string host = match[2].str();
-        if (host.empty() || host == "@") {
-            host = "0.0.0.0";
+        const bool multicastInput = isMulticastHost(endpoint.host);
+        std::string listenAddress = endpoint.host;
+        if (listenAddress.empty() || (endpoint.explicitListen && !multicastInput)) {
+            listenAddress = "0.0.0.0";
         }
 
         g_object_set(src,
-            "address", host.c_str(),
-            "port", port,
+            "address", listenAddress.c_str(),
+            "port", endpoint.port,
             "reuse", TRUE,
             "do-timestamp", TRUE,
             "buffer-size", kUdpInputSocketBufferSize,
             nullptr);
 
-        if (isMulticastHost(host) && !cfg.interfaceAddress.empty()) {
+        if (multicastInput) {
+            g_object_set(src, "auto-multicast", TRUE, nullptr);
+        }
+
+        if (multicastInput && !cfg.interfaceAddress.empty()) {
             g_object_set(src, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress).c_str(), nullptr);
         }
 
-        if (toLower(match[1].str()) == "rtp") {
+        if (endpoint.scheme == "rtp") {
             GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");
             if (!depay || !addElementOrFail(pipeline, depay)) {
                 return nullptr;

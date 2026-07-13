@@ -134,6 +134,10 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
     if (type == "hls") {
         return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/hls/" + cfg.id + "/playlist.m3u8";
     }
+    const std::string outputHostLower = toLower(cfg.outputHost);
+    if (outputHostLower.rfind("udp://", 0) == 0) {
+        return cfg.outputHost;
+    }
     return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
 }
 
@@ -779,7 +783,7 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://127.0.0.1:9087, rtmp://camera/live/stream или https://host/live.m3u8" /></div>
+        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
@@ -850,7 +854,7 @@ function updateOutputHints() {
     hostLabel.textContent = 'Мультикаст / UDP IP';
     portLabel.textContent = 'UDP порт';
     port.disabled = false;
-    host.placeholder = '239.0.0.1';
+    host.placeholder = '239.0.0.1 или udp://@239.0.0.1:1234';
   }
   syncOutputHostWithInterface();
 }
