@@ -80,7 +80,7 @@ GstElement* build(
         "address", host.c_str(),
         "port", port,
         "reuse", TRUE,
-        "do-timestamp", TRUE,
+        "do-timestamp", FALSE,
         "buffer-size", kSocketBufferSize,
         nullptr);
 
@@ -107,7 +107,9 @@ GstElement* build(
             return nullptr;
         }
     } else {
-        GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+        // A UDP datagram commonly contains seven TS packets. Do not force a
+        // buffer packet size or replace the transport stream's PCR/PTS clock.
+        GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true");
         g_object_set(src, "caps", caps, nullptr);
         gst_caps_unref(caps);
         if (!gst_element_link(src, queue)) {

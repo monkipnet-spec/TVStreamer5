@@ -1083,7 +1083,9 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement) {
     terminalElement = nullptr;
     const std::vector<const char*> required = {
-        "videotestsrc", "capsfilter", "videoconvert", "x264enc", "h264parse", "mpegtsmux", "queue"
+        "videotestsrc", "capsfilter", "videoconvert", "x264enc", "h264parse",
+        "audiotestsrc", "audioconvert", "audioresample", "avenc_aac", "aacparse",
+        "mpegtsmux", "queue"
     };
     for (const char* element : required) {
         if (!hasElementFactory(element)) {
@@ -1097,10 +1099,20 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
     GstElement* convert = gst_element_factory_make("videoconvert", "test_bars_convert");
     GstElement* encoder = gst_element_factory_make("x264enc", "test_bars_encoder");
     GstElement* parser = gst_element_factory_make("h264parse", "test_bars_h264parse");
+    GstElement* videoQueue = gst_element_factory_make("queue", "test_bars_video_queue");
+    GstElement* audioSrc = gst_element_factory_make("audiotestsrc", "test_tone_src");
+    GstElement* audioConvert = gst_element_factory_make("audioconvert", "test_tone_convert");
+    GstElement* audioResample = gst_element_factory_make("audioresample", "test_tone_resample");
+    GstElement* audioCapsfilter = gst_element_factory_make("capsfilter", "test_tone_caps");
+    GstElement* audioEncoder = gst_element_factory_make("avenc_aac", "test_tone_encoder");
+    GstElement* audioParser = gst_element_factory_make("aacparse", "test_tone_aacparse");
+    GstElement* audioQueue = gst_element_factory_make("queue", "test_tone_queue");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "test_bars_mux");
     GstElement* queue = gst_element_factory_make("queue", "test_bars_queue");
 
-    if (!src || !capsfilter || !convert || !encoder || !parser || !mux || !queue) {
+    if (!src || !capsfilter || !convert || !encoder || !parser || !videoQueue ||
+        !audioSrc || !audioConvert || !audioResample || !audioCapsfilter || !audioEncoder ||
+        !audioParser || !audioQueue || !mux || !queue) {
         return nullptr;
     }
 
@@ -1109,6 +1121,14 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
         !addElementOrFail(pipeline, convert) ||
         !addElementOrFail(pipeline, encoder) ||
         !addElementOrFail(pipeline, parser) ||
+        !addElementOrFail(pipeline, videoQueue) ||
+        !addElementOrFail(pipeline, audioSrc) ||
+        !addElementOrFail(pipeline, audioConvert) ||
+        !addElementOrFail(pipeline, audioResample) ||
+        !addElementOrFail(pipeline, audioCapsfilter) ||
+        !addElementOrFail(pipeline, audioEncoder) ||
+        !addElementOrFail(pipeline, audioParser) ||
+        !addElementOrFail(pipeline, audioQueue) ||
         !addElementOrFail(pipeline, mux) ||
         !addElementOrFail(pipeline, queue)) {
         return nullptr;
@@ -1118,7 +1138,15 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
     g_object_set(capsfilter, "caps", caps, nullptr);
     gst_caps_unref(caps);
 
-    guint bitrateKbps = static_cast<guint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1000));
+    GstCaps* audioCaps = gst_caps_from_string("audio/x-raw,format=F32LE,rate=48000,channels=2");
+    g_object_set(audioCapsfilter, "caps", audioCaps, nullptr);
+    gst_caps_unref(audioCaps);
+
+    constexpr guint audioBitrate = 128000;
+    const uint64_t availableVideoBitrate = cfg.targetBitrate > 500000
+        ? (cfg.targetBitrate * 85 / 100) - audioBitrate
+        : 1000000;
+    guint bitrateKbps = static_cast<guint>(std::max<uint64_t>(availableVideoBitrate / 1000, 350));
     g_object_set(src,
         "is-live", TRUE,
         "pattern", 0,
@@ -1127,12 +1155,22 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
         "bitrate", bitrateKbps,
         "key-int-max", 50,
         "bframes", 0,
+        "byte-stream", TRUE,
         nullptr);
+    gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
+    gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
     g_object_set(parser, "config-interval", 1, nullptr);
+    g_object_set(audioSrc, "is-live", TRUE, "wave", 0, "freq", 1000.0, nullptr);
+    g_object_set(audioEncoder, "bitrate", static_cast<gint64>(audioBitrate), nullptr);
     configureTsMux(mux, cfg);
+    configureQueue(videoQueue);
+    configureQueue(audioQueue);
     configureQueue(queue);
 
-    if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, mux, queue, nullptr)) {
+    if (!gst_element_link_many(src, capsfilter, convert, encoder, parser, videoQueue, mux, nullptr) ||
+        !gst_element_link_many(audioSrc, audioConvert, audioResample, audioCapsfilter,
+            audioEncoder, audioParser, audioQueue, mux, nullptr) ||
+        !gst_element_link(mux, queue)) {
         return nullptr;
     }
 
