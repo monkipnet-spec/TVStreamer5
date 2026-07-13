@@ -1,9 +1,9 @@
 # TVStreamer5
 
-TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS/UDP/RTP MPEG-TS
+TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS MPEG-TS
 streams, optionally remaps service/PID metadata, monitors input quality,
 switches to a backup source when the primary source disappears, and outputs
-streams as UDP, SRT listener, HTTP TS, HLS, RTMP, or YouTube Live.
+streams as SRT, HTTP TS, HLS, RTMP, or YouTube Live.
 
 ## Build on the Host
 
@@ -90,8 +90,8 @@ chmod +x scripts/build_container.sh scripts/run_container.sh
 ./scripts/run_container.sh
 ```
 
-The run script uses `--network host` so RTSP inputs, SRT, UDP, RTP, multicast,
-HTTP TS, HLS, and the web UI can use the host network directly. The application reads
+The run script uses `--network host` so RTSP inputs, SRT, HTTP TS, HLS, and the
+web UI can use the host network directly. The application reads
 `tvstreamer5-config.json` from `/data` inside the container. If `CONFIG_FILE`
 points to a file with a different name, the run script mounts it as
 `/data/tvstreamer5-config.json` automatically.
@@ -161,82 +161,9 @@ docker exec -it tvstreamer5 bash
 docker system df
 ```
 
-For UDP, SRT listener mode, HTTP TS, HLS, and multicast, `--network host` is the
-recommended mode. It gives the container access to the host network namespace,
-so TVStreamer5 can see all host interfaces and bind input/output to the
-interface selected in the web UI. Avoid Docker bridge port mappings for
-MPEG-TS UDP/multicast; they usually add loss, jitter, or do not forward
-multicast correctly.
-
-Recommended host network tuning for high-bitrate UDP:
-
-```bash
-sudo sysctl -w net.core.rmem_max=67108864
-sudo sysctl -w net.core.wmem_max=67108864
-sudo sysctl -w net.core.rmem_default=8388608
-sudo sysctl -w net.core.wmem_default=8388608
-sudo sysctl -w net.ipv4.udp_rmem_min=131072
-sudo sysctl -w net.ipv4.udp_wmem_min=131072
-sudo sysctl -w net.core.netdev_max_backlog=50000
-```
-
-TVStreamer5 requests a 64 MiB UDP send socket buffer for MPEG-TS output, so
-`net.core.wmem_max` must be at least `67108864` for the full outgoing buffer to
-be applied.
-
-If VLC reports skipped frames or the picture breaks up, enable CBR and keep
-`target_bitrate` above the real input bitrate. A good starting point is
-20-30% above the measured input bitrate; disable CBR for pure passthrough.
-
-UDP output is a transparent pass-through for a clean input stream. It does not
-pace, demux, remux, rewrite PID or service information, or add CBR null packets.
-The CBR and remap settings are therefore ignored for UDP output. Before
-`udpsink`, unchanged TS packets are grouped into seven-packet (1316-byte) UDP
-datagrams to avoid IP fragmentation on a standard 1500-byte MTU. SRT input/output
-latency is 2000 ms, and input failover waits 15 seconds before declaring the
-source lost. If GStreamer reports EOS or a stream error, TVStreamer5 attempts to
-rebuild the current pipeline before marking the stream failed or switching to
-the configured backup source.
-
-Persist the tuning after reboot:
-
-```bash
-sudo tee /etc/sysctl.d/99-tvstreamer5-udp.conf >/dev/null <<'EOF'
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.rmem_default=8388608
-net.core.wmem_default=8388608
-net.ipv4.udp_rmem_min=131072
-net.ipv4.udp_wmem_min=131072
-net.core.netdev_max_backlog=50000
-EOF
-sudo sysctl --system
-```
-
-For multicast receive/transmit on a selected interface, replace `eth0` with the
-real interface name shown by `ip -br addr`:
-
-```bash
-ip -br addr
-sudo ip link set dev eth0 multicast on
-sudo ip route replace 224.0.0.0/4 dev eth0
-sudo sysctl -w net.ipv4.conf.eth0.rp_filter=0
-sudo sysctl -w net.ipv4.conf.all.rp_filter=0
-```
-
-If several interfaces are used for different streams, repeat the `ip link` and
-`rp_filter` commands for each interface. Add only one broad multicast route if
-all multicast should leave through one default interface; otherwise let
-TVStreamer5 select the output interface in the stream settings.
-
-Useful checks while testing:
-
-```bash
-ip -br addr
-ip route get 239.1.1.1
-ss -u -n -a
-sudo tcpdump -ni eth0 udp port 1234
-```
+For SRT listener mode, HTTP TS, and HLS, `--network host` is recommended. It
+gives the container access to the host network namespace so TVStreamer5 can bind
+to the interface selected in the web UI.
 
 Optional variables:
 
@@ -256,10 +183,6 @@ rtsps://192.168.1.10/live
 srt://192.168.1.10:9000
 rtmp://192.168.1.10/live/camera1
 http://192.168.1.10:8080/stream.ts
-udp://@:1234
-udp://@239.1.1.1:1234
-udp://239.1.1.1:1234
-rtp://239.1.1.1:5004
 test://bars
 ```
 
@@ -279,10 +202,9 @@ auto
 ## Output Formats
 
 Each stream has an `output_type` field. Existing configs without this field are
-treated as `udp`.
+treated as `srt`.
 
 ```text
-udp   MPEG-TS over UDP unicast or multicast
 srt   MPEG-TS over SRT listener or caller
 http  MPEG-TS over HTTP at /stream/<stream-id>.ts
 hls   HLS playlist at /hls/<stream-id>/playlist.m3u8
@@ -293,7 +215,6 @@ youtube  FLV over RTMP push to YouTube Live
 Examples of player URLs shown by the UI:
 
 ```text
-udp://@239.1.1.1:1234
 srt://192.168.1.20:9000
 rtmp://live.example.com:1935/live/channel-1
 rtmp://a.rtmp.youtube.com/live2/<stream-key>
@@ -304,9 +225,6 @@ http://192.168.1.20:9000/hls/channel-1/playlist.m3u8
 Output host and port meaning depends on the selected format:
 
 ```text
-UDP:  output_host is the unicast/multicast destination and output_port is UDP
-      port. Flussonic-style full URLs like udp://@239.1.1.1:1234 are also
-      accepted in output_host; in that case the URL port overrides output_port.
 SRT:  output_mode selects listener or caller. In listener mode, output_host is
       the address advertised in the SRT player URL and TVStreamer5 binds SRT to
       interface_address or 0.0.0.0. In caller mode, output_host is the remote
@@ -317,11 +235,10 @@ RTMP: output_host is a full RTMP/RTMPS URL or host; output_port is used for host
 YouTube: output_host is the stream key or a full RTMP/RTMPS ingest URL.
 ```
 
-The web UI lets you choose the output interface. For UDP multicast it is used as
-the multicast interface. For UDP unicast it is used as the bind address. For SRT
-it is used as the local listener address when supported by the GStreamer SRT
-plugin. RTSP and RTMP camera input and RTMP/YouTube output remux common
-H.264/H.265/AAC streams without transcoding where supported.
+The web UI lets you choose the output interface. For SRT it is used as the local
+listener address when supported by the GStreamer SRT plugin. RTSP and RTMP
+camera input and RTMP/YouTube output remux common H.264/H.265/AAC streams without
+transcoding where supported.
 
 Enable `auto_start` in a stream's settings to start that stream automatically
 after TVStreamer5 restarts. Streams with `auto_start` disabled stay stopped.
@@ -336,7 +253,7 @@ switches back automatically when data appears again.
 The stream tile shows the currently active input:
 
 ```text
-Активный вход: Основной · udp://...
+Активный вход: Основной · rtsp://...
 Активный вход: Резерв · srt://...
 ```
 
@@ -376,9 +293,9 @@ Minimal stream object:
   "input_uri": "rtsp://user:password@192.168.1.10:554/stream1",
   "backup_input_uri": "srt://192.168.1.10:9000",
   "input_mode": "auto",
-  "output_type": "udp",
+  "output_type": "srt",
   "output_mode": "listener",
-  "output_host": "239.1.1.1",
+  "output_host": "0.0.0.0",
   "output_port": 1234,
   "interface_address": "",
   "cbr": true,

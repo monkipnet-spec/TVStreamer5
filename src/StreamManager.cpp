@@ -4,7 +4,6 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
-#include <regex>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -16,22 +15,13 @@
 
 namespace {
 
-constexpr gint kUdpInputSocketBufferSize = 64 * 1024 * 1024;
-constexpr gint kUdpOutputSocketBufferSize = 128 * 1024 * 1024;
-constexpr guint kTsPacketsPerUdpBuffer = 7;
-constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
+constexpr guint kTsPacketsPerBuffer = 7;
+constexpr guint kTsBlockSize = kTsPacketsPerBuffer * 188;
 constexpr guint kTsSmoothingLatencyUs = 300'000;
 constexpr guint64 kDefaultCbrBitrate = 8'000'000;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 constexpr gint kSrtLatencyMs = 2000;
-
-struct UdpEndpoint {
-    std::string scheme = "udp";
-    std::string host;
-    int port = 0;
-    bool explicitListen = false;
-};
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -96,72 +86,10 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
     }
 }
 
-bool isMulticastHost(const std::string& host) {
-    std::regex re(R"(^((22[4-9])|(23[0-9]))\.)");
-    return std::regex_search(host, re);
-}
-
-bool parseUdpEndpoint(const std::string& uri, UdpEndpoint& endpoint) {
-    std::regex re(R"(^(udp|rtp)://(@)?\[?([^\]/:?]*)\]?:([0-9]+)(?:[/?#].*)?$)", std::regex::icase);
-    std::smatch match;
-    if (!std::regex_match(uri, match, re) || match.size() < 5) {
-        return false;
-    }
-
-    endpoint.scheme = toLower(match[1].str());
-    endpoint.explicitListen = match[2].matched;
-    endpoint.host = match[3].str();
-    try {
-        endpoint.port = std::stoi(match[4].str());
-    } catch (...) {
-        return false;
-    }
-
-    return endpoint.port > 0 && endpoint.port <= 65535;
-}
-
-UdpEndpoint udpOutputEndpoint(const StreamConfig& cfg) {
-    UdpEndpoint endpoint;
-    endpoint.host = cfg.outputHost;
-    endpoint.port = cfg.outputPort;
-
-    const std::string outputHostLower = toLower(cfg.outputHost);
-    if (outputHostLower.rfind("udp://", 0) == 0) {
-        UdpEndpoint parsed;
-        if (parseUdpEndpoint(cfg.outputHost, parsed)) {
-            endpoint = parsed;
-        }
-    }
-
-    if (endpoint.host.empty() || endpoint.host == "@") {
-        endpoint.host = "127.0.0.1";
-    }
-    return endpoint;
-}
-
-std::string interfaceNameForAddress(const std::string& address) {
-    if (address.empty()) {
-        return "";
-    }
-
-    for (const auto& iface : enumerateNetworkInterfaces()) {
-        if (iface.address == address) {
-            return iface.name;
-        }
-    }
-
-    return "";
-}
-
-std::string interfaceNameOrAddress(const std::string& address) {
-    const std::string ifaceName = interfaceNameForAddress(address);
-    return ifaceName.empty() ? address : ifaceName;
-}
-
 std::string outputType(const StreamConfig& cfg) {
     std::string type = toLower(cfg.outputType);
     if (type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
-        type = "udp";
+        type = "srt";
     }
     return type;
 }
@@ -218,30 +146,6 @@ uint64_t bufferListSize(GstBufferList* list) {
     return total;
 }
 
-void configureUdpSink(GstElement* sink, const StreamConfig& cfg) {
-    const UdpEndpoint endpoint = udpOutputEndpoint(cfg);
-    const bool multicastOutput = isMulticastHost(endpoint.host);
-
-    g_object_set(sink,
-        "host", endpoint.host.c_str(),
-        "port", endpoint.port,
-        "async", FALSE,
-        "sync", FALSE,
-        "buffer-size", kUdpOutputSocketBufferSize,
-        nullptr);
-    setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setInt64PropertyIfPresent(sink, "max-lateness", -1);
-
-    if (!cfg.interfaceAddress.empty() && !multicastOutput) {
-        setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
-    }
-
-    if (multicastOutput) {
-        g_object_set(sink, "auto-multicast", TRUE, nullptr);
-        setStringPropertyIfPresent(sink, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress));
-    }
-}
-
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
@@ -256,7 +160,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         "uri", uri.c_str(),
         "sync", FALSE,
         "async", FALSE,
-        "blocksize", kTsUdpBlockSize,
+        "blocksize", kTsBlockSize,
         nullptr);
 
     setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
@@ -343,7 +247,7 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 }
 
 void configureTsPacketAlignment(GstElement* element) {
-    setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
+    setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerBuffer));
     setBooleanPropertyIfPresent(element, "set-timestamps", TRUE);
     setUIntPropertyIfPresent(element, "smoothing-latency", kTsSmoothingLatencyUs);
 }
@@ -372,7 +276,7 @@ void linkDemuxPadToQueue(GstElement* demux, GstPad* pad, gpointer userData) {
 
 void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
     g_object_set(mux,
-        "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer),
+        "alignment", static_cast<gint>(kTsPacketsPerBuffer),
         "pcr-interval", 1800U,
         "pat-interval", 9000U,
         "pmt-interval", 9000U,
@@ -608,7 +512,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->activeInputUri = streamConfig.inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
-    if (streamConfig.remapEnabled && outputType(streamConfig) != "udp") {
+    if (streamConfig.remapEnabled) {
         state->remapContext = std::make_unique<RemapContext>();
         state->remapContext->config = streamConfig;
     }
@@ -627,9 +531,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = outputType(streamConfig) != "udp" && streamConfig.cbr
-        ? streamConfig.targetBitrate
-        : 0;
+    state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -869,9 +771,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->inputBytes = 0;
     state->outputBytes = 0;
     state->inputBitrate = 0;
-    state->outputBitrate = outputType(state->config) != "udp" && state->config.cbr
-        ? state->config.targetBitrate
-        : 0;
+    state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastInputBytesSeen = 0;
@@ -912,14 +812,6 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     const std::string type = outputType(cfg);
-    if (type == "udp") {
-        if (!buildUdpOutputPipeline(state, pipeline, sourceTail)) {
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-        return pipeline;
-    }
-
     if (type == "rtmp" || type == "youtube") {
         if (!buildRtmpOutputPipeline(state, pipeline, sourceTail)) {
             gst_object_unref(pipeline);
@@ -1154,64 +1046,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (inputLower.rfind("udp://", 0) == 0 || inputLower.rfind("rtp://", 0) == 0) {
-        UdpEndpoint endpoint;
-        if (!parseUdpEndpoint(input, endpoint)) {
-            return nullptr;
-        }
-
-        GstElement* src = gst_element_factory_make("udpsrc", "input_src");
-        if (!src || !addElementOrFail(pipeline, src)) {
-            return nullptr;
-        }
-
-        const bool multicastInput = isMulticastHost(endpoint.host);
-        std::string listenAddress = endpoint.host;
-        if (listenAddress.empty() || (endpoint.explicitListen && !multicastInput)) {
-            listenAddress = "0.0.0.0";
-        }
-
-        g_object_set(src,
-            "address", listenAddress.c_str(),
-            "port", endpoint.port,
-            "reuse", TRUE,
-            "do-timestamp", FALSE,
-            "buffer-size", kUdpInputSocketBufferSize,
-            nullptr);
-
-        if (multicastInput) {
-            g_object_set(src, "auto-multicast", TRUE, nullptr);
-        }
-
-        if (multicastInput && !cfg.interfaceAddress.empty()) {
-            g_object_set(src, "multicast-iface", interfaceNameOrAddress(cfg.interfaceAddress).c_str(), nullptr);
-        }
-
-        if (endpoint.scheme == "rtp") {
-            GstElement* queue = addQueue("input_queue");
-            GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");
-            if (!queue || !depay || !addElementOrFail(pipeline, depay)) {
-                return nullptr;
-            }
-
-            GstCaps* caps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=MP2T,clock-rate=90000");
-            g_object_set(src, "caps", caps, nullptr);
-            gst_caps_unref(caps);
-
-            if (!gst_element_link_many(src, depay, queue, nullptr)) {
-                return nullptr;
-            }
-            terminalElement = queue;
-        } else {
-            GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
-            g_object_set(src, "caps", caps, nullptr);
-            gst_caps_unref(caps);
-            terminalElement = src;
-        }
-
-        return src;
-    }
-        GstElement* src = gst_element_factory_make("filesrc", "input_src");
+    GstElement* src = gst_element_factory_make("filesrc", "input_src");
     GstElement* queue = addQueue("input_queue");
     if (!src || !queue || !addElementOrFail(pipeline, src)) {
         return nullptr;
@@ -1284,28 +1119,6 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
 
     terminalElement = queue;
     return src;
-}
-
-bool StreamManager::buildUdpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
-    if (!state || !pipeline || !sourceTail) {
-        return false;
-    }
-
-    if (!hasElementFactory("tsparse") || !hasElementFactory("udpsink")) {
-        std::cerr << "missing UDP output element: tsparse or udpsink" << std::endl;
-        return false;
-    }
-
-    GstElement* packetizer = gst_element_factory_make("tsparse", "udp_packetizer");
-    GstElement* sink = createOutputSink(state->config, pipeline);
-    if (!packetizer || !sink || !addElementOrFail(pipeline, packetizer)) {
-        return false;
-    }
-
-    setUIntPropertyIfPresent(packetizer, "alignment", kTsPacketsPerUdpBuffer);
-    setBooleanPropertyIfPresent(packetizer, "set-timestamps", FALSE);
-    setUIntPropertyIfPresent(packetizer, "smoothing-latency", 0);
-    return gst_element_link_many(sourceTail, packetizer, sink, nullptr);
 }
 
 bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
@@ -1434,10 +1247,8 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
 
 GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline) {
     const std::string type = outputType(cfg);
-    const char* factory = "udpsink";
-    if (type == "srt") {
-        factory = "srtsink";
-    } else if (type == "http") {
+    const char* factory = "srtsink";
+    if (type == "http") {
         factory = "multifdsink";
     } else if (type == "hls") {
         factory = "hlssink";
@@ -1463,8 +1274,6 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         configureHlsSink(sink, cfg);
     } else if (type == "rtmp" || type == "youtube") {
         configureRtmpSink(sink, cfg);
-    } else {
-        configureUdpSink(sink, cfg);
     }
 
     return sink;
@@ -1813,7 +1622,6 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
              g_strcmp0(factoryName, "rtspsrc") == 0 ||
              g_strcmp0(factoryName, "rtmpsrc") == 0 ||
              g_strcmp0(factoryName, "souphttpsrc") == 0 ||
-             g_strcmp0(factoryName, "udpsrc") == 0 ||
              g_strcmp0(factoryName, "filesrc") == 0)) {
             GstPad* srcPad = gst_element_get_static_pad(element, "src");
             if (srcPad) {
@@ -1829,8 +1637,7 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         }
 
         if (!outputAttached && factoryName &&
-            (g_strcmp0(factoryName, "udpsink") == 0 ||
-             g_strcmp0(factoryName, "srtsink") == 0 ||
+            (g_strcmp0(factoryName, "srtsink") == 0 ||
              g_strcmp0(factoryName, "rtmpsink") == 0 ||
              g_strcmp0(factoryName, "multifdsink") == 0 ||
              g_strcmp0(factoryName, "hlssink") == 0)) {
