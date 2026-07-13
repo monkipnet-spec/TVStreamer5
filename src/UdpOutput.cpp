@@ -4,12 +4,10 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <regex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -44,8 +42,6 @@ std::string interfaceAddressFor(const std::string& address) {
 class UdpTsSender {
 public:
     UdpTsSender(const StreamConfig& cfg, std::string& error)
-        : pacedBitrate(cfg.targetBitrate),
-          nextSend(std::chrono::steady_clock::now())
     {
         socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (socketFd < 0) {
@@ -164,29 +160,12 @@ private:
     }
 
     void sendDatagram(const guint8* data, std::size_t size) {
-        pace(size);
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
         const socklen_t destinationSize = sizeof(destinationAddress);
         ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
         if (sent < 0) {
             std::cerr << "UDP output send failed: " << std::strerror(errno) << std::endl;
         }
-    }
-
-    void pace(std::size_t bytes) {
-        if (pacedBitrate == 0) {
-            return;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (nextSend > now) {
-            std::this_thread::sleep_until(nextSend);
-        } else if (now - nextSend > std::chrono::seconds(1)) {
-            nextSend = now;
-        }
-
-        const uint64_t nanos = static_cast<uint64_t>(bytes) * 8ULL * 1000000000ULL / pacedBitrate;
-        nextSend += std::chrono::nanoseconds(nanos);
     }
 
     void closeSocket() {
@@ -199,10 +178,8 @@ private:
 
     int socketFd = -1;
     bool ready = false;
-    uint64_t pacedBitrate = 0;
     sockaddr_in destinationAddress {};
     std::vector<guint8> pending;
-    std::chrono::steady_clock::time_point nextSend;
 };
 
 GstFlowReturn onNewSample(GstAppSink* sink, gpointer userData) {
@@ -250,7 +227,7 @@ GstElement* createSink(
     g_object_set(sink,
         "caps", caps,
         "emit-signals", FALSE,
-        "sync", FALSE,
+        "sync", TRUE,
         "async", FALSE,
         "qos", FALSE,
         "max-lateness", static_cast<gint64>(-1),
