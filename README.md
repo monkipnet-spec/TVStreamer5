@@ -189,6 +189,12 @@ If VLC reports skipped frames or the picture breaks up, enable CBR and keep
 8 Mbit/s for CBR MPEG-TS output to avoid starving bursty UDP players; disable
 CBR for pure passthrough.
 
+TVStreamer5 is tuned to ride through short packet-loss bursts: UDP output queues
+buffer up to 10 seconds, SRT input/output latency is 2000 ms, and input failover
+waits 15 seconds before declaring the source lost. If GStreamer reports EOS or a
+transient stream error, TVStreamer5 attempts to rebuild the current pipeline
+before marking the stream failed or switching to the configured backup source.
+
 Persist the tuning after reboot:
 
 ```bash

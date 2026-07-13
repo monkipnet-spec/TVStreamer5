@@ -21,10 +21,11 @@ constexpr gint kUdpOutputSocketBufferSize = 128 * 1024 * 1024;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kTsUdpBlockSize = kTsPacketsPerUdpBuffer * 188;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
-constexpr guint64 kUdpQueueLatency = 5 * GST_SECOND;
+constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kDefaultCbrBitrate = 8'000'000;
-constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
+constexpr auto kInputFailoverDelay = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
+constexpr gint kSrtLatencyMs = 2000;
 
 struct UdpEndpoint {
     std::string scheme = "udp";
@@ -268,7 +269,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "latency", 250);
+    setIntPropertyIfPresent(sink, "latency", kSrtLatencyMs);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
     if (caller) {
@@ -1058,7 +1059,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make(factory, "input_src");
-        GstElement* queue = addQueue("input_queue");
+        GstElement* queue = addQueue("input_queue", 10000000000ULL);
         if (!src || !queue || !addElementOrFail(pipeline, src)) {
             return nullptr;
         }
@@ -1066,7 +1067,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         g_object_set(src, "uri", input.c_str(), nullptr);
         setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
         setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
-        setIntPropertyIfPresent(src, "latency", 500);
+        setIntPropertyIfPresent(src, "latency", kSrtLatencyMs);
         setStringPropertyIfPresent(src, "localaddress", cfg.interfaceAddress);
         if (mode == "listener") {
             setIntPropertyIfPresent(src, "mode", 2);
@@ -1979,18 +1980,65 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
                 g_free(dbg);
 
+                gst_message_unref(msg);
+                state->statusMessage = "recovering after error";
+                notifyStreamState(
+                    state->config,
+                    "🟡",
+                    "Сбой потока",
+                    "Причина: " + message + "\nПробую восстановить текущий источник\nURL: " + state->activeInputUri);
+                if (restartPipelineWithInput(state, state->activeInputUri, state->usingBackup)) {
+                    bus = state->bus;
+                    notifyStreamState(
+                        state->config,
+                        "🟢",
+                        "Поток восстановлен",
+                        "Активный источник: " + std::string(state->usingBackup ? "резерв" : "основной") +
+                            "\nURL: " + state->activeInputUri);
+                    continue;
+                }
+                if (!state->usingBackup && !state->config.backupInputUri.empty() &&
+                    restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                    bus = state->bus;
+                    notifyStreamState(
+                        state->config,
+                        "🟠",
+                        "Переключился на резерв",
+                        "Основной источник дал ошибку\nBackup: " + state->activeInputUri);
+                    continue;
+                }
                 state->statusMessage = "error: " + message;
                 state->active = false;
-                notifyStreamState(state->config, "🔴", "Ошибка потока", "Причина: " + message);
-                gst_message_unref(msg);
+                notifyStreamState(state->config, "🔴", "Ошибка потока", "Автовосстановление не удалось\nПричина: " + message);
                 return;
             }
-            case GST_MESSAGE_EOS:
+            case GST_MESSAGE_EOS: {
+                gst_message_unref(msg);
+                state->statusMessage = "recovering after eos";
+                notifyStreamState(
+                    state->config,
+                    "🟡",
+                    "Источник закрыл соединение",
+                    "GStreamer получил EOS\nПробую подключиться снова\nURL: " + state->activeInputUri);
+                if (restartPipelineWithInput(state, state->activeInputUri, state->usingBackup)) {
+                    bus = state->bus;
+                    continue;
+                }
+                if (!state->usingBackup && !state->config.backupInputUri.empty() &&
+                    restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                    bus = state->bus;
+                    notifyStreamState(
+                        state->config,
+                        "🟠",
+                        "Переключился на резерв",
+                        "Основной источник завершился\nBackup: " + state->activeInputUri);
+                    continue;
+                }
                 state->statusMessage = "ended";
                 state->active = false;
-                notifyStreamState(state->config, "⚫", "Поток завершился", "GStreamer получил EOS");
-                gst_message_unref(msg);
+                notifyStreamState(state->config, "⚫", "Поток завершился", "Автовосстановление не удалось");
                 return;
+            }
             default:
                 gst_message_unref(msg);
                 break;
