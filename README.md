@@ -184,6 +184,9 @@ TVStreamer5 requests a 64 MiB UDP send socket buffer for MPEG-TS output, so
 `net.core.wmem_max` must be at least `67108864` for the full outgoing buffer to
 be applied.
 
+If VLC reports skipped frames or the picture breaks up with remap/CBR enabled,
+make sure `target_bitrate` is not lower than the real input bitrate.
+
 Persist the tuning after reboot:
 
 ```bash
