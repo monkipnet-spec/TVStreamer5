@@ -28,10 +28,12 @@ constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
-constexpr uint64_t kPcrWrap = 1ULL << 42;
+constexpr uint64_t kPcrWrap = (1ULL << 33) * 300ULL;
 constexpr uint64_t kMinPacedBitrate = 512000ULL;
 constexpr uint64_t kMaxPacedBitrate = 200000000ULL;
-constexpr uint64_t kPaceHeadroomPercent = 125ULL;
+constexpr uint64_t kCbrSafetyHeadroomPercent = 105ULL;
+constexpr uint64_t kVbrPaceHeadroomPercent = 110ULL;
+constexpr uint64_t kPaceRiseLimitPercent = 125ULL;
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
@@ -57,11 +59,26 @@ void setUInt64PropertyIfPresent(GstElement* element, const char* propertyName, g
     }
 }
 
+uint64_t clampPacedBitrate(uint64_t bitrate) {
+    return std::clamp(bitrate, kMinPacedBitrate, kMaxPacedBitrate);
+}
+
+uint64_t pacedBitrateWithHeadroom(uint64_t bitrate, uint64_t headroomPercent) {
+    const uint64_t capped = std::min(bitrate, kMaxPacedBitrate);
+    return clampPacedBitrate(capped * headroomPercent / 100ULL);
+}
+
 class UdpTsSender {
 public:
     UdpTsSender(const StreamConfig& cfg, std::string& error)
         : nextSend(std::chrono::steady_clock::now())
     {
+        cbrPacing = cfg.cbr && cfg.targetBitrate > 0;
+        if (cfg.targetBitrate > 0) {
+            configuredBitrate = clampPacedBitrate(cfg.targetBitrate);
+            pacedBitrate = configuredBitrate;
+        }
+
         socketFd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (socketFd < 0) {
             error = std::string("failed to create UDP socket: ") + std::strerror(errno);
@@ -242,17 +259,30 @@ private:
             return;
         }
 
-        estimatedBitrate = estimatedBitrate * kPaceHeadroomPercent / 100ULL;
+        estimatedBitrate = pacedBitrateWithHeadroom(
+            estimatedBitrate,
+            cbrPacing ? kCbrSafetyHeadroomPercent : kVbrPaceHeadroomPercent);
+
+        if (cbrPacing && configuredBitrate > 0) {
+            const uint64_t cbrSafetyCeiling = pacedBitrateWithHeadroom(
+                configuredBitrate,
+                kCbrSafetyHeadroomPercent);
+            if (estimatedBitrate <= cbrSafetyCeiling) {
+                pacedBitrate = configuredBitrate;
+                return;
+            }
+        }
+
         if (pacedBitrate == 0) {
             pacedBitrate = estimatedBitrate;
             return;
         }
 
         if (estimatedBitrate > pacedBitrate) {
-            pacedBitrate = estimatedBitrate;
-        } else {
-            pacedBitrate = (pacedBitrate * 9ULL + estimatedBitrate) / 10ULL;
+            const uint64_t riseLimit = pacedBitrate * kPaceRiseLimitPercent / 100ULL;
+            estimatedBitrate = std::min(estimatedBitrate, std::max(riseLimit, pacedBitrate + 1));
         }
+        pacedBitrate = (pacedBitrate * 7ULL + estimatedBitrate * 3ULL) / 10ULL;
     }
 
     void sendDatagram(const guint8* data, std::size_t size) {
@@ -300,6 +330,8 @@ private:
 
     int socketFd = -1;
     bool ready = false;
+    bool cbrPacing = false;
+    uint64_t configuredBitrate = 0;
     uint64_t pacedBitrate = 0;
     bool haveLastPcr = false;
     uint64_t lastPcr = 0;
