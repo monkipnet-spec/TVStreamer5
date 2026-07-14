@@ -17,6 +17,7 @@ struct StreamConfig {
     int outputPort = 1234;
     std::string interfaceAddress;
     std::string inputMode = "auto";
+    bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;
     bool cbr = true;

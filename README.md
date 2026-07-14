@@ -253,6 +253,9 @@ rtp://239.1.1.1:5004
 test://bars
 ```
 
+Enable `test_pattern` on a stream to send the built-in color bars instead of the
+configured primary/backup input URLs without overwriting those URLs.
+
 RTSP camera input is remuxed to MPEG-TS before the common output pipeline. The
 current RTSP path supports common camera payloads: H.264/H.265 video and
 AAC/MPA audio. Use the full camera URL, including username and password when the
@@ -364,6 +367,7 @@ Minimal stream object:
   "input_uri": "rtsp://user:password@192.168.1.10:554/stream1",
   "backup_input_uri": "srt://192.168.1.10:9000",
   "input_mode": "auto",
+  "test_pattern": false,
   "output_type": "udp-cbr",
   "output_mode": "listener",
   "output_host": "239.1.1.1",

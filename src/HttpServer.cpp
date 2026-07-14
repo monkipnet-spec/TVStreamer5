@@ -350,8 +350,12 @@ std::string HttpServer::currentState() {
             item["active"] = streamState->active.load();
             item["status"] = streamState->statusMessage;
             item["using_backup"] = streamState->usingBackup;
-            item["active_input_uri"] = streamState->activeInputUri.empty() ? cfg.inputUri : streamState->activeInputUri;
-            item["active_input_label"] = streamState->usingBackup ? "Резерв" : "Основной";
+            item["active_input_uri"] = cfg.testPattern
+                ? "test://bars"
+                : (streamState->activeInputUri.empty() ? cfg.inputUri : streamState->activeInputUri);
+            item["active_input_label"] = cfg.testPattern
+                ? "Тест"
+                : (streamState->usingBackup ? "Резерв" : "Основной");
             item["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
             item["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
             item["cc_errors"] = Json::UInt64(streamState->ccErrorsDelta.load());
@@ -360,8 +364,8 @@ std::string HttpServer::currentState() {
             item["active"] = false;
             item["status"] = "stopped";
             item["using_backup"] = false;
-            item["active_input_uri"] = cfg.inputUri;
-            item["active_input_label"] = "Основной";
+            item["active_input_uri"] = cfg.testPattern ? "test://bars" : cfg.inputUri;
+            item["active_input_label"] = cfg.testPattern ? "Тест" : "Основной";
             item["bitrate_in_kbps"] = Json::UInt64(0);
             item["bitrate_out_kbps"] = Json::UInt64(0);
             item["cc_errors"] = Json::UInt64(0);
@@ -872,7 +876,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_mode:'auto', auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
+    interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:''
   });
 }
@@ -887,6 +891,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://127.0.0.1:9087, rtmp://camera/live/stream или https://host/live.m3u8" /></div>
         <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
+        <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
         <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp-vbr" ${outputType==='udp-vbr'?'selected':''}>UDP MPEG-TS VBR</option><option value="udp-cbr" ${outputType==='udp-cbr'?'selected':''}>UDP MPEG-TS CBR</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
@@ -1020,6 +1025,7 @@ function saveStream(id) {
     backup_input_uri: document.getElementById('streamBackupInput').value,
     interface_address: document.getElementById('streamInterface').value,
     input_mode: document.getElementById('streamInputMode').value,
+    test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
     cbr: selectedCbr,

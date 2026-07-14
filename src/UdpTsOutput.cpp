@@ -181,7 +181,9 @@ private:
                 continue;
             }
 
-            updatePacingFromDatagram(pending.data(), kUdpPayloadSize);
+            if (pacingConfig.enabled) {
+                updatePacingFromDatagram(pending.data(), kUdpPayloadSize);
+            }
             sendDatagram(pending.data(), kUdpPayloadSize);
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(kUdpPayloadSize));
         }
@@ -303,7 +305,7 @@ private:
     }
 
     void pace(std::size_t bytes) {
-        if (pacedBitrate == 0) {
+        if (!pacingConfig.enabled || pacedBitrate == 0) {
             return;
         }
 

@@ -24,6 +24,7 @@ constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
+constexpr const char* kTestPatternUri = "test://bars";
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -660,7 +661,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     auto state = std::make_unique<StreamState>();
     state->config = streamConfig;
     state->primaryInputUri = streamConfig.inputUri;
-    state->activeInputUri = streamConfig.inputUri;
+    state->activeInputUri = streamConfig.testPattern ? kTestPatternUri : streamConfig.inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
     if (streamConfig.remapEnabled) {
@@ -818,6 +819,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     desc << "manual-pipeline"
          << " input=" << cfg.inputUri
          << " input_mode=" << cfg.inputMode
+         << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
          << " output_type=" << outputType(cfg)
          << " output_mode=" << srtOutputMode(cfg)
@@ -1004,7 +1006,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return nullptr;
     }
     const StreamConfig& cfg = state->config;
-    const std::string input = cfg.inputUri;
+    const std::string input = cfg.testPattern ? kTestPatternUri : cfg.inputUri;
     const std::string inputLower = toLower(input);
 
     auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL) -> GstElement* {
@@ -1974,61 +1976,63 @@ void StreamManager::monitorBus(const std::string& id) {
             }
         }
 
-        const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
-        if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
+        if (!state->config.testPattern) {
+            const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
+            if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
                 notifyStreamState(
                     state->config,
                     "🟡",
                     "Основной поток пропал",
                     "Нет входных данных 5 секунд\nПереключаюсь на резерв\nBackup: " + state->config.backupInputUri);
-            if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
-                bus = state->bus;
-                state->inputLossNotified = false;
-                notifyStreamState(
-                    state->config,
-                    "🟠",
-                    "Работаю с резервного источника",
-                    "Активный источник: резерв\nURL: " + state->activeInputUri);
-            } else {
-                state->inputLossNotified = true;
-                notifyStreamState(
-                    state->config,
-                    "🔴",
-                    "Не удалось включить резерв",
-                    "Backup pipeline не стартовал\nBackup: " + state->config.backupInputUri);
-            }
-        } else if (state->usingBackup && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
-            const std::string primaryUri = state->primaryInputUri;
+                if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                    bus = state->bus;
+                    state->inputLossNotified = false;
+                    notifyStreamState(
+                        state->config,
+                        "🟠",
+                        "Работаю с резервного источника",
+                        "Активный источник: резерв\nURL: " + state->activeInputUri);
+                } else {
+                    state->inputLossNotified = true;
+                    notifyStreamState(
+                        state->config,
+                        "🔴",
+                        "Не удалось включить резерв",
+                        "Backup pipeline не стартовал\nBackup: " + state->config.backupInputUri);
+                }
+            } else if (state->usingBackup && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+                const std::string primaryUri = state->primaryInputUri;
 
-            if (!primaryUri.empty()) {
+                if (!primaryUri.empty()) {
+                    notifyStreamState(
+                        state->config,
+                        "🔵",
+                        "Проверяю основной источник",
+                        "Временно возвращаюсь на основной URL\nURL: " + primaryUri);
+                    if (restartPipelineWithInput(state, primaryUri, false)) {
+                        bus = state->bus;
+                        state->inputLossNotified = false;
+                    }
+                }
+            } else if (inputTimedOut && !state->usingBackup && state->primaryRetryPending && !state->config.backupInputUri.empty()) {
                 notifyStreamState(
                     state->config,
-                    "🔵",
-                    "Проверяю основной источник",
-                    "Временно возвращаюсь на основной URL\nURL: " + primaryUri);
-                if (restartPipelineWithInput(state, primaryUri, false)) {
+                    "🟡",
+                    "Основной пока недоступен",
+                    "Возвращаюсь на резервный источник\nBackup: " + state->config.backupInputUri);
+                if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                 }
+            } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
+                state->inputLossNotified = true;
+                state->statusMessage = "no input signal";
+                notifyStreamState(
+                    state->config,
+                    "🔴",
+                    "Нет входного сигнала",
+                    "Входных данных нет 5 секунд\nРезервная ссылка не задана\nURL: " + state->activeInputUri);
             }
-        } else if (inputTimedOut && !state->usingBackup && state->primaryRetryPending && !state->config.backupInputUri.empty()) {
-            notifyStreamState(
-                state->config,
-                "🟡",
-                "Основной пока недоступен",
-                "Возвращаюсь на резервный источник\nBackup: " + state->config.backupInputUri);
-            if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
-                bus = state->bus;
-                state->inputLossNotified = false;
-            }
-        } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
-            state->inputLossNotified = true;
-            state->statusMessage = "no input signal";
-            notifyStreamState(
-                state->config,
-                "🔴",
-                "Нет входного сигнала",
-                "Входных данных нет 5 секунд\nРезервная ссылка не задана\nURL: " + state->activeInputUri);
         }
 
         GstMessage* msg = gst_bus_timed_pop(bus, 500000000LL);
