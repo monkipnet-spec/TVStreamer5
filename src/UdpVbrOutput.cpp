@@ -4,7 +4,8 @@
 
 namespace {
 
-constexpr uint64_t kVbrInitialBitrate = 20000000ULL;
+constexpr uint64_t kVbrDefaultBitrate = 7000000ULL;
+constexpr uint64_t kMinConfiguredVbrBitrate = 3000000ULL;
 constexpr uint64_t kVbrPaceHeadroomPercent = 108ULL;
 
 } // namespace
@@ -18,9 +19,9 @@ GstElement* createSink(
     UdpTsOutput::PacingConfig pacing;
     pacing.updateFromPcr = false;
     pacing.updateFromArrivalRate = true;
-    pacing.initialBitrate = config.targetBitrate > kVbrInitialBitrate
+    pacing.initialBitrate = config.targetBitrate >= kMinConfiguredVbrBitrate
         ? config.targetBitrate
-        : kVbrInitialBitrate;
+        : kVbrDefaultBitrate;
     pacing.headroomPercent = kVbrPaceHeadroomPercent;
     return UdpTsOutput::createSink(pipeline, config, pacing, error);
 }

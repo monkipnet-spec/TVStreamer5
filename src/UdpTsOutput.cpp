@@ -3,11 +3,15 @@
 #include <gst/app/gstappsink.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iostream>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
@@ -25,6 +29,7 @@ namespace {
 constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kTsPacketsPerDatagram = 7;
 constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
+constexpr std::size_t kMaxQueuedBytes = 64 * 1024 * 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -33,7 +38,7 @@ constexpr uint64_t kMinPacedBitrate = 512000ULL;
 constexpr uint64_t kMaxPacedBitrate = 200000000ULL;
 constexpr uint64_t kPaceRiseLimitPercent = 125ULL;
 constexpr auto kMaxPaceSleep = std::chrono::milliseconds(20);
-constexpr auto kArrivalRateWindow = std::chrono::milliseconds(300);
+constexpr auto kArrivalRateWindow = std::chrono::seconds(1);
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
@@ -141,9 +146,16 @@ public:
         }
 
         ready = true;
+        senderThread = std::thread(&UdpTsSender::sendLoop, this);
     }
 
     ~UdpTsSender() {
+        stopping = true;
+        queueReady.notify_all();
+        queueSpace.notify_all();
+        if (senderThread.joinable()) {
+            senderThread.join();
+        }
         closeSocket();
     }
 
@@ -161,25 +173,67 @@ public:
             return GST_FLOW_ERROR;
         }
 
-        appendAndSend(map.data, map.size);
+        std::vector<guint8> chunk(map.data, map.data + map.size);
         gst_buffer_unmap(buffer, &map);
-        return GST_FLOW_OK;
+
+        if (pacingConfig.enabled && pacingConfig.updateFromArrivalRate) {
+            updatePacingFromArrival(chunk.size());
+        }
+
+        return enqueueChunk(std::move(chunk)) ? GST_FLOW_OK : GST_FLOW_FLUSHING;
     }
 
 private:
+    bool enqueueChunk(std::vector<guint8>&& chunk) {
+        if (chunk.empty() || stopping) {
+            return !stopping;
+        }
+
+        std::unique_lock<std::mutex> lock(queueMutex);
+        queueSpace.wait(lock, [&]() {
+            return stopping || queuedBytes < kMaxQueuedBytes;
+        });
+        if (stopping) {
+            return false;
+        }
+
+        queuedBytes += chunk.size();
+        queuedChunks.push_back(std::move(chunk));
+        lock.unlock();
+        queueReady.notify_one();
+        return true;
+    }
+
+    void sendLoop() {
+        while (!stopping) {
+            std::vector<guint8> chunk;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                queueReady.wait(lock, [&]() {
+                    return stopping || !queuedChunks.empty();
+                });
+                if (stopping) {
+                    break;
+                }
+
+                chunk = std::move(queuedChunks.front());
+                queuedBytes -= chunk.size();
+                queuedChunks.pop_front();
+            }
+            queueSpace.notify_one();
+            appendAndSend(chunk.data(), chunk.size());
+        }
+    }
+
     void appendAndSend(const guint8* data, std::size_t size) {
         if (!data || size == 0) {
             return;
         }
 
-        if (pacingConfig.enabled && pacingConfig.updateFromArrivalRate) {
-            updatePacingFromArrival(size);
-        }
-
         pending.insert(pending.end(), data, data + size);
         resyncPending();
 
-        while (pending.size() >= kUdpPayloadSize) {
+        while (!stopping && pending.size() >= kUdpPayloadSize) {
             if (!isAlignedDatagram(pending.data())) {
                 pending.erase(pending.begin());
                 resyncPending();
@@ -282,21 +336,23 @@ private:
                 configuredBitrate,
                 pacingConfig.headroomPercent);
             if (estimatedBitrate <= configuredSafetyCeiling) {
-                pacedBitrate = configuredBitrate;
+                pacedBitrate.store(configuredBitrate, std::memory_order_relaxed);
                 return;
             }
         }
 
-        if (pacedBitrate == 0) {
-            pacedBitrate = estimatedBitrate;
+        uint64_t currentBitrate = pacedBitrate.load(std::memory_order_relaxed);
+        if (currentBitrate == 0) {
+            pacedBitrate.store(estimatedBitrate, std::memory_order_relaxed);
             return;
         }
 
-        if (estimatedBitrate > pacedBitrate) {
-            const uint64_t riseLimit = pacedBitrate * kPaceRiseLimitPercent / 100ULL;
-            estimatedBitrate = std::min(estimatedBitrate, std::max(riseLimit, pacedBitrate + 1));
+        if (estimatedBitrate > currentBitrate) {
+            const uint64_t riseLimit = currentBitrate * kPaceRiseLimitPercent / 100ULL;
+            estimatedBitrate = std::min(estimatedBitrate, std::max(riseLimit, currentBitrate + 1));
         }
-        pacedBitrate = (pacedBitrate * 7ULL + estimatedBitrate * 3ULL) / 10ULL;
+        currentBitrate = (currentBitrate * 7ULL + estimatedBitrate * 3ULL) / 10ULL;
+        pacedBitrate.store(currentBitrate, std::memory_order_relaxed);
     }
 
     void updatePacingFromArrival(std::size_t bytes) {
@@ -334,11 +390,12 @@ private:
     }
 
     void pace(std::size_t bytes) {
-        if (!pacingConfig.enabled || pacedBitrate == 0) {
+        const uint64_t currentBitrate = pacedBitrate.load(std::memory_order_relaxed);
+        if (!pacingConfig.enabled || currentBitrate == 0) {
             return;
         }
 
-        const uint64_t nanos = static_cast<uint64_t>(bytes) * 8ULL * 1000000000ULL / pacedBitrate;
+        const uint64_t nanos = static_cast<uint64_t>(bytes) * 8ULL * 1000000000ULL / currentBitrate;
         const auto interval = std::chrono::nanoseconds(nanos);
         const auto now = std::chrono::steady_clock::now();
 
@@ -370,7 +427,7 @@ private:
     bool ready = false;
     UdpTsOutput::PacingConfig pacingConfig;
     uint64_t configuredBitrate = 0;
-    uint64_t pacedBitrate = 0;
+    std::atomic<uint64_t> pacedBitrate{0};
     bool haveLastPcr = false;
     uint64_t lastPcr = 0;
     uint64_t bytesSinceLastPcr = 0;
@@ -380,6 +437,13 @@ private:
     sockaddr_in destinationAddress {};
     std::vector<guint8> pending;
     std::chrono::steady_clock::time_point nextSend;
+    std::atomic<bool> stopping{false};
+    std::thread senderThread;
+    std::mutex queueMutex;
+    std::condition_variable queueReady;
+    std::condition_variable queueSpace;
+    std::deque<std::vector<guint8>> queuedChunks;
+    std::size_t queuedBytes = 0;
 };
 
 GstFlowReturn onNewSample(GstAppSink* sink, gpointer userData) {
