@@ -33,6 +33,7 @@ constexpr uint64_t kMinPacedBitrate = 512000ULL;
 constexpr uint64_t kMaxPacedBitrate = 200000000ULL;
 constexpr uint64_t kPaceRiseLimitPercent = 125ULL;
 constexpr auto kMaxPaceSleep = std::chrono::milliseconds(20);
+constexpr auto kArrivalRateWindow = std::chrono::milliseconds(300);
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
@@ -171,6 +172,10 @@ private:
             return;
         }
 
+        if (pacingConfig.enabled && pacingConfig.updateFromArrivalRate) {
+            updatePacingFromArrival(size);
+        }
+
         pending.insert(pending.end(), data, data + size);
         resyncPending();
 
@@ -181,7 +186,7 @@ private:
                 continue;
             }
 
-            if (pacingConfig.enabled) {
+            if (pacingConfig.enabled && pacingConfig.updateFromPcr) {
                 updatePacingFromDatagram(pending.data(), kUdpPayloadSize);
             }
             sendDatagram(pending.data(), kUdpPayloadSize);
@@ -294,6 +299,30 @@ private:
         pacedBitrate = (pacedBitrate * 7ULL + estimatedBitrate * 3ULL) / 10ULL;
     }
 
+    void updatePacingFromArrival(std::size_t bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!haveArrivalWindow) {
+            arrivalWindowStart = now;
+            haveArrivalWindow = true;
+        }
+
+        arrivalWindowBytes += bytes;
+        const auto elapsed = now - arrivalWindowStart;
+        if (elapsed < kArrivalRateWindow) {
+            return;
+        }
+
+        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+        if (micros > 0 && arrivalWindowBytes > 0) {
+            const uint64_t estimatedBitrate = arrivalWindowBytes * 8ULL * 1000000ULL /
+                static_cast<uint64_t>(micros);
+            updatePacedBitrate(estimatedBitrate);
+        }
+
+        arrivalWindowBytes = 0;
+        arrivalWindowStart = now;
+    }
+
     void sendDatagram(const guint8* data, std::size_t size) {
         pace(size);
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
@@ -345,6 +374,9 @@ private:
     bool haveLastPcr = false;
     uint64_t lastPcr = 0;
     uint64_t bytesSinceLastPcr = 0;
+    bool haveArrivalWindow = false;
+    uint64_t arrivalWindowBytes = 0;
+    std::chrono::steady_clock::time_point arrivalWindowStart;
     sockaddr_in destinationAddress {};
     std::vector<guint8> pending;
     std::chrono::steady_clock::time_point nextSend;
