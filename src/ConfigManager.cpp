@@ -10,7 +10,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.name = root.get("name", "").asString();
     config.inputUri = root.get("input_uri", "").asString();
     config.backupInputUri = root.get("backup_input_uri", "").asString();
-    config.outputType = root.get("output_type", "udp").asString();
+    config.outputType = root.get("output_type", "udp-cbr").asString();
     config.outputMode = root.get("output_mode", "listener").asString();
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
     config.outputPort = root.get("output_port", 1234).asInt();

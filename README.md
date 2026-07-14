@@ -3,11 +3,12 @@
 TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS/UDP/RTP MPEG-TS
 streams, optionally remaps service/PID metadata, monitors input quality,
 switches to a backup source when the primary source disappears, and outputs
-streams as UDP, SRT listener, HTTP TS, HLS, RTMP, or YouTube Live.
+streams as UDP VBR, UDP CBR, SRT listener, HTTP TS, HLS, RTMP, or YouTube Live.
 
 UDP protocol handling is isolated in `src/UdpInput.cpp` and
-`src/UdpOutput.cpp`. The stream manager only dispatches construction to these
-modules; shared MPEG-TS remap and CBR processing remains in the common pipeline.
+separate `src/UdpVbrOutput.cpp` and `src/UdpCbrOutput.cpp` modules. Shared UDP
+TS datagram/socket handling lives in `src/UdpTsOutput.cpp`; MPEG-TS remap and
+CBR mux processing remains in the common stream pipeline.
 
 ## Build on the Host
 
@@ -363,7 +364,7 @@ Minimal stream object:
   "input_uri": "rtsp://user:password@192.168.1.10:554/stream1",
   "backup_input_uri": "srt://192.168.1.10:9000",
   "input_mode": "auto",
-  "output_type": "udp",
+  "output_type": "udp-cbr",
   "output_mode": "listener",
   "output_host": "239.1.1.1",
   "output_port": 1234,
@@ -378,3 +379,7 @@ Minimal stream object:
   "service_provider": ""
 }
 ```
+
+Use `"output_type": "udp-vbr"` for transparent UDP VBR output. The legacy
+`"output_type": "udp"` form is still accepted and chooses CBR/VBR from the
+`cbr` flag.

@@ -1,6 +1,7 @@
 #include "StreamManager.h"
+#include "UdpCbrOutput.h"
 #include "UdpInput.h"
-#include "UdpOutput.h"
+#include "UdpVbrOutput.h"
 
 #include <algorithm>
 #include <chrono>
@@ -89,10 +90,47 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
 
 std::string outputType(const StreamConfig& cfg) {
     std::string type = toLower(cfg.outputType);
-    if (type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
+    if (type == "udp_vbr" || type == "udpvbr") {
+        type = "udp-vbr";
+    } else if (type == "udp_cbr" || type == "udpcbr") {
+        type = "udp-cbr";
+    }
+
+    if (type != "udp" && type != "udp-vbr" && type != "udp-cbr" &&
+        type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
         type = "udp";
     }
     return type;
+}
+
+bool isUdpOutputType(const std::string& type) {
+    return type == "udp" || type == "udp-vbr" || type == "udp-cbr";
+}
+
+bool isUdpOutput(const StreamConfig& cfg) {
+    return isUdpOutputType(outputType(cfg));
+}
+
+bool udpCbrOutputEnabled(const StreamConfig& cfg) {
+    const std::string type = outputType(cfg);
+    if (type == "udp-cbr") {
+        return true;
+    }
+    if (type == "udp-vbr") {
+        return false;
+    }
+    return type == "udp" && cfg.cbr && cfg.targetBitrate > 0;
+}
+
+bool cbrMuxEnabled(const StreamConfig& cfg) {
+    const std::string type = outputType(cfg);
+    if (type == "udp-vbr") {
+        return false;
+    }
+    if (type == "udp-cbr") {
+        return cfg.targetBitrate > 0;
+    }
+    return cfg.cbr && cfg.targetBitrate > 0;
 }
 
 std::string srtOutputMode(const StreamConfig& cfg) {
@@ -342,7 +380,7 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 }
 
 void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
-    configureQueue(queue, outputType(cfg) == "udp" ? kUdpQueueLatency : 3000000000ULL);
+    configureQueue(queue, isUdpOutput(cfg) ? kUdpQueueLatency : 3000000000ULL);
 }
 
 void configureTsPacketAlignment(GstElement* element) {
@@ -396,7 +434,7 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    if (cfg.cbr && cfg.targetBitrate > 0) {
+    if (cbrMuxEnabled(cfg)) {
         setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
 }
@@ -644,7 +682,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = streamConfig.cbr ? streamConfig.targetBitrate : 0;
+    state->outputBitrate = cbrMuxEnabled(streamConfig) ? streamConfig.targetBitrate : 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -886,7 +924,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->ccErrors = 0;
     state->ccErrorsDelta = 0;
     state->inputBitrate = 0;
-    state->outputBitrate = state->config.cbr ? state->config.targetBitrate : 0;
+    state->outputBitrate = cbrMuxEnabled(state->config) ? state->config.targetBitrate : 0;
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastCcErrorsSample = 0;
@@ -940,7 +978,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return pipeline;
     }
 
-    const bool needsRemux = cfg.remapEnabled || (cfg.cbr && cfg.targetBitrate > 0);
+    const bool needsRemux = cfg.remapEnabled || cbrMuxEnabled(cfg);
     bool ok = false;
     if (needsRemux) {
         if (!state->remapContext) {
@@ -1307,7 +1345,7 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
 
     configureOutputQueue(queue, cfg);
     configureTsPacketAlignment(tsparse);
-    if (outputType(cfg) == "udp") {
+    if (isUdpOutput(cfg)) {
         setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
         setUInt64PropertyIfPresent(tsparse, "smoothing-latency", kTsSmoothingLatency);
     }
@@ -1328,8 +1366,7 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
-    const bool cbrActive = outputType(state->config) != "udp" &&
-        state->config.cbr && state->config.targetBitrate > 0;
+    const bool cbrActive = !isUdpOutput(state->config) && cbrMuxEnabled(state->config);
     GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
     GstElement* pacer = cbrActive ? gst_element_factory_make("identity", "cbr_pacer") : nullptr;
     GstElement* sink = createOutputSink(state->config, pipeline);
@@ -1425,9 +1462,11 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
 
 GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline) {
     const std::string type = outputType(cfg);
-    if (type == "udp") {
+    if (isUdpOutputType(type)) {
         std::string error;
-        GstElement* sink = UdpOutput::createSink(pipeline, cfg, error);
+        GstElement* sink = udpCbrOutputEnabled(cfg)
+            ? UdpCbrOutput::createSink(pipeline, cfg, error)
+            : UdpVbrOutput::createSink(pipeline, cfg, error);
         if (!sink) {
             std::cerr << error << std::endl;
         }
