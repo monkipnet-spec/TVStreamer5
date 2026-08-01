@@ -50,6 +50,7 @@ struct SubscriberConfig {
     std::string primaryIp;
     std::string backupIp;
     std::string addedAt;
+    bool enabled = true;
     std::vector<std::string> streamIds;
 
     Json::Value toJson() const;

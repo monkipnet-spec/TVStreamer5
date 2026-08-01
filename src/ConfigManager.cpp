@@ -99,6 +99,7 @@ Json::Value SubscriberConfig::toJson() const {
     root["primary_ip"] = primaryIp;
     root["backup_ip"] = backupIp;
     root["added_at"] = addedAt;
+    root["enabled"] = enabled;
     Json::Value streams(Json::arrayValue);
     for (const auto& id : streamIds) streams.append(id);
     root["stream_ids"] = streams;
@@ -111,6 +112,7 @@ SubscriberConfig SubscriberConfig::fromJson(const Json::Value& root) {
     subscriber.primaryIp = root.get("primary_ip", "").asString();
     subscriber.backupIp = root.get("backup_ip", "").asString();
     subscriber.addedAt = root.get("added_at", "").asString();
+    subscriber.enabled = root.get("enabled", true).asBool();
     if (root["stream_ids"].isArray()) {
         for (const auto& id : root["stream_ids"]) {
             subscriber.streamIds.push_back(id.asString());
