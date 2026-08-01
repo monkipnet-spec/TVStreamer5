@@ -386,6 +386,7 @@ std::string HttpServer::listInterfaces() {
       ? 0.0
       : 100.0 * static_cast<double>(memoryTotal - std::min(memoryTotal, memoryAvailable)) / memoryTotal;
     Json::Value interfaces(Json::arrayValue);
+    const auto interfaceAddresses = enumerateNetworkInterfaces();
     std::ifstream netdev("/proc/net/dev");
     std::string line;
     while (std::getline(netdev, line)) {
@@ -413,6 +414,10 @@ std::string HttpServer::listInterfaces() {
       previousNetworkBytes[name] = {rxBytes, txBytes};
       Json::Value item;
       item["name"] = name;
+      const auto address = std::find_if(interfaceAddresses.begin(), interfaceAddresses.end(), [&name](const NetworkInterface& iface) {
+        return iface.name == name;
+      });
+      item["address"] = address == interfaceAddresses.end() ? "" : address->address;
       item["rx_mbps"] = rxMbps;
       item["tx_mbps"] = txMbps;
       interfaces.append(item);
@@ -900,7 +905,7 @@ function updateSystemLoad(metrics) {
   if (!table) return;
   const interfaces = metrics.interfaces || [];
   table.innerHTML = interfaces.length ? interfaces.map(iface => `
-    <tr><td>${iface.name}</td><td>${Number(iface.rx_mbps || 0).toFixed(2)} Mbps</td><td>${Number(iface.tx_mbps || 0).toFixed(2)} Mbps</td></tr>
+    <tr><td>${iface.name}${iface.address ? ` (${iface.address})` : ''}</td><td>${Number(iface.rx_mbps || 0).toFixed(2)} Mbps</td><td>${Number(iface.tx_mbps || 0).toFixed(2)} Mbps</td></tr>
   `).join('') : '<tr><td colspan="3" class="network-empty">Интерфейсы не найдены</td></tr>';
 }
 function fetchSystemMetrics() {
