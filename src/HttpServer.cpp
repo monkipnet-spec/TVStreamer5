@@ -929,6 +929,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 <button class="button-secondary" onclick="toggleLanguage()" id="languageButton">RU</button>
 <button class="button-secondary" onclick="openLoginModal()" data-i18n="user">User</button>
 <button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
+<button class="button-secondary" onclick="downloadVlcPlaylist()" data-i18n="playlist">VLC playlist</button>
 <button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
 <button class="button-secondary" onclick="openAboutModal()">About</button>
 </div>
@@ -946,7 +947,7 @@ const translations = {
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close', preview:'Preview', source:'Source', playHint:'Click Play to start playback.',
     browserUnsupported:'Browser cannot play {type} directly. Output URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Could not play {type} in the browser. URL: {url}',
-    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality'
+    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
@@ -954,7 +955,7 @@ const translations = {
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть', preview:'Просмотр', source:'Источник', playHint:'Нажмите Play для запуска воспроизведения.',
     browserUnsupported:'Браузер не воспроизводит {type} напрямую. Выходной URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Не удалось воспроизвести поток {type} в браузере. URL: {url}',
-    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока'
+    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC'
   }
 };
 let language = localStorage.getItem('tvstreamer-language') || 'en';
@@ -992,6 +993,24 @@ function updateSystemLoad(metrics) {
 }
 function fetchSystemMetrics() {
   fetch('/api/system-metrics').then(r=>r.json()).then(updateSystemLoad).catch(()=>{});
+}
+function downloadVlcPlaylist() {
+  const entries = (state.streams || [])
+    .filter(stream => stream.vlc_link)
+    .map(stream => {
+      const name = String(stream.name || stream.id).replace(/[\r\n]/g, ' ').trim();
+      return `#EXTINF:-1,${name}\n${stream.vlc_link}`;
+    });
+  const content = `#EXTM3U\n${entries.join('\n')}\n`;
+  const blob = new Blob([content], {type:'audio/x-mpegurl;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'tvstreamer5-playlist.m3u';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 function openModal(html) {
   document.getElementById('modalContent').innerHTML = html;
