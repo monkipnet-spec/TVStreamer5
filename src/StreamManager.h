@@ -70,7 +70,9 @@ public:
     void stopAll();
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
-    bool addHttpClient(const std::string& id, int fd);
+    bool addHttpClient(const std::string& id, int fd, const std::string& clientIp);
+    size_t activeHttpSessions(const std::string& clientIp) const;
+    size_t resetHttpSessions(const std::string& clientIp);
 
 private:
     bool gstreamerInitialized;
@@ -97,5 +99,11 @@ private:
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
-    std::mutex managerMutex;
+    struct HttpClientSession {
+        std::string streamId;
+        std::string clientIp;
+    };
+    std::map<int, HttpClientSession> httpClients;
+    mutable std::mutex managerMutex;
+    static void onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData);
 };

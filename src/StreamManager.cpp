@@ -766,6 +766,7 @@ bool StreamManager::stopStream(const std::string& id) {
 
 void StreamManager::stopAll() {
     std::lock_guard<std::mutex> lock(managerMutex);
+    httpClients.clear();
     for (auto& [id, statePtr] : streams) {
         auto& state = *statePtr;
         state.running = false;
@@ -831,7 +832,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     return desc.str();
 }
 
-bool StreamManager::addHttpClient(const std::string& id, int fd) {
+bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp) {
     std::lock_guard<std::mutex> lock(managerMutex);
     auto found = streams.find(id);
     if (found == streams.end() || !found->second->pipeline) {
@@ -855,9 +856,49 @@ bool StreamManager::addHttpClient(const std::string& id, int fd) {
         return false;
     }
 
+    g_signal_connect(sink, "client-fd-removed", G_CALLBACK(StreamManager::onHttpClientFdRemoved), this);
     g_signal_emit_by_name(sink, "add", fd);
+    httpClients[fd] = {id, clientIp};
     gst_object_unref(sink);
     return true;
+}
+
+void StreamManager::onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData) {
+    (void)sink;
+    auto* manager = static_cast<StreamManager*>(userData);
+    if (!manager) return;
+    std::lock_guard<std::mutex> lock(manager->managerMutex);
+    manager->httpClients.erase(fd);
+}
+
+size_t StreamManager::activeHttpSessions(const std::string& clientIp) const {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    size_t count = 0;
+    for (const auto& [fd, session] : httpClients) {
+        (void)fd;
+        if (session.clientIp == clientIp) ++count;
+    }
+    return count;
+}
+
+size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
+    std::vector<std::pair<GstElement*, int>> sinks;
+    {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for (const auto& [fd, session] : httpClients) {
+        if (session.clientIp != clientIp) continue;
+        auto found = streams.find(session.streamId);
+        if (found == streams.end() || !found->second->pipeline) continue;
+        GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
+        if (!sink) continue;
+        sinks.emplace_back(sink, fd);
+    }
+    }
+    for (const auto& [sink, fd] : sinks) {
+        g_signal_emit_by_name(sink, "remove", fd);
+        gst_object_unref(sink);
+    }
+    return sinks.size();
 }
 
 void StreamManager::notifyStreamState(

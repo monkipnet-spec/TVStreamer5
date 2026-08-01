@@ -237,6 +237,10 @@ void HttpServer::handleSession(tcp::socket socket) {
                 handleSaveSubscribers(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/reset-subscriber") {
+              handleResetSubscriber(req.body());
+              res.set(http::field::content_type, "application/json");
+              res.body() = "{\"result\": \"ok\"}";
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -471,7 +475,12 @@ std::string HttpServer::currentState() {
     root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
     Json::Value subscribers(Json::arrayValue);
     for (const auto& subscriber : configManager.subscribers.subscribers) {
-      subscribers.append(subscriber.toJson());
+      Json::Value item = subscriber.toJson();
+      const size_t primarySessions = subscriber.primaryIp.empty() ? 0 : streamManager.activeHttpSessions(subscriber.primaryIp);
+      const size_t backupSessions = subscriber.backupIp.empty() ? 0 : streamManager.activeHttpSessions(subscriber.backupIp);
+      item["active_sessions"] = Json::UInt64(primarySessions + backupSessions);
+      item["session_active"] = (primarySessions + backupSessions) > 0;
+      subscribers.append(item);
     }
     root["subscribers"] = subscribers;
     Json::Value streams(Json::arrayValue);
@@ -532,8 +541,10 @@ bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target
         "Connection: close\r\n"
         "\r\n";
     boost::asio::write(socket, boost::asio::buffer(header));
+    boost::system::error_code endpointError;
+    const std::string clientIp = socket.remote_endpoint(endpointError).address().to_string();
     int fd = socket.release();
-    streamManager.addHttpClient(id, fd);
+    streamManager.addHttpClient(id, fd, endpointError ? "" : clientIp);
     return true;
 }
 
@@ -793,6 +804,25 @@ void HttpServer::handleStopStream(const std::string& body) {
     configManager.saveSubscribers();
   }
 
+  void HttpServer::handleResetSubscriber(const std::string& body) {
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value root;
+    std::string errs;
+    std::istringstream ss(body);
+    if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) return;
+    const std::string name = root.get("name", "").asString();
+    for (const auto& subscriber : configManager.subscribers.subscribers) {
+      if (subscriber.name != name) continue;
+      size_t reset = 0;
+      if (!subscriber.primaryIp.empty()) reset += streamManager.resetHttpSessions(subscriber.primaryIp);
+      if (!subscriber.backupIp.empty() && subscriber.backupIp != subscriber.primaryIp) {
+        reset += streamManager.resetHttpSessions(subscriber.backupIp);
+      }
+      std::cerr << "Reset subscriber sessions: " << name << " (" << reset << ")" << std::endl;
+      return;
+    }
+  }
+
 void HttpServer::addEndpoint(const std::string& path, std::function<void(const boost::asio::ip::tcp::socket&)> handler) {
     // Store endpoint handler for future use
     // This is a simple implementation - in a real server you'd want proper routing
@@ -869,6 +899,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-content.quality-modal{width:min(920px,100%)}
 .modal-content.network-modal{width:min(620px,100%)}
+.modal-content.subscriber-modal{width:min(1280px,100%)}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
 .quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
 .quality-title{display:flex;flex-direction:column;gap:4px}
@@ -920,11 +951,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .network-table th:first-child,.network-table td:first-child{text-align:left}
 .network-table th{color:#9aa3b1;font-weight:600}
 .network-empty{padding:22px 0;text-align:center;color:#9aa3b1}
-.subscriber-list{display:grid;gap:8px}
-.subscriber-row{display:grid;grid-template-columns:minmax(190px,1.8fr) 1fr 1fr 130px minmax(120px,auto) 86px 34px;gap:6px;align-items:center}
+.subscriber-list{display:grid;gap:8px;min-width:1020px}
+.subscriber-row{display:grid;grid-template-columns:minmax(190px,1.8fr) minmax(180px,1fr) minmax(180px,1fr) minmax(120px,auto) 86px minmax(145px,auto) 34px;gap:6px;align-items:center}
 .subscriber-row input{width:100%;box-sizing:border-box;padding:7px 8px;background:#121825;border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#EEE;font-size:.78rem}
 .subscriber-row .remove-subscriber{width:30px;height:30px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;cursor:pointer}
-.subscriber-head{display:grid;grid-template-columns:minmax(190px,1.8fr) 1fr 1fr 130px minmax(120px,auto) 86px 34px;gap:6px;color:#9aa3b1;font-size:.72rem;margin-bottom:4px}
+.subscriber-head{display:grid;grid-template-columns:minmax(190px,1.8fr) minmax(180px,1fr) minmax(180px,1fr) minmax(120px,auto) 86px minmax(145px,auto) 34px;gap:6px;color:#9aa3b1;font-size:.72rem;margin-bottom:4px;min-width:1020px}
 .subscriber-streams{grid-column:1/-1;display:flex;gap:5px;flex-wrap:wrap;padding:4px 0 8px 4px;border-bottom:1px solid rgba(255,255,255,.08)}
 .subscriber-streams label{display:flex;align-items:center;gap:4px;color:#cfd8ea;font-size:.72rem}
 .subscriber-stream-picker{position:relative;min-width:0}
@@ -935,6 +966,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .subscriber-stream-options label{display:flex;align-items:center;gap:6px;color:#cfd8ea;font-size:.76rem}
 .subscriber-enabled{display:flex;align-items:center;justify-content:center;gap:4px;color:#b6f7c2;font-size:.72rem;white-space:nowrap}
 .subscriber-enabled input{width:15px;height:15px}
+.subscriber-session{display:flex;align-items:center;gap:6px;white-space:nowrap;color:#9aa3b1;font-size:.72rem}
+.subscriber-session.active{color:#b6f7c2}
+.reset-session{padding:5px 7px;border:1px solid rgba(255,184,77,.25);border-radius:7px;background:rgba(255,184,77,.12);color:#ffe0a3;cursor:pointer;font-size:.7rem}
 </style>
 </head>
 <body>
@@ -978,14 +1012,14 @@ const translations = {
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
-    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT'
+    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
-    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT'
+    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
 };
 let language = localStorage.getItem('tvstreamer-language') || 'en';
@@ -1135,11 +1169,10 @@ function openSubscribersModal() {
   const renderSubscribers = () => {
     const subscribers = state.subscribers || [];
     const rows = subscribers.length ? subscribers.map((subscriber, index) => `
-      <div class="subscriber-row" data-index="${index}">
+      <div class="subscriber-row" data-index="${index}" data-added-at="${subscriber.added_at || ''}">
         <input data-field="name" value="${subscriber.name || ''}" placeholder="${t('subscriberName')}" />
         <input data-field="primary_ip" value="${subscriber.primary_ip || ''}" placeholder="${t('primaryIp')}" />
         <input data-field="backup_ip" value="${subscriber.backup_ip || ''}" placeholder="${t('backupIp')}" />
-        <input data-field="added_at" type="date" value="${String(subscriber.added_at || '').slice(0, 10)}" />
         <details class="subscriber-stream-picker">
           <summary id="subscriberStreamsSummary-${index}">${t('streams')} (${(subscriber.stream_ids || []).length})</summary>
           <div class="subscriber-stream-options">
@@ -1147,13 +1180,14 @@ function openSubscribersModal() {
           </div>
         </details>
         <label class="subscriber-enabled"><input data-field="enabled" type="checkbox" onchange="updateSubscriberStatus(this)" ${subscriber.enabled !== false ? 'checked' : ''} /><span>${subscriber.enabled !== false ? t('enabled') : t('disabled')}</span></label>
+        <div class="subscriber-session ${subscriber.session_active ? 'active' : ''}"><span>${subscriber.session_active ? `${t('activeSession')} (${subscriber.active_sessions || 0})` : t('offlineSession')}</span><button class="reset-session" onclick="resetSubscriberSession('${String(subscriber.name || '').replace(/'/g, "\\'")}')">${t('resetSession')}</button></div>
         <button class="remove-subscriber" onclick="removeSubscriber(${index})" aria-label="Remove">×</button>
       </div>
     `).join('') : `<div class="network-empty">${t('noSubscribers')}</div>`;
     openModal(`
       <h2>${t('subscribers')}</h2>
       <div class="checkbox-inline"><input id="subscriberFiltering" type="checkbox" ${state.subscriber_filtering_enabled ? 'checked' : ''} /><span>${t('filtering')}</span></div>
-      <div class="subscriber-head"><span>${t('subscriberName')}</span><span>${t('primaryIp')}</span><span>${t('backupIp')}</span><span>${t('addedAt')}</span><span>${t('streams')}</span><span>${t('enabled')}</span><span></span></div>
+      <div class="subscriber-head"><span>${t('subscriberName')}</span><span>${t('primaryIp')}</span><span>${t('backupIp')}</span><span>${t('streams')}</span><span>${t('enabled')}</span><span>${t('session')}</span><span></span></div>
       <div id="subscriberList" class="subscriber-list">${rows}</div>
       <div class="modal-actions">
         <button class="button-secondary" onclick="addSubscriber()">+ ${t('addSubscriber')}</button>
@@ -1162,6 +1196,7 @@ function openSubscribersModal() {
         <button class="button-primary" onclick="saveSubscribers()">${t('save')}</button>
       </div>
     `);
+    document.getElementById('modalContent').className = 'modal-content subscriber-modal';
   };
   renderSubscribers();
 }
@@ -1185,12 +1220,17 @@ function updateSubscriberStatus(input) {
   const text = label?.querySelector('span');
   if (text) text.textContent = input.checked ? t('enabled') : t('disabled');
 }
+function resetSubscriberSession(name) {
+  fetch('/api/reset-subscriber', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})
+  }).then(()=>{ state.subscribers = (state.subscribers || []).map(subscriber => subscriber.name === name ? {...subscriber, session_active:false, active_sessions:0} : subscriber); openSubscribersModal(); });
+}
 function saveSubscribers() {
   const rows = [...document.querySelectorAll('.subscriber-row')];
   const subscribers = rows.map(row => {
     const value = field => row.querySelector(`[data-field="${field}"]`)?.value.trim() || '';
     return {
-      name:value('name'), primary_ip:value('primary_ip'), backup_ip:value('backup_ip'), added_at:value('added_at'),
+      name:value('name'), primary_ip:value('primary_ip'), backup_ip:value('backup_ip'), added_at:row.dataset.addedAt || '',
       enabled:row.querySelector('[data-field="enabled"]')?.checked !== false,
       stream_ids:[...row.querySelectorAll('[data-stream-id]:checked')].map(input=>input.dataset.streamId)
     };
@@ -1213,7 +1253,7 @@ function exportSubscribers() {
     lines.push('', `${index + 1}. ${value('name')}`,
       `IP: ${value('primary_ip')}`,
       `Backup IP: ${value('backup_ip')}`,
-      `${t('addedAt')}: ${value('added_at')}`,
+      `${t('addedAt')}: ${row.dataset.addedAt || '—'}`,
       `${t('status')}: ${enabled ? t('enabled') : t('disabled')}`,
       `${t('streams')}: ${streams.length ? streams.join(', ') : '—'}`);
   });
