@@ -45,6 +45,7 @@ private:
     bool bindHttpPort(int port);
     void rebindHttpPort(int port);
     std::string listInterfaces();
+    std::string systemMetrics();
     std::string currentState();
     std::string qualityHistory(const std::string& target);
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
@@ -52,6 +53,7 @@ private:
     void handleSaveConfig(const std::string& body);
     void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
+    void handleDeleteStream(const std::string& body);
     std::string renderIndexPage();
     void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 
@@ -60,6 +62,11 @@ private:
     ConfigManager& configManager;
     StreamManager& streamManager;
     std::mutex qualityMutex;
+    std::mutex metricsMutex;
+    uint64_t previousCpuTotal = 0;
+    uint64_t previousCpuIdle = 0;
+    std::chrono::steady_clock::time_point previousMetricsSample;
+    std::map<std::string, std::pair<uint64_t, uint64_t>> previousNetworkBytes;
     std::unordered_map<std::string, std::deque<QualitySample>> qualitySamples;
     std::unordered_map<std::string, std::function<void(const boost::asio::ip::tcp::socket&)>> endpointHandlers;
 };

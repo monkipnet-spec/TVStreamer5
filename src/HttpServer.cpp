@@ -194,6 +194,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
+            } else if (target == "/api/system-metrics") {
+              res.set(http::field::content_type, "application/json");
+              res.body() = systemMetrics();
             } else if (target == "/api/state") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = currentState();
@@ -220,6 +223,10 @@ void HttpServer::handleSession(tcp::socket socket) {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/delete-stream") {
+              handleDeleteStream(req.body());
+              res.set(http::field::content_type, "application/json");
+              res.body() = "{\"result\": \"ok\"}";
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -331,6 +338,89 @@ std::string HttpServer::listInterfaces() {
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, root);
 }
+
+  std::string HttpServer::systemMetrics() {
+    uint64_t cpuTotal = 0;
+    uint64_t cpuIdle = 0;
+    {
+      std::ifstream statFile("/proc/stat");
+      std::string label;
+      uint64_t user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
+      if (statFile >> label >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal && label == "cpu") {
+        cpuIdle = idle + iowait;
+        cpuTotal = user + nice + system + idle + iowait + irq + softirq + steal;
+      }
+    }
+
+    uint64_t memoryTotal = 0;
+    uint64_t memoryAvailable = 0;
+    {
+      std::ifstream meminfo("/proc/meminfo");
+      std::string label;
+      uint64_t value = 0;
+      std::string unit;
+      while (meminfo >> label >> value >> unit) {
+        if (label == "MemTotal:") memoryTotal = value;
+        if (label == "MemAvailable:") memoryAvailable = value;
+      }
+    }
+
+    Json::Value root;
+    std::lock_guard<std::mutex> lock(metricsMutex);
+    double cpuPercent = 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    if (previousCpuTotal > 0 && cpuTotal > previousCpuTotal && cpuIdle >= previousCpuIdle) {
+      const uint64_t totalDelta = cpuTotal - previousCpuTotal;
+      const uint64_t idleDelta = cpuIdle - previousCpuIdle;
+      cpuPercent = 100.0 * static_cast<double>(totalDelta - std::min(totalDelta, idleDelta)) / totalDelta;
+    }
+    previousCpuTotal = cpuTotal;
+    previousCpuIdle = cpuIdle;
+    const double elapsedSeconds = previousMetricsSample.time_since_epoch().count() == 0
+      ? 0.0
+      : std::chrono::duration<double>(now - previousMetricsSample).count();
+    previousMetricsSample = now;
+
+    root["cpu_percent"] = cpuPercent;
+    root["ram_percent"] = memoryTotal == 0
+      ? 0.0
+      : 100.0 * static_cast<double>(memoryTotal - std::min(memoryTotal, memoryAvailable)) / memoryTotal;
+    Json::Value interfaces(Json::arrayValue);
+    std::ifstream netdev("/proc/net/dev");
+    std::string line;
+    while (std::getline(netdev, line)) {
+      const auto colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      std::string name = line.substr(0, colon);
+      name.erase(0, name.find_first_not_of(" \t"));
+      name.erase(name.find_last_not_of(" \t") + 1);
+      if (name == "lo" || name.empty()) continue;
+      std::istringstream values(line.substr(colon + 1));
+      uint64_t rxBytes = 0, txBytes = 0;
+      if (!(values >> rxBytes)) continue;
+      for (int i = 0; i < 7; ++i) {
+        uint64_t ignored = 0;
+        values >> ignored;
+      }
+      if (!(values >> txBytes)) continue;
+      double rxMbps = 0.0;
+      double txMbps = 0.0;
+      const auto previous = previousNetworkBytes.find(name);
+      if (elapsedSeconds > 0.0 && previous != previousNetworkBytes.end()) {
+        rxMbps = static_cast<double>(rxBytes - std::min(rxBytes, previous->second.first)) * 8.0 / elapsedSeconds / 1000000.0;
+        txMbps = static_cast<double>(txBytes - std::min(txBytes, previous->second.second)) * 8.0 / elapsedSeconds / 1000000.0;
+      }
+      previousNetworkBytes[name] = {rxBytes, txBytes};
+      Json::Value item;
+      item["name"] = name;
+      item["rx_mbps"] = rxMbps;
+      item["tx_mbps"] = txMbps;
+      interfaces.append(item);
+    }
+    root["interfaces"] = interfaces;
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, root);
+  }
 
 std::string HttpServer::currentState() {
     Json::Value root;
@@ -617,6 +707,25 @@ void HttpServer::handleStopStream(const std::string& body) {
     streamManager.stopStream(id);
 }
 
+  void HttpServer::handleDeleteStream(const std::string& body) {
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value root;
+    std::string errs;
+    std::istringstream ss(body);
+    if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
+      std::cerr << "Invalid delete-stream payload: " << errs << std::endl;
+      return;
+    }
+    const std::string id = root.get("id", "").asString();
+    if (id.empty()) return;
+    streamManager.stopStream(id);
+    auto& streams = configManager.config.streams;
+    streams.erase(std::remove_if(streams.begin(), streams.end(), [&id](const StreamConfig& stream) {
+      return stream.id == id;
+    }), streams.end());
+    configManager.save();
+  }
+
 void HttpServer::addEndpoint(const std::string& path, std::function<void(const boost::asio::ip::tcp::socket&)> handler) {
     // Store endpoint handler for future use
     // This is a simple implementation - in a real server you'd want proper routing
@@ -643,6 +752,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .header-left .subtitle{font-size:.78rem;color:#9aa3b1;margin-top:2px}
 .header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .header-center{display:flex;align-items:center;justify-content:center;gap:12px}
+.system-load{display:flex;align-items:center;gap:8px;padding:6px 10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;color:#d1d9ed;font-size:.76rem;white-space:nowrap}
+.system-load strong{color:#fff;font-size:.76rem}
+.system-load .metric{display:flex;align-items:center;gap:4px}
+.system-load .metric span{color:#7dd1ff;font-weight:700;min-width:38px;text-align:right}
+.network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
+.network-button:hover{background:rgba(57,189,248,.24)}
 .button-primary{padding:8px 14px;border:none;border-radius:999px;color:#FFF;background:#1f8bff;cursor:pointer;font-size:0.88rem;transition:background .2s ease}
 .button-secondary{padding:7px 12px;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:#EEE;background:rgba(255,255,255,.05);cursor:pointer;font-size:0.82rem;transition:background .2s ease,border-color .2s ease}
 .button-primary:hover{background:#0f7ce7}
@@ -659,8 +774,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .tile.active{border-color:#17c261}
 .tile.error{border-color:#fb5f5f}
 .tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.tile .delete-button{position:absolute;top:8px;right:8px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
+.tile .delete-button:hover{background:#f0444d;transform:scale(1.08)}
 .tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff}
-.tile .badge{padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.tile .badge{position:absolute;left:50%;top:10px;transform:translateX(-50%);padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
@@ -684,6 +801,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal.active{display:flex}
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-content.quality-modal{width:min(920px,100%)}
+.modal-content.network-modal{width:min(620px,100%)}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
 .quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
 .quality-title{display:flex;flex-direction:column;gap:4px}
@@ -692,7 +810,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .period-tabs button{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#d7deec;border-radius:8px;cursor:pointer;font-size:.72rem}
 .period-tabs button.active{background:#1f8bff;color:#fff;border-color:#1f8bff}
 .quality-board{position:relative;border:1px solid rgba(255,255,255,.08);background:#101722;border-radius:10px;padding:8px}
-.quality-board canvas{display:block;width:100%;height:320px;cursor:copy}
+.quality-board canvas{display:block;width:100%;height:230px;cursor:copy}
+.quality-board.cc-board{margin-top:10px}
+.quality-board.cc-board canvas{height:150px;cursor:default}
 .quality-legend{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0;color:#cfd8ea;font-size:.78rem}
 .quality-legend span{display:flex;align-items:center;gap:5px}
 .quality-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
@@ -728,6 +848,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .about-row strong{color:#9aa3b1;font-weight:600}
 .about-row span,.about-row a{color:#fff;text-decoration:none;overflow-wrap:anywhere}
 .about-row a:hover{color:#7dd1ff}
+.network-table{width:100%;border-collapse:collapse;color:#d7deec;font-size:.85rem}
+.network-table th,.network-table td{padding:9px 6px;text-align:right;border-bottom:1px solid rgba(255,255,255,.08)}
+.network-table th:first-child,.network-table td:first-child{text-align:left}
+.network-table th{color:#9aa3b1;font-weight:600}
+.network-empty{padding:22px 0;text-align:center;color:#9aa3b1}
 </style>
 </head>
 <body>
@@ -739,10 +864,15 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 </div>
 </div>
 <div class="header-center">
+<div class="system-load">
+<span class="metric"><strong>CPU</strong> <span id="cpuLoad">—%</span></span>
+<span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
+</div>
 <div class="stats-panel">
 <div class="status"><strong>Всего:</strong> <span id="totalCount">0</span></div>
 <div class="status"><strong>Активно:</strong> <span id="activeCount">0</span></div>
 </div>
+<button class="network-button" onclick="openNetworkModal()">Сеть</button>
 </div>
 <div class="header-right">
 <button class="button-secondary" onclick="openLoginModal()">Пользователь</button>
@@ -758,8 +888,23 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 </div>
 <script>
 let state = {};
+let networkRefreshTimer = null;
 function fetchState() {
-  fetch('/api/state').then(r=>r.json()).then(data=>{state=data; render();});
+  Promise.all([fetch('/api/state').then(r=>r.json()), fetch('/api/system-metrics').then(r=>r.json())])
+    .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics);});
+}
+function updateSystemLoad(metrics) {
+  document.getElementById('cpuLoad').textContent = `${Number(metrics.cpu_percent || 0).toFixed(1)}%`;
+  document.getElementById('ramLoad').textContent = `${Number(metrics.ram_percent || 0).toFixed(1)}%`;
+  const table = document.getElementById('networkTableBody');
+  if (!table) return;
+  const interfaces = metrics.interfaces || [];
+  table.innerHTML = interfaces.length ? interfaces.map(iface => `
+    <tr><td>${iface.name}</td><td>${Number(iface.rx_mbps || 0).toFixed(2)} Mbps</td><td>${Number(iface.tx_mbps || 0).toFixed(2)} Mbps</td></tr>
+  `).join('') : '<tr><td colspan="3" class="network-empty">Интерфейсы не найдены</td></tr>';
+}
+function fetchSystemMetrics() {
+  fetch('/api/system-metrics').then(r=>r.json()).then(updateSystemLoad).catch(()=>{});
 }
 function openModal(html) {
   document.getElementById('modalContent').innerHTML = html;
@@ -798,6 +943,7 @@ function render() {
         </div>
         <div class="badge">${bitrateMode}</div>
       </div>
+      <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
         <div class="info-row"><strong>Вывод</strong><span>${outputType.toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
         <div class="info-row"><strong>Активный вход</strong><span>${stream.active_input_label || 'Основной'} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
@@ -825,6 +971,29 @@ function toggleStream(id, active) {
       setTimeout(fetchState,500);
       setTimeout(fetchState,1500);
     });
+}
+function deleteStream(id) {
+  const stream = state.streams.find(s=>s.id===id);
+  if (!stream || !window.confirm(`Удалить поток «${stream.name || stream.id}»?`)) return;
+  fetch('/api/delete-stream', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
+    .then(()=>{ closeModal(); setTimeout(fetchState, 300); });
+}
+function openNetworkModal() {
+  document.getElementById('modalContent').className = 'modal-content network-modal';
+  document.getElementById('modalContent').innerHTML = `
+    <h2>Загрузка сетевых интерфейсов</h2>
+    <table class="network-table"><thead><tr><th>Интерфейс</th><th>Входящий</th><th>Исходящий</th></tr></thead><tbody id="networkTableBody"></tbody></table>
+    <div class="modal-actions"><button class="button-secondary" onclick="closeNetworkModal()">Закрыть</button></div>
+  `;
+  document.getElementById('modal').classList.add('active');
+  fetchSystemMetrics();
+  clearInterval(networkRefreshTimer);
+  networkRefreshTimer = setInterval(fetchSystemMetrics, 2000);
+}
+function closeNetworkModal() {
+  clearInterval(networkRefreshTimer);
+  networkRefreshTimer = null;
+  closeModal();
 }
 function editStream(id) {
   const stream = state.streams.find(s=>s.id===id);
@@ -1135,12 +1304,15 @@ function openQualityModal(id, periodSeconds=3600) {
       <div class="period-tabs">${tabs}</div>
     </div>
     <div class="quality-board">
-      <canvas id="qualityCanvas" width="860" height="320"></canvas>
+      <canvas id="qualityCanvas" width="860" height="230"></canvas>
+    </div>
+    <div class="quality-board cc-board">
+      <canvas id="ccCanvas" width="860" height="150"></canvas>
     </div>
     <div class="quality-legend">
       <span><i class="quality-line quality-input"></i>Входной битрейт</span>
       <span><i class="quality-line quality-output"></i>Исходящий битрейт</span>
-      <span><i class="quality-line quality-cc"></i>CC-errors</span>
+      <span><i class="quality-line quality-cc"></i>CC-errors на отдельном графике</span>
       <span>Клик по графику копирует измерение в буфер</span>
     </div>
     <div class="quality-decode">
@@ -1176,23 +1348,37 @@ function renderQualityTabs(periodSeconds) {
 }
 function drawQualityChart(data) {
   const canvas = document.getElementById('qualityCanvas');
+  const ccCanvas = document.getElementById('ccCanvas');
   const details = document.getElementById('qualityDetails');
   const errors = document.getElementById('qualityErrors');
-  if (!canvas || !details || !errors) return;
-  const ctx = canvas.getContext('2d');
-  const rect = canvas.getBoundingClientRect();
-  const ratio = window.devicePixelRatio || 1;
-  canvas.width = Math.max(640, Math.floor(rect.width * ratio));
-  canvas.height = Math.floor(320 * ratio);
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  const width = canvas.width / ratio;
-  const height = canvas.height / ratio;
+  if (!canvas || !ccCanvas || !details || !errors) return;
+  const setupCanvas = (target, height) => {
+    const targetRect = target.getBoundingClientRect();
+    const targetRatio = window.devicePixelRatio || 1;
+    target.width = Math.max(640, Math.floor(targetRect.width * targetRatio));
+    target.height = Math.floor(height * targetRatio);
+    const targetContext = target.getContext('2d');
+    targetContext.setTransform(targetRatio, 0, 0, targetRatio, 0, 0);
+    return {ctx: targetContext, width: target.width / targetRatio, height};
+  };
+  const chart = setupCanvas(canvas, 230);
+  const ccChart = setupCanvas(ccCanvas, 150);
+  const ctx = chart.ctx;
+  const ccCtx = ccChart.ctx;
+  const width = chart.width;
+  const height = chart.height;
+  const ccWidth = ccChart.width;
+  const ccHeight = ccChart.height;
   ctx.clearRect(0, 0, width, height);
+  ccCtx.clearRect(0, 0, ccWidth, ccHeight);
   const samples = data.samples || [];
   if (!samples.length) {
     ctx.fillStyle = '#9aa3b1';
     ctx.textAlign = 'center';
     ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
+    ccCtx.fillStyle = '#9aa3b1';
+    ccCtx.textAlign = 'center';
+    ccCtx.fillText('Нет данных CC-errors', ccWidth / 2, ccHeight / 2);
     details.innerHTML = '<div class="quality-card"><strong>Нет данных</strong>История собирается в памяти во время работы приложения.</div>';
     errors.innerHTML = '';
     qualityChart.points = [];
@@ -1201,10 +1387,12 @@ function drawQualityChart(data) {
   const left = 54, right = 46, top = 16, bottom = 34;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
+  const ccLeft = 54, ccRight = 46, ccTop = 16, ccBottom = 28;
+  const ccPlotW = ccWidth - ccLeft - ccRight;
+  const ccPlotH = ccHeight - ccTop - ccBottom;
   const endTs = data.generated_at || Math.floor(Date.now()/1000);
   const startTs = endTs - (data.period_seconds || qualityChart.period);
   const maxBitrate = Math.max(1000, ...samples.map(s=>Math.max(s.input_kbps || 0, s.output_kbps || 0))) * 1.15;
-  const maxCcErrors = Math.max(1, ...samples.map(s=>s.cc_errors || 0));
   ctx.strokeStyle = 'rgba(255,255,255,.09)';
   ctx.fillStyle = '#8e99aa';
   ctx.font = '9px Arial';
@@ -1214,13 +1402,6 @@ function drawQualityChart(data) {
     ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
     const kbps = Math.round(maxBitrate * (1 - i / 4));
     ctx.fillText(kbps + 'k', left - 7, y + 4);
-  }
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#ff9c9c';
-  for (let i=0;i<=4;i++) {
-    const y = top + plotH * i / 4;
-    const value = Math.round(maxCcErrors * (1 - i / 4));
-    ctx.fillText(value + ' cc', width - right + 8, y + 4);
   }
   ctx.textAlign = 'center';
   ctx.fillStyle = '#8e99aa';
@@ -1232,7 +1413,6 @@ function drawQualityChart(data) {
   }
   const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
   const yFor = kbps => top + plotH - (Math.min(kbps, maxBitrate) / maxBitrate) * plotH;
-  const ccYFor = value => top + plotH - (Math.min(value, maxCcErrors) / maxCcErrors) * plotH;
   const drawLine = (field, color) => {
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
@@ -1248,35 +1428,49 @@ function drawQualityChart(data) {
   };
   drawLine('input_kbps', '#58a6ff');
   drawLine('output_kbps', '#17c261');
-  const drawCcErrors = () => {
-    ctx.strokeStyle = '#ff5f5f';
-    ctx.fillStyle = 'rgba(255,95,95,.28)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    let started = false;
-    samples.forEach(s => {
-      const value = s.cc_errors || 0;
-      const x = xFor(s.ts);
-      const y = ccYFor(value);
-      if (value > 0) {
-        ctx.fillRect(x - 2, y, 4, top + plotH - y);
-      }
-      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
-    });
-    ctx.stroke();
-  };
-  drawCcErrors();
   qualityChart.points = [];
   const lastSample = samples[samples.length - 1] || {};
   samples.forEach(s => {
     const x = xFor(s.ts);
-    const y = (s.cc_errors || 0) > 0 ? ccYFor(s.cc_errors || 0) : yFor(s.output_kbps || s.input_kbps || 0);
-    ctx.fillStyle = (s.cc_errors || 0) > 0 ? '#ff5f5f' : qualityColor(s.level);
+    const y = yFor(s.output_kbps || s.input_kbps || 0);
+    ctx.fillStyle = qualityColor(s.level);
     ctx.beginPath();
-    ctx.arc(x, y, (s.cc_errors || 0) > 0 || s.level !== 'ok' ? 5 : 3, 0, Math.PI * 2);
+    ctx.arc(x, y, s.level !== 'ok' ? 5 : 3, 0, Math.PI * 2);
     ctx.fill();
     qualityChart.points.push({x, y, sample:s});
   });
+  const maxCcErrors = Math.max(1, ...samples.map(s=>s.cc_errors || 0));
+  const ccYFor = value => ccTop + ccPlotH - (Math.min(value, maxCcErrors) / maxCcErrors) * ccPlotH;
+  ccCtx.strokeStyle = 'rgba(255,255,255,.09)';
+  ccCtx.fillStyle = '#ff9c9c';
+  ccCtx.font = '9px Arial';
+  ccCtx.textAlign = 'right';
+  for (let i=0;i<=4;i++) {
+    const y = ccTop + ccPlotH * i / 4;
+    ccCtx.beginPath(); ccCtx.moveTo(ccLeft, y); ccCtx.lineTo(ccWidth - ccRight, y); ccCtx.stroke();
+    ccCtx.fillText(Math.round(maxCcErrors * (1 - i / 4)) + ' cc', ccLeft - 7, y + 4);
+  }
+  ccCtx.textAlign = 'center';
+  ccCtx.fillStyle = '#8e99aa';
+  for (let i=0;i<=6;i++) {
+    const x = ccLeft + ccPlotW * i / 6;
+    const ts = startTs + (endTs - startTs) * i / 6;
+    ccCtx.beginPath(); ccCtx.moveTo(x, ccTop); ccCtx.lineTo(x, ccTop + ccPlotH); ccCtx.stroke();
+    ccCtx.fillText(formatTime(ts, data.period_seconds), x, ccHeight - 8);
+  }
+  const ccXFor = ts => ccLeft + ((ts - startTs) / Math.max(1, endTs - startTs)) * ccPlotW;
+  ccCtx.strokeStyle = '#ff5f5f';
+  ccCtx.fillStyle = 'rgba(255,95,95,.28)';
+  ccCtx.lineWidth = 2;
+  ccCtx.beginPath();
+  let ccStarted = false;
+  samples.forEach(s => {
+    const x = ccXFor(s.ts);
+    const y = ccYFor(s.cc_errors || 0);
+    if ((s.cc_errors || 0) > 0) ccCtx.fillRect(x - 2, y, 4, ccTop + ccPlotH - y);
+    if (!ccStarted) { ccCtx.moveTo(x, y); ccStarted = true; } else { ccCtx.lineTo(x, y); }
+  });
+  ccCtx.stroke();
   const summary = data.summary || {};
   details.innerHTML = `
     <div class="quality-card"><strong>Период</strong>${formatTime(startTs, data.period_seconds)} — ${formatTime(endTs, data.period_seconds)}</div>
