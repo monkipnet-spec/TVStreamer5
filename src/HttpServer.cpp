@@ -187,6 +187,8 @@ void HttpServer::handleSession(tcp::socket socket) {
         if (req.method() == http::verb::get) {
             if (target.rfind("/stream/", 0) == 0 && handleHttpStream(socket, target)) {
                 return;
+            } else if (target.rfind("/preview/", 0) == 0 && servePreviewFile(target, res)) {
+              // servePreviewFile filled the response.
             } else if (target.rfind("/hls/", 0) == 0 && serveHlsFile(target, res)) {
                 // serveHlsFile filled the response.
             } else if (target == "/" || target == "/index.html") {
@@ -536,6 +538,46 @@ bool HttpServer::serveHlsFile(const std::string& target, http::response<http::st
     return true;
 }
 
+bool HttpServer::servePreviewFile(const std::string& target, http::response<http::string_body>& res) {
+  const std::string prefix = "/preview/";
+  const auto slash = target.find('/', prefix.size());
+  if (slash == std::string::npos) {
+    return false;
+  }
+  const std::string id = cleanPathToken(target.substr(prefix.size(), slash - prefix.size()));
+  const std::string rawFileName = target.substr(slash + 1);
+  const std::string fileName = cleanPathToken(rawFileName, true);
+  if (id.empty() || fileName.empty() || fileName != rawFileName || fileName.find("..") != std::string::npos) {
+    return false;
+  }
+  if (!streamManager.startPreview(id)) {
+    res.result(http::status::not_found);
+    res.set(http::field::content_type, "text/plain");
+    res.body() = "Preview unavailable";
+    return true;
+  }
+  const std::filesystem::path filePath =
+    std::filesystem::path(streamManager.previewDirectory(id)) / fileName;
+  if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+    res.result(http::status::not_found);
+    res.set(http::field::content_type, "text/plain");
+    res.body() = "Preview is warming up";
+    return true;
+  }
+  std::ifstream input(filePath, std::ios::binary);
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  res.body() = buffer.str();
+  if (filePath.extension() == ".m3u8") {
+    res.set(http::field::content_type, "application/vnd.apple.mpegurl");
+    res.set(http::field::cache_control, "no-cache");
+  } else {
+    res.set(http::field::content_type, "video/MP2T");
+    res.set(http::field::cache_control, "no-cache");
+  }
+  return true;
+}
+
 std::string HttpServer::qualityHistory(const std::string& target) {
     const std::string id = queryValue(target, "id");
     uint64_t periodSeconds = 3600;
@@ -807,6 +849,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-content.quality-modal{width:min(920px,100%)}
 .modal-content.network-modal{width:min(620px,100%)}
+.modal-content.preview-modal{width:min(960px,100%);padding:14px}
+.preview-video{display:block;width:100%;max-height:70vh;background:#05070b;border-radius:10px;object-fit:contain}
+.preview-status{min-height:20px;margin-top:9px;color:#9aa3b1;font-size:.8rem;overflow-wrap:anywhere}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
 .quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
 .quality-title{display:flex;flex-direction:column;gap:4px}
@@ -859,13 +904,14 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .network-table th{color:#9aa3b1;font-weight:600}
 .network-empty{padding:22px 0;text-align:center;color:#9aa3b1}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 </head>
 <body>
 <header>
 <div class="header-left">
 <div>
 <div class="title">Control Panel</div>
-<div class="subtitle">Мониторинг трансляций и управление потоками</div>
+<div class="subtitle" data-i18n="subtitle">Broadcast monitoring and stream control</div>
 </div>
 </div>
 <div class="header-center">
@@ -874,15 +920,16 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 <span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
 </div>
 <div class="stats-panel">
-<div class="status"><strong>Всего:</strong> <span id="totalCount">0</span></div>
-<div class="status"><strong>Активно:</strong> <span id="activeCount">0</span></div>
+<div class="status"><strong data-i18n="total">Total:</strong> <span id="totalCount">0</span></div>
+<div class="status"><strong data-i18n="active">Active:</strong> <span id="activeCount">0</span></div>
 </div>
-<button class="network-button" onclick="openNetworkModal()">Сеть</button>
+<button class="network-button" onclick="openNetworkModal()" data-i18n="network">Network</button>
 </div>
 <div class="header-right">
-<button class="button-secondary" onclick="openLoginModal()">Пользователь</button>
+<button class="button-secondary" onclick="toggleLanguage()" id="languageButton">RU</button>
+<button class="button-secondary" onclick="openLoginModal()" data-i18n="user">User</button>
 <button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
-<button class="button-primary" onclick="openStreamModal()">+ Добавить поток</button>
+<button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
 <button class="button-secondary" onclick="openAboutModal()">About</button>
 </div>
 </header>
@@ -892,6 +939,41 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 <div class="modal-content" id="modalContent"></div>
 </div>
 <script>
+const translations = {
+  en: {
+    subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', user:'User', addStream:'+ Add stream',
+    interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
+    online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
+    networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close', preview:'Preview', source:'Source', playHint:'Click Play to start playback.',
+    browserUnsupported:'Browser cannot play {type} directly. Output URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Could not play {type} in the browser. URL: {url}',
+    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality'
+  },
+  ru: {
+    subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
+    interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
+    online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
+    networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть', preview:'Просмотр', source:'Источник', playHint:'Нажмите Play для запуска воспроизведения.',
+    browserUnsupported:'Браузер не воспроизводит {type} напрямую. Выходной URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Не удалось воспроизвести поток {type} в браузере. URL: {url}',
+    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока'
+  }
+};
+let language = localStorage.getItem('tvstreamer-language') || 'en';
+function t(key, values={}) {
+  let value = translations[language]?.[key] || translations.en[key] || key;
+  Object.entries(values).forEach(([name, replacement]) => { value = value.replace(`{${name}}`, replacement); });
+  return value;
+}
+function applyLanguage() {
+  document.querySelectorAll('[data-i18n]').forEach(element => { element.textContent = t(element.dataset.i18n); });
+  const button = document.getElementById('languageButton');
+  if (button) button.textContent = language === 'en' ? 'RU' : 'EN';
+}
+function toggleLanguage() {
+  language = language === 'en' ? 'ru' : 'en';
+  localStorage.setItem('tvstreamer-language', language);
+  applyLanguage();
+  render();
+}
 let state = {};
 let networkRefreshTimer = null;
 function fetchState() {
@@ -906,7 +988,7 @@ function updateSystemLoad(metrics) {
   const interfaces = metrics.interfaces || [];
   table.innerHTML = interfaces.length ? interfaces.map(iface => `
     <tr><td>${iface.name}${iface.address ? ` (${iface.address})` : ''}</td><td>${Number(iface.rx_mbps || 0).toFixed(2)} Mbps</td><td>${Number(iface.tx_mbps || 0).toFixed(2)} Mbps</td></tr>
-  `).join('') : '<tr><td colspan="3" class="network-empty">Интерфейсы не найдены</td></tr>';
+  `).join('') : `<tr><td colspan="3" class="network-empty">${t('interfacesNotFound')}</td></tr>`;
 }
 function fetchSystemMetrics() {
   fetch('/api/system-metrics').then(r=>r.json()).then(updateSystemLoad).catch(()=>{});
@@ -950,21 +1032,25 @@ function render() {
       </div>
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
-        <div class="info-row"><strong>Вывод</strong><span>${outputType.toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
-        <div class="info-row"><strong>Активный вход</strong><span>${stream.active_input_label || 'Основной'} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
-        <div class="info-row"><strong>Основной</strong><span>${stream.input_uri || '—'}</span></div>
-        <div class="info-row"><strong>Резерв</strong><span>${stream.backup_input_uri || '—'}</span></div>
-        <div class="info-row"><strong>SID</strong><span>${stream.service_id || '—'}</span></div>
-        <div class="info-row"><strong>Bitrate In</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>Bitrate Out</strong><span>${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>Статус</strong><span>${stream.status}</span></div>
+        <div class="info-row"><strong>${t('output')}</strong><span>${outputType.toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
+        <div class="info-row"><strong>${t('activeInput')}</strong><span>${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
+        <div class="info-row"><strong>${t('bitrateIn')}</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
+        <div class="info-row"><strong>${t('bitrateOut')}</strong><span>${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
+        <div class="info-row"><strong>${t('status')}</strong><span>${stream.status}</span></div>
       </div>
       <div class="controls">
-        <button class="${stream.active ? 'stop-button' : 'start-button'}" onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? 'Стоп' : 'Старт'}</button>
-        <button onclick="editStream('${stream.id}')">Ред.</button>
-        <button class="quality-button" onclick="openQualityModal('${stream.id}')">График</button>
+        <button class="${stream.active ? 'stop-button' : 'start-button'}" onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? t('stop') : t('start')}</button>
+        <button onclick="editStream('${stream.id}')">${t('edit')}</button>
+        <button class="quality-button" onclick="openQualityModal('${stream.id}')">${t('chart')}</button>
         <button class="copy-button" onclick="copyLink('${stream.vlc_link}', this)">URL</button>
       </div>`;
+    tile.addEventListener('click', event => {
+      if (event.target.closest('button')) return;
+      openPreviewModal(stream.id);
+    });
     tiles.appendChild(tile);
   });
 }
@@ -979,16 +1065,16 @@ function toggleStream(id, active) {
 }
 function deleteStream(id) {
   const stream = state.streams.find(s=>s.id===id);
-  if (!stream || !window.confirm(`Удалить поток «${stream.name || stream.id}»?`)) return;
+  if (!stream || !window.confirm(`${t('removeConfirm')} «${stream.name || stream.id}»?`)) return;
   fetch('/api/delete-stream', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
     .then(()=>{ closeModal(); setTimeout(fetchState, 300); });
 }
 function openNetworkModal() {
   document.getElementById('modalContent').className = 'modal-content network-modal';
   document.getElementById('modalContent').innerHTML = `
-    <h2>Загрузка сетевых интерфейсов</h2>
-    <table class="network-table"><thead><tr><th>Интерфейс</th><th>Входящий</th><th>Исходящий</th></tr></thead><tbody id="networkTableBody"></tbody></table>
-    <div class="modal-actions"><button class="button-secondary" onclick="closeNetworkModal()">Закрыть</button></div>
+    <h2>${t('networkLoad')}</h2>
+    <table class="network-table"><thead><tr><th>${t('interface')}</th><th>${t('incoming')}</th><th>${t('outgoing')}</th></tr></thead><tbody id="networkTableBody"></tbody></table>
+    <div class="modal-actions"><button class="button-secondary" onclick="closeNetworkModal()">${t('close')}</button></div>
   `;
   document.getElementById('modal').classList.add('active');
   fetchSystemMetrics();
@@ -1005,22 +1091,70 @@ function editStream(id) {
   if (!stream) return;
   openStreamForm(stream);
 }
+function previewMimeType(stream) {
+  const type = normalizedOutputType(stream);
+  if (type === 'hls') return 'application/vnd.apple.mpegurl';
+  if (type === 'http') return 'video/mp2t';
+  return '';
+}
+function openPreviewModal(id) {
+  const stream = state.streams.find(s=>s.id===id);
+  if (!stream) return;
+  const type = normalizedOutputType(stream);
+  const source = (type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'srt' || type === 'rtmp' || type === 'youtube')
+    ? `/preview/${encodeURIComponent(stream.id)}/playlist.m3u8`
+    : (stream.vlc_link || '');
+  const canUseBrowserSource = type === 'http' || type === 'hls' || type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'srt' || type === 'rtmp' || type === 'youtube';
+  document.getElementById('modalContent').className = 'modal-content preview-modal';
+  document.getElementById('modalContent').innerHTML = `
+    <h2>${t('preview')}: ${stream.name || stream.id}</h2>
+    <video id="previewVideo" class="preview-video" controls autoplay muted playsinline></video>
+    <div id="previewStatus" class="preview-status"></div>
+    <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">${t('close')}</button></div>
+  `;
+  document.getElementById('modal').classList.add('active');
+  const video = document.getElementById('previewVideo');
+  const status = document.getElementById('previewStatus');
+  if (!canUseBrowserSource || !source) {
+    video.style.display = 'none';
+    status.textContent = t('browserUnsupported', {type:type.toUpperCase(), url:source || '—'});
+    return;
+  }
+  const mimeType = previewMimeType(stream);
+  if ((type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'hls' || type === 'srt' || type === 'rtmp' || type === 'youtube') && window.Hls && Hls.isSupported()) {
+    const hls = new Hls({liveSyncDurationCount: 2});
+    hls.loadSource(source);
+    hls.attachMedia(video);
+    video.previewHls = hls;
+    status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${source}`;
+  } else {
+    video.src = source;
+    if (mimeType) video.type = mimeType;
+    status.textContent = `${t('source')}: ${type.toUpperCase()} · ${source}`;
+  }
+  video.play().catch(() => {
+    status.textContent += ` · ${t('playHint')}`;
+  });
+  video.onerror = () => {
+    status.textContent = t('playbackFailed', {type:type.toUpperCase(), url:source});
+  };
+}
 function openAboutModal() {
   openModal(`
-    <h2>About</h2>
+    <h2>${t('about')}</h2>
     <div class="about-list">
-      <div class="about-row"><strong>Имя</strong><span>Лукомский Виталий</span></div>
-      <div class="about-row"><strong>Страна</strong><span>Беларусь, г. Борисов</span></div>
+      <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
+      <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
     </div>
     <div class="modal-actions">
-      <button class="button-primary" onclick="closeModal()">Закрыть</button>
+      <button class="button-primary" onclick="closeModal()">${t('close')}</button>
     </div>
   `);
 }
 function openLoginModal() {
   openModal(`
-    <h2>Пользователь</h2>
+    <h2>${t('userTitle')}</h2>
     <div class="form-grid full">
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
       <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
@@ -1028,8 +1162,8 @@ function openLoginModal() {
       <div class="form-row"><label>Порт web-интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
     </div>
     <div class="modal-actions">
-      <button class="button-secondary" onclick="closeModal()">Отмена</button>
-      <button class="button-primary" onclick="saveSettings()">Сохранить</button>
+      <button class="button-secondary" onclick="closeModal()">${t('cancel')}</button>
+      <button class="button-primary" onclick="saveSettings()">${t('save')}</button>
     </div>
   `);
 }
@@ -1538,6 +1672,7 @@ function loadInterfaces() {
     .catch(() => { state.interfaces=[]; return []; });
 }
 window.onload = () => {
+  applyLanguage();
   fetchState();
   loadInterfaces();
   setInterval(fetchState, 2000);
