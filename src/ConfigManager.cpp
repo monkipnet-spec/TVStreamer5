@@ -3,6 +3,9 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 
 StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     StreamConfig config;
@@ -90,6 +93,54 @@ ConfigManager::ConfigManager() {
     configPath = std::filesystem::current_path() / "tvstreamer5-config.json";
 }
 
+Json::Value SubscriberConfig::toJson() const {
+    Json::Value root;
+    root["name"] = name;
+    root["primary_ip"] = primaryIp;
+    root["backup_ip"] = backupIp;
+    root["added_at"] = addedAt;
+    Json::Value streams(Json::arrayValue);
+    for (const auto& id : streamIds) streams.append(id);
+    root["stream_ids"] = streams;
+    return root;
+}
+
+SubscriberConfig SubscriberConfig::fromJson(const Json::Value& root) {
+    SubscriberConfig subscriber;
+    subscriber.name = root.get("name", "").asString();
+    subscriber.primaryIp = root.get("primary_ip", "").asString();
+    subscriber.backupIp = root.get("backup_ip", "").asString();
+    subscriber.addedAt = root.get("added_at", "").asString();
+    if (root["stream_ids"].isArray()) {
+        for (const auto& id : root["stream_ids"]) {
+            subscriber.streamIds.push_back(id.asString());
+        }
+    }
+    return subscriber;
+}
+
+Json::Value SubscriberListConfig::toJson() const {
+    Json::Value root;
+    root["filtering_enabled"] = filteringEnabled;
+    Json::Value list(Json::arrayValue);
+    for (const auto& subscriber : subscribers) {
+        list.append(subscriber.toJson());
+    }
+    root["subscribers"] = list;
+    return root;
+}
+
+SubscriberListConfig SubscriberListConfig::fromJson(const Json::Value& root) {
+    SubscriberListConfig config;
+    config.filteringEnabled = root.get("filtering_enabled", false).asBool();
+    if (root["subscribers"].isArray()) {
+        for (const auto& item : root["subscribers"]) {
+            config.subscribers.push_back(SubscriberConfig::fromJson(item));
+        }
+    }
+    return config;
+}
+
 bool ConfigManager::load() {
     if (!std::filesystem::exists(configPath)) {
         std::cerr << "Config file not found, creating default configuration: " << configPath << std::endl;
@@ -98,23 +149,46 @@ bool ConfigManager::load() {
             std::lock_guard<std::mutex> lock(fileMutex);
             config = defaultConfig;
         }
-        return save();
+        if (!save()) return false;
+        return loadSubscribers();
     }
 
-    std::lock_guard<std::mutex> lock(fileMutex);
-    std::ifstream input(configPath);
-    if (!input.is_open()) {
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(fileMutex);
+        std::ifstream input(configPath);
+        if (!input.is_open()) {
+            return false;
+        }
+        Json::Value root;
+        Json::CharReaderBuilder readerBuilder;
+        std::string errs;
+        bool ok = Json::parseFromStream(readerBuilder, input, &root, &errs);
+        if (!ok) {
+            std::cerr << "Failed to parse config: " << errs << std::endl;
+            return false;
+        }
+        config = AppConfig::fromJson(root);
     }
+    return loadSubscribers();
+}
+
+bool ConfigManager::loadSubscribers() {
+    const auto path = std::filesystem::current_path() / "tvstreamer5-subscribers.json";
+    if (!std::filesystem::exists(path)) {
+        subscribers = SubscriberListConfig{};
+        return saveSubscribers();
+    }
+    std::lock_guard<std::mutex> lock(fileMutex);
+    std::ifstream input(path);
+    if (!input.is_open()) return false;
     Json::Value root;
     Json::CharReaderBuilder readerBuilder;
     std::string errs;
-    bool ok = Json::parseFromStream(readerBuilder, input, &root, &errs);
-    if (!ok) {
-        std::cerr << "Failed to parse config: " << errs << std::endl;
+    if (!Json::parseFromStream(readerBuilder, input, &root, &errs)) {
+        std::cerr << "Failed to parse subscribers config: " << errs << std::endl;
         return false;
     }
-    config = AppConfig::fromJson(root);
+    subscribers = SubscriberListConfig::fromJson(root);
     return true;
 }
 
@@ -129,5 +203,16 @@ bool ConfigManager::save() {
     writer["indentation"] = "  ";
     std::string str = Json::writeString(writer, config.toJson());
     output << str;
+    return true;
+}
+
+bool ConfigManager::saveSubscribers() {
+    std::lock_guard<std::mutex> lock(fileMutex);
+    const auto path = std::filesystem::current_path() / "tvstreamer5-subscribers.json";
+    std::ofstream output(path);
+    if (!output.is_open()) return false;
+    Json::StreamWriterBuilder writer;
+    writer["indentation"] = "  ";
+    output << Json::writeString(writer, subscribers.toJson());
     return true;
 }

@@ -45,13 +45,35 @@ struct AppConfig {
     static AppConfig fromJson(const Json::Value& root);
 };
 
+struct SubscriberConfig {
+    std::string name;
+    std::string primaryIp;
+    std::string backupIp;
+    std::string addedAt;
+    std::vector<std::string> streamIds;
+
+    Json::Value toJson() const;
+    static SubscriberConfig fromJson(const Json::Value& root);
+};
+
+struct SubscriberListConfig {
+    bool filteringEnabled = false;
+    std::vector<SubscriberConfig> subscribers;
+
+    Json::Value toJson() const;
+    static SubscriberListConfig fromJson(const Json::Value& root);
+};
+
 class ConfigManager {
 public:
     ConfigManager();
     bool load();
     bool save();
+    bool loadSubscribers();
+    bool saveSubscribers();
 
     AppConfig config;
+    SubscriberListConfig subscribers;
 
 private:
     std::filesystem::path configPath;

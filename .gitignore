@@ -4,5 +4,6 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 tvstreamer5-config.json
+tvstreamer5-subscribers.json
 .vscode/
 *.log

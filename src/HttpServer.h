@@ -41,6 +41,7 @@ private:
     void handleSession(tcp::socket socket);
     bool requiresAuthentication(const std::string& target) const;
     bool isAuthorized(const http::request<http::string_body>& req) const;
+    bool isStreamClientAllowed(const tcp::socket& socket, const std::string& target) const;
     void writeUnauthorized(http::response<http::string_body>& res) const;
     bool bindHttpPort(int port);
     void rebindHttpPort(int port);
@@ -54,6 +55,7 @@ private:
     void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
     void handleDeleteStream(const std::string& body);
+    void handleSaveSubscribers(const std::string& body);
     std::string renderIndexPage();
     void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 

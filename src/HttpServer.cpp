@@ -185,8 +185,14 @@ void HttpServer::handleSession(tcp::socket socket) {
         }
 
         if (req.method() == http::verb::get) {
-            if (target.rfind("/stream/", 0) == 0 && handleHttpStream(socket, target)) {
-                return;
+          if (target.rfind("/stream/", 0) == 0) {
+            if (!isStreamClientAllowed(socket, target)) {
+              res.result(http::status::forbidden);
+              res.set(http::field::content_type, "text/plain");
+              res.body() = "Stream access denied";
+            } else if (handleHttpStream(socket, target)) {
+              return;
+            }
             } else if (target.rfind("/hls/", 0) == 0 && serveHlsFile(target, res)) {
                 // serveHlsFile filled the response.
             } else if (target == "/" || target == "/index.html") {
@@ -227,6 +233,10 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleDeleteStream(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/save-subscribers") {
+                handleSaveSubscribers(req.body());
+                res.set(http::field::content_type, "application/json");
+                res.body() = "{\"result\": \"ok\"}";
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -271,6 +281,28 @@ bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const
     const std::string password = decoded.substr(separator + 1);
     return constantTimeEquals(login, configManager.config.login) &&
            constantTimeEquals(password, configManager.config.password);
+}
+
+bool HttpServer::isStreamClientAllowed(const tcp::socket& socket, const std::string& target) const {
+  if (!configManager.subscribers.filteringEnabled) {
+    return true;
+  }
+  boost::system::error_code ec;
+  const std::string clientIp = socket.remote_endpoint(ec).address().to_string();
+  if (ec) return false;
+  const std::string prefix = "/stream/";
+  const auto start = prefix.size();
+  const auto end = target.find('.', start);
+  const std::string streamId = cleanPathToken(target.substr(start, end == std::string::npos ? std::string::npos : end - start));
+  if (streamId.empty()) return false;
+  for (const auto& subscriber : configManager.subscribers.subscribers) {
+    const bool ipMatches = clientIp == subscriber.primaryIp || (!subscriber.backupIp.empty() && clientIp == subscriber.backupIp);
+    const bool streamMatches = std::find(subscriber.streamIds.begin(), subscriber.streamIds.end(), streamId) != subscriber.streamIds.end();
+    if (ipMatches && streamMatches) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void HttpServer::writeUnauthorized(http::response<http::string_body>& res) const {
@@ -436,6 +468,12 @@ std::string HttpServer::currentState() {
     root["telegram_chat_id"] = configManager.config.telegramChatId;
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
+    root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
+    Json::Value subscribers(Json::arrayValue);
+    for (const auto& subscriber : configManager.subscribers.subscribers) {
+      subscribers.append(subscriber.toJson());
+    }
+    root["subscribers"] = subscribers;
     Json::Value streams(Json::arrayValue);
     auto snap = streamManager.snapshot();
     for (const auto& cfg : configManager.config.streams) {
@@ -732,6 +770,29 @@ void HttpServer::handleStopStream(const std::string& body) {
     configManager.save();
   }
 
+  void HttpServer::handleSaveSubscribers(const std::string& body) {
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value root;
+    std::string errs;
+    std::istringstream ss(body);
+    if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
+      std::cerr << "Invalid subscribers payload: " << errs << std::endl;
+      return;
+    }
+    SubscriberListConfig next;
+    next.filteringEnabled = root.get("filtering_enabled", false).asBool();
+    if (root["subscribers"].isArray()) {
+      for (const auto& item : root["subscribers"]) {
+        auto subscriber = SubscriberConfig::fromJson(item);
+        if (!subscriber.name.empty() && (!subscriber.primaryIp.empty() || !subscriber.backupIp.empty())) {
+          next.subscribers.push_back(std::move(subscriber));
+        }
+      }
+    }
+    configManager.subscribers = std::move(next);
+    configManager.saveSubscribers();
+  }
+
 void HttpServer::addEndpoint(const std::string& path, std::function<void(const boost::asio::ip::tcp::socket&)> handler) {
     // Store endpoint handler for future use
     // This is a simple implementation - in a real server you'd want proper routing
@@ -859,6 +920,19 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .network-table th:first-child,.network-table td:first-child{text-align:left}
 .network-table th{color:#9aa3b1;font-weight:600}
 .network-empty{padding:22px 0;text-align:center;color:#9aa3b1}
+.subscriber-list{display:grid;gap:8px}
+.subscriber-row{display:grid;grid-template-columns:1.1fr 1fr 1fr 150px 34px;gap:6px;align-items:center}
+.subscriber-row input{width:100%;box-sizing:border-box;padding:7px 8px;background:#121825;border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#EEE;font-size:.78rem}
+.subscriber-row .remove-subscriber{width:30px;height:30px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;cursor:pointer}
+.subscriber-head{display:grid;grid-template-columns:1.1fr 1fr 1fr 150px 34px;gap:6px;color:#9aa3b1;font-size:.72rem;margin-bottom:4px}
+.subscriber-streams{grid-column:1/-1;display:flex;gap:5px;flex-wrap:wrap;padding:4px 0 8px 4px;border-bottom:1px solid rgba(255,255,255,.08)}
+.subscriber-streams label{display:flex;align-items:center;gap:4px;color:#cfd8ea;font-size:.72rem}
+.subscriber-stream-picker{grid-column:1/-1;position:relative;border-bottom:1px solid rgba(255,255,255,.08);padding:4px 0 8px 4px}
+.subscriber-stream-picker summary{display:inline-flex;align-items:center;gap:6px;padding:6px 9px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(255,255,255,.05);color:#d7deec;font-size:.76rem;cursor:pointer;list-style:none}
+.subscriber-stream-picker summary::-webkit-details-marker{display:none}
+.subscriber-stream-picker summary:after{content:'▾';color:#9aa3b1}
+.subscriber-stream-options{display:grid;gap:5px;margin-top:6px;padding:8px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px}
+.subscriber-stream-options label{display:flex;align-items:center;gap:6px;color:#cfd8ea;font-size:.76rem}
 </style>
 </head>
 <body>
@@ -885,6 +959,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 <button class="button-secondary" onclick="openLoginModal()" data-i18n="user">User</button>
 <button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
 <button class="button-secondary" onclick="downloadVlcPlaylist()" data-i18n="playlist">VLC playlist</button>
+<button class="button-secondary" onclick="openSubscribersModal()" data-i18n="subscribers">Subscribers</button>
 <button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
 <button class="button-secondary" onclick="openAboutModal()">About</button>
 </div>
@@ -901,14 +976,14 @@ const translations = {
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
-    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist'
+    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
-    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC'
+    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены'
   }
 };
 let language = localStorage.getItem('tvstreamer-language') || 'en';
@@ -1053,6 +1128,67 @@ function closeNetworkModal() {
   clearInterval(networkRefreshTimer);
   networkRefreshTimer = null;
   closeModal();
+}
+function openSubscribersModal() {
+  const renderSubscribers = () => {
+    const subscribers = state.subscribers || [];
+    const rows = subscribers.length ? subscribers.map((subscriber, index) => `
+      <div class="subscriber-row" data-index="${index}">
+        <input data-field="name" value="${subscriber.name || ''}" placeholder="${t('subscriberName')}" />
+        <input data-field="primary_ip" value="${subscriber.primary_ip || ''}" placeholder="${t('primaryIp')}" />
+        <input data-field="backup_ip" value="${subscriber.backup_ip || ''}" placeholder="${t('backupIp')}" />
+        <input data-field="added_at" type="date" value="${String(subscriber.added_at || '').slice(0, 10)}" />
+        <button class="remove-subscriber" onclick="removeSubscriber(${index})" aria-label="Remove">×</button>
+        <details class="subscriber-stream-picker">
+          <summary id="subscriberStreamsSummary-${index}">${t('streams')} (${(subscriber.stream_ids || []).length})</summary>
+          <div class="subscriber-stream-options">
+            ${(state.streams || []).map(stream => `<label><input type="checkbox" data-stream-id="${stream.id}" onchange="updateSubscriberStreamSummary(${index})" ${(subscriber.stream_ids || []).includes(stream.id) ? 'checked' : ''} />${stream.name || stream.id}</label>`).join('') || `<span>${t('noStreams')}</span>`}
+          </div>
+        </details>
+      </div>
+    `).join('') : `<div class="network-empty">${t('noSubscribers')}</div>`;
+    openModal(`
+      <h2>${t('subscribers')}</h2>
+      <div class="checkbox-inline"><input id="subscriberFiltering" type="checkbox" ${state.subscriber_filtering_enabled ? 'checked' : ''} /><span>${t('filtering')}</span></div>
+      <div class="subscriber-head"><span>${t('subscriberName')}</span><span>${t('primaryIp')}</span><span>${t('backupIp')}</span><span>${t('addedAt')}</span><span></span></div>
+      <div id="subscriberList" class="subscriber-list">${rows}</div>
+      <div class="modal-actions">
+        <button class="button-secondary" onclick="addSubscriber()">+ ${t('addSubscriber')}</button>
+        <button class="button-secondary" onclick="closeModal()">${t('cancel')}</button>
+        <button class="button-primary" onclick="saveSubscribers()">${t('save')}</button>
+      </div>
+    `);
+  };
+  renderSubscribers();
+}
+function addSubscriber() {
+  const subscribers = state.subscribers || (state.subscribers = []);
+  subscribers.push({name:'', primary_ip:'', backup_ip:'', added_at:new Date().toISOString().slice(0, 10)});
+  openSubscribersModal();
+}
+function removeSubscriber(index) {
+  (state.subscribers || []).splice(index, 1);
+  openSubscribersModal();
+}
+function updateSubscriberStreamSummary(index) {
+  const row = document.querySelector(`.subscriber-row[data-index="${index}"]`);
+  const summary = document.getElementById(`subscriberStreamsSummary-${index}`);
+  if (!row || !summary) return;
+  summary.textContent = `${t('streams')} (${row.querySelectorAll('[data-stream-id]:checked').length})`;
+}
+function saveSubscribers() {
+  const rows = [...document.querySelectorAll('.subscriber-row')];
+  const subscribers = rows.map(row => {
+    const value = field => row.querySelector(`[data-field="${field}"]`)?.value.trim() || '';
+    return {
+      name:value('name'), primary_ip:value('primary_ip'), backup_ip:value('backup_ip'), added_at:value('added_at'),
+      stream_ids:[...row.querySelectorAll('[data-stream-id]:checked')].map(input=>input.dataset.streamId)
+    };
+  });
+  fetch('/api/save-subscribers', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({filtering_enabled:document.getElementById('subscriberFiltering').checked, subscribers})
+  }).then(()=>{ state.subscribers=subscribers; state.subscriber_filtering_enabled=document.getElementById('subscriberFiltering').checked; closeModal(); });
 }
 function editStream(id) {
   const stream = state.streams.find(s=>s.id===id);
