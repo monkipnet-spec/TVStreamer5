@@ -647,72 +647,6 @@ StreamManager::~StreamManager() {
     stopAll();
 }
 
-std::string StreamManager::previewDirectory(const std::string& id) const {
-    return (std::filesystem::path("/tmp/tvstreamer5-preview") / id).string();
-}
-
-bool StreamManager::startPreview(const std::string& id) {
-    std::lock_guard<std::mutex> lock(managerMutex);
-    if (previewPipelines.count(id)) {
-        return true;
-    }
-    auto found = streams.find(id);
-    if (found == streams.end() || !found->second) {
-        return false;
-    }
-    const auto& cfg = found->second->config;
-    const std::string type = outputType(cfg);
-    if (!isUdpOutputType(type) && type != "srt" && type != "rtmp" && type != "youtube") {
-        return false;
-    }
-
-    const std::string directory = previewDirectory(id);
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
-    std::ostringstream description;
-    if (isUdpOutputType(type)) {
-        description << "udpsrc port=" << cfg.outputPort;
-        if (cfg.outputHost.rfind("22", 0) == 0 || cfg.outputHost.rfind("23", 0) == 0) {
-            description << " multicast-group=" << cfg.outputHost;
-        }
-        description << " caps=\"video/mpegts,systemstream=(boolean)true,packetsize=(int)188\""
-                    << " ! tsparse ! hlssink playlist-location=" << directory << "/playlist.m3u8"
-                    << " location=" << directory << "/segment%05d.ts target-duration=2 max-files=6 playlist-length=4";
-    } else if (type == "srt") {
-        const std::string mode = srtOutputMode(cfg) == "listener" ? "caller" : "listener";
-        const std::string host = cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" ? "127.0.0.1" : cfg.outputHost;
-        description << "srtsrc uri=\"srt://" << host << ":" << cfg.outputPort << "?mode=" << mode << "\""
-                    << " ! tsparse ! hlssink playlist-location=" << directory << "/playlist.m3u8"
-                    << " location=" << directory << "/segment%05d.ts target-duration=2 max-files=6 playlist-length=4";
-    } else {
-        const std::string location = rtmpOutputLocation(cfg);
-        description << "rtmpsrc location=\"" << location << "\" ! flvdemux name=demux "
-                    << "demux.video_0 ! queue ! h264parse ! mpegtsmux name=mux ! hlssink playlist-location="
-                    << directory << "/playlist.m3u8 location=" << directory << "/segment%05d.ts target-duration=2 max-files=6 playlist-length=4 "
-                    << "demux.audio_0 ! queue ! aacparse ! mux.";
-    }
-
-    GError* error = nullptr;
-    GstElement* pipeline = gst_parse_launch(description.str().c_str(), &error);
-    if (!pipeline) {
-        std::cerr << "Unable to create preview pipeline: "
-                  << (error ? error->message : "unknown error") << std::endl;
-        if (error) g_error_free(error);
-        return false;
-    }
-    if (error) {
-        std::cerr << "Preview pipeline warning: " << error->message << std::endl;
-        g_error_free(error);
-    }
-    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        return false;
-    }
-    previewPipelines[id] = pipeline;
-    return true;
-}
-
 bool StreamManager::startStream(const StreamConfig& streamConfig) {
     std::lock_guard<std::mutex> lock(managerMutex);
     if (streams.count(streamConfig.id)) {
@@ -799,12 +733,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
 
 bool StreamManager::stopStream(const std::string& id) {
     std::lock_guard<std::mutex> lock(managerMutex);
-    auto preview = previewPipelines.find(id);
-    if (preview != previewPipelines.end()) {
-        gst_element_set_state(preview->second, GST_STATE_NULL);
-        gst_object_unref(preview->second);
-        previewPipelines.erase(preview);
-    }
     if (!streams.count(id)) {
         return false;
     }
@@ -838,11 +766,6 @@ bool StreamManager::stopStream(const std::string& id) {
 
 void StreamManager::stopAll() {
     std::lock_guard<std::mutex> lock(managerMutex);
-    for (auto& [id, pipeline] : previewPipelines) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-    }
-    previewPipelines.clear();
     for (auto& [id, statePtr] : streams) {
         auto& state = *statePtr;
         state.running = false;

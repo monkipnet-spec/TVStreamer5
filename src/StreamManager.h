@@ -71,8 +71,6 @@ public:
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
     bool addHttpClient(const std::string& id, int fd);
-    bool startPreview(const std::string& id);
-    std::string previewDirectory(const std::string& id) const;
 
 private:
     bool gstreamerInitialized;
@@ -99,6 +97,5 @@ private:
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
-    std::map<std::string, GstElement*> previewPipelines;
     std::mutex managerMutex;
 };

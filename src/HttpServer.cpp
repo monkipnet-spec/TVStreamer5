@@ -187,8 +187,6 @@ void HttpServer::handleSession(tcp::socket socket) {
         if (req.method() == http::verb::get) {
             if (target.rfind("/stream/", 0) == 0 && handleHttpStream(socket, target)) {
                 return;
-            } else if (target.rfind("/preview/", 0) == 0 && servePreviewFile(target, res)) {
-              // servePreviewFile filled the response.
             } else if (target.rfind("/hls/", 0) == 0 && serveHlsFile(target, res)) {
                 // serveHlsFile filled the response.
             } else if (target == "/" || target == "/index.html") {
@@ -538,45 +536,6 @@ bool HttpServer::serveHlsFile(const std::string& target, http::response<http::st
     return true;
 }
 
-bool HttpServer::servePreviewFile(const std::string& target, http::response<http::string_body>& res) {
-  const std::string prefix = "/preview/";
-  const auto slash = target.find('/', prefix.size());
-  if (slash == std::string::npos) {
-    return false;
-  }
-  const std::string id = cleanPathToken(target.substr(prefix.size(), slash - prefix.size()));
-  const std::string rawFileName = target.substr(slash + 1);
-  const std::string fileName = cleanPathToken(rawFileName, true);
-  if (id.empty() || fileName.empty() || fileName != rawFileName || fileName.find("..") != std::string::npos) {
-    return false;
-  }
-  if (!streamManager.startPreview(id)) {
-    res.result(http::status::not_found);
-    res.set(http::field::content_type, "text/plain");
-    res.body() = "Preview unavailable";
-    return true;
-  }
-  const std::filesystem::path filePath =
-    std::filesystem::path(streamManager.previewDirectory(id)) / fileName;
-  if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
-    res.result(http::status::not_found);
-    res.set(http::field::content_type, "text/plain");
-    res.body() = "Preview is warming up";
-    return true;
-  }
-  std::ifstream input(filePath, std::ios::binary);
-  std::ostringstream buffer;
-  buffer << input.rdbuf();
-  res.body() = buffer.str();
-  if (filePath.extension() == ".m3u8") {
-    res.set(http::field::content_type, "application/vnd.apple.mpegurl");
-    res.set(http::field::cache_control, "no-cache");
-  } else {
-    res.set(http::field::content_type, "video/MP2T");
-    res.set(http::field::cache_control, "no-cache");
-  }
-  return true;
-}
 
 std::string HttpServer::qualityHistory(const std::string& target) {
     const std::string id = queryValue(target, "id");
@@ -849,9 +808,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-content.quality-modal{width:min(920px,100%)}
 .modal-content.network-modal{width:min(620px,100%)}
-.modal-content.preview-modal{width:min(960px,100%);padding:14px}
-.preview-video{display:block;width:100%;max-height:70vh;background:#05070b;border-radius:10px;object-fit:contain}
-.preview-status{min-height:20px;margin-top:9px;color:#9aa3b1;font-size:.8rem;overflow-wrap:anywhere}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
 .quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
 .quality-title{display:flex;flex-direction:column;gap:4px}
@@ -904,7 +860,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .network-table th{color:#9aa3b1;font-weight:600}
 .network-empty{padding:22px 0;text-align:center;color:#9aa3b1}
 </style>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 </head>
 <body>
 <header>
@@ -945,17 +900,15 @@ const translations = {
     subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', user:'User', addStream:'+ Add stream',
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
-    networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close', preview:'Preview', source:'Source', playHint:'Click Play to start playback.',
-    browserUnsupported:'Browser cannot play {type} directly. Output URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Could not play {type} in the browser. URL: {url}',
-    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', waitingForSignal:'waiting for input signal'
+    networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
+    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
-    networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть', preview:'Просмотр', source:'Источник', playHint:'Нажмите Play для запуска воспроизведения.',
-    browserUnsupported:'Браузер не воспроизводит {type} напрямую. Выходной URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Не удалось воспроизвести поток {type} в браузере. URL: {url}',
-    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', waitingForSignal:'ожидание входного сигнала'
+    networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
+    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC'
   }
 };
 let language = localStorage.getItem('tvstreamer-language') || 'en';
@@ -977,7 +930,6 @@ function toggleLanguage() {
 }
 let state = {};
 let networkRefreshTimer = null;
-let activePreviewHls = null;
 function fetchState() {
   Promise.all([fetch('/api/state').then(r=>r.json()), fetch('/api/system-metrics').then(r=>r.json())])
     .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics);});
@@ -1018,13 +970,7 @@ function openModal(html) {
   document.getElementById('modalContent').className = 'modal-content';
   document.getElementById('modal').classList.add('active');
 }
-function closeModal() {
-  if (activePreviewHls) {
-    activePreviewHls.destroy();
-    activePreviewHls = null;
-  }
-  document.getElementById('modal').classList.remove('active');
-}
+function closeModal() { document.getElementById('modal').classList.remove('active'); }
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
   if (raw === 'udp') return stream.cbr ? 'udp-cbr' : 'udp-vbr';
@@ -1073,10 +1019,6 @@ function render() {
         <button class="quality-button" onclick="openQualityModal('${stream.id}')">${t('chart')}</button>
         <button class="copy-button" onclick="copyLink('${stream.vlc_link}', this)">URL</button>
       </div>`;
-    tile.addEventListener('click', event => {
-      if (event.target.closest('button')) return;
-      openPreviewModal(stream.id);
-    });
     tiles.appendChild(tile);
   });
 }
@@ -1116,68 +1058,6 @@ function editStream(id) {
   const stream = state.streams.find(s=>s.id===id);
   if (!stream) return;
   openStreamForm(stream);
-}
-function previewMimeType(stream) {
-  const type = normalizedOutputType(stream);
-  if (type === 'hls') return 'application/vnd.apple.mpegurl';
-  if (type === 'http') return 'video/mp2t';
-  return '';
-}
-function openPreviewModal(id) {
-  const stream = state.streams.find(s=>s.id===id);
-  if (!stream) return;
-  const type = normalizedOutputType(stream);
-  const source = (type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'srt' || type === 'rtmp' || type === 'youtube')
-    ? `/preview/${encodeURIComponent(stream.id)}/playlist.m3u8`
-    : (stream.vlc_link || '');
-  const canUseBrowserSource = type === 'http' || type === 'hls' || type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'srt' || type === 'rtmp' || type === 'youtube';
-  document.getElementById('modalContent').className = 'modal-content preview-modal';
-  document.getElementById('modalContent').innerHTML = `
-    <h2>${t('preview')}: ${stream.name || stream.id}</h2>
-    <video id="previewVideo" class="preview-video" controls autoplay muted playsinline></video>
-    <div id="previewStatus" class="preview-status"></div>
-    <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">${t('close')}</button></div>
-  `;
-  document.getElementById('modal').classList.add('active');
-  const video = document.getElementById('previewVideo');
-  const status = document.getElementById('previewStatus');
-  if (!canUseBrowserSource || !source) {
-    video.style.display = 'none';
-    status.textContent = t('browserUnsupported', {type:type.toUpperCase(), url:source || '—'});
-    return;
-  }
-  const mimeType = previewMimeType(stream);
-  if ((type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'hls' || type === 'srt' || type === 'rtmp' || type === 'youtube') && window.Hls && Hls.isSupported()) {
-    const hls = new Hls({liveSyncDurationCount: 2});
-    activePreviewHls = hls;
-    hls.loadSource(source);
-    hls.attachMedia(video);
-    video.previewHls = hls;
-    status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${source}`;
-    hls.on(Hls.Events.ERROR, (_event, details) => {
-      if (!details.fatal && details.response?.code !== 404) return;
-      if (details.response?.code === 404 || details.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${t('waitingForSignal')}`;
-        return;
-      }
-      status.textContent = t('playbackFailed', {type:type.toUpperCase(), url:source});
-    });
-    setTimeout(() => {
-      if (video.readyState === HTMLMediaElement.HAVE_NOTHING && activePreviewHls === hls) {
-        status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${t('waitingForSignal')}`;
-      }
-    }, 2500);
-  } else {
-    video.src = source;
-    if (mimeType) video.type = mimeType;
-    status.textContent = `${t('source')}: ${type.toUpperCase()} · ${source}`;
-  }
-  video.play().catch(() => {
-    status.textContent += ` · ${t('playHint')}`;
-  });
-  video.onerror = () => {
-    status.textContent = t('playbackFailed', {type:type.toUpperCase(), url:source});
-  };
 }
 function openAboutModal() {
   openModal(`
