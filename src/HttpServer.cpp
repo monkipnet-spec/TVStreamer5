@@ -947,7 +947,7 @@ const translations = {
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close', preview:'Preview', source:'Source', playHint:'Click Play to start playback.',
     browserUnsupported:'Browser cannot play {type} directly. Output URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Could not play {type} in the browser. URL: {url}',
-    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist'
+    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', waitingForSignal:'waiting for input signal'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
@@ -955,7 +955,7 @@ const translations = {
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть', preview:'Просмотр', source:'Источник', playHint:'Нажмите Play для запуска воспроизведения.',
     browserUnsupported:'Браузер не воспроизводит {type} напрямую. Выходной URL: {url}', hlsPreview:'{type} -> HLS preview', playbackFailed:'Не удалось воспроизвести поток {type} в браузере. URL: {url}',
-    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC'
+    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', waitingForSignal:'ожидание входного сигнала'
   }
 };
 let language = localStorage.getItem('tvstreamer-language') || 'en';
@@ -977,6 +977,7 @@ function toggleLanguage() {
 }
 let state = {};
 let networkRefreshTimer = null;
+let activePreviewHls = null;
 function fetchState() {
   Promise.all([fetch('/api/state').then(r=>r.json()), fetch('/api/system-metrics').then(r=>r.json())])
     .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics);});
@@ -1017,7 +1018,13 @@ function openModal(html) {
   document.getElementById('modalContent').className = 'modal-content';
   document.getElementById('modal').classList.add('active');
 }
-function closeModal() { document.getElementById('modal').classList.remove('active'); }
+function closeModal() {
+  if (activePreviewHls) {
+    activePreviewHls.destroy();
+    activePreviewHls = null;
+  }
+  document.getElementById('modal').classList.remove('active');
+}
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
   if (raw === 'udp') return stream.cbr ? 'udp-cbr' : 'udp-vbr';
@@ -1142,10 +1149,24 @@ function openPreviewModal(id) {
   const mimeType = previewMimeType(stream);
   if ((type === 'udp-cbr' || type === 'udp-vbr' || type === 'udp' || type === 'hls' || type === 'srt' || type === 'rtmp' || type === 'youtube') && window.Hls && Hls.isSupported()) {
     const hls = new Hls({liveSyncDurationCount: 2});
+    activePreviewHls = hls;
     hls.loadSource(source);
     hls.attachMedia(video);
     video.previewHls = hls;
     status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${source}`;
+    hls.on(Hls.Events.ERROR, (_event, details) => {
+      if (!details.fatal && details.response?.code !== 404) return;
+      if (details.response?.code === 404 || details.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${t('waitingForSignal')}`;
+        return;
+      }
+      status.textContent = t('playbackFailed', {type:type.toUpperCase(), url:source});
+    });
+    setTimeout(() => {
+      if (video.readyState === HTMLMediaElement.HAVE_NOTHING && activePreviewHls === hls) {
+        status.textContent = `${t('source')}: ${t('hlsPreview', {type:type.toUpperCase()})} · ${t('waitingForSignal')}`;
+      }
+    }, 2500);
   } else {
     video.src = source;
     if (mimeType) video.type = mimeType;
