@@ -28,7 +28,16 @@ http://localhost:9000
 The default config file is `tvstreamer5-config.json` in the current working
 directory. The web UI is the recommended way to edit streams because it exposes
 input/output interfaces, output format, CBR, PID remap, Telegram settings, and
-backup source status in one place.
+backup source status in one place. It also provides stream start/stop/delete
+controls, live quality and system metrics, protocol-specific player links, a
+downloadable VLC playlist, subscriber management, and an English/Russian
+interface switch.
+
+The web UI and its API use HTTP Basic Authentication with the `login` and
+`password` values from `tvstreamer5-config.json`. The `/health` endpoint is
+available without authentication for health checks. HTTP TS and HLS player
+links are also unauthenticated; enable subscriber filtering when HTTP TS access
+must be restricted by client IP.
 
 ## Install on Linux
 
@@ -333,6 +342,44 @@ The stream tile shows the currently active input:
 
 The tile status changes to `Backup` while the backup URL is active.
 
+## Subscriber Access Control
+
+Subscriber settings are stored separately in
+`tvstreamer5-subscribers.json`. The web UI can add, enable, disable, and remove
+subscribers, assign streams to them, export the current list as
+`tvstreamer5-subscribers.txt`, and show the number of active HTTP sessions.
+Active sessions can be reset from the subscriber dialog; resetting disconnects
+the subscriber's current HTTP TS sessions.
+
+Set `filtering_enabled` to `true` to restrict HTTP TS playback. A request to
+`/stream/<stream-id>.ts` is allowed only when its source IP matches the enabled
+subscriber's `primary_ip` or `backup_ip`, and `<stream-id>` is included in that
+subscriber's `stream_ids`. When filtering is disabled, HTTP TS access is not
+restricted by the subscriber list. HLS files are not subject to this subscriber
+IP filter.
+
+Example:
+
+```json
+{
+  "filtering_enabled": true,
+  "subscribers": [
+    {
+      "name": "Subscriber 1",
+      "primary_ip": "192.168.1.50",
+      "backup_ip": "192.168.1.51",
+      "added_at": "2026-08-01",
+      "enabled": true,
+      "stream_ids": ["channel-1", "channel-2"]
+    }
+  ]
+}
+```
+
+The subscriber file is loaded from the current working directory alongside
+`tvstreamer5-config.json`. Changes made in the web UI are saved automatically
+when the subscriber dialog is saved.
+
 ## Telegram Notifications
 
 Configure `telegram_token` and `telegram_chat_id` in the web UI or config file
@@ -387,3 +434,9 @@ Minimal stream object:
 Use `"output_type": "udp-vbr"` for transparent UDP VBR output. The legacy
 `"output_type": "udp"` form is still accepted and chooses CBR/VBR from the
 `cbr` flag.
+
+The HTTP interface port is configured with `http_port`; the same port serves
+the web UI, HTTP TS streams, and HLS files. The `login` and `password` fields
+control Basic Authentication for the web UI and API. The UI can generate a VLC
+playlist containing all available `vlc_link` URLs; save it from the
+`VLC playlist` control as `tvstreamer5-playlist.m3u`.
