@@ -899,7 +899,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-content.quality-modal{width:min(920px,100%)}
 .modal-content.network-modal{width:min(620px,100%)}
-.modal-content.subscriber-modal{width:min(1280px,100%)}
+.modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
 .quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
 .quality-title{display:flex;flex-direction:column;gap:4px}
