@@ -954,7 +954,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .tile .controls .quality-button:hover{background:rgba(57,189,248,.24)}
 .modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(8,10,15,.78);display:none;align-items:center;justify-content:center;padding:12px;z-index:20}
 .modal.active{display:flex}
-.modal-content{background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
+.modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
+.modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
+.modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
 .modal-content.quality-modal{width:min(920px,100%)}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
@@ -1136,9 +1138,12 @@ function downloadVlcPlaylist() {
   link.remove();
   URL.revokeObjectURL(url);
 }
+function modalCloseButton() {
+  return `<button class="modal-close" onclick="closeModal()" aria-label="${t('close')}">×</button>`;
+}
 function openModal(html) {
   subscribersModalOpen = false;
-  document.getElementById('modalContent').innerHTML = html;
+  document.getElementById('modalContent').innerHTML = modalCloseButton() + html;
   document.getElementById('modalContent').className = 'modal-content';
   document.getElementById('modal').classList.add('active');
 }
@@ -1214,7 +1219,7 @@ function deleteStream(id) {
 }
 function openNetworkModal() {
   document.getElementById('modalContent').className = 'modal-content network-modal';
-  document.getElementById('modalContent').innerHTML = `
+  document.getElementById('modalContent').innerHTML = modalCloseButton() + `
     <h2>${t('networkLoad')}</h2>
     <table class="network-table"><thead><tr><th>${t('interface')}</th><th>${t('incoming')}</th><th>${t('outgoing')}</th></tr></thead><tbody id="networkTableBody"></tbody></table>
     <div class="modal-actions"><button class="button-secondary" onclick="closeNetworkModal()">${t('close')}</button></div>
@@ -1695,7 +1700,7 @@ function openQualityModal(id, periodSeconds=3600) {
   qualityChart.period = periodSeconds;
   document.getElementById('modalContent').className = 'modal-content quality-modal';
   const tabs = qualityPeriods.map(p=>`<button class="${p.seconds===periodSeconds?'active':''}" onclick="loadQualityHistory('${id}', ${p.seconds})">${p.label}</button>`).join('');
-  document.getElementById('modalContent').innerHTML = `
+  document.getElementById('modalContent').innerHTML = modalCloseButton() + `
     <div class="quality-head">
       <div class="quality-title">
         <h2>Качество потока</h2>
