@@ -514,10 +514,9 @@ std::string HttpServer::currentState() {
     Json::Value subscribers(Json::arrayValue);
     for (const auto& subscriber : configManager.subscribers.subscribers) {
       Json::Value item = subscriber.toJson();
-      const size_t primarySessions = subscriber.primaryIp.empty() ? 0 : streamManager.activeHttpSessions(subscriber.primaryIp);
-      const size_t backupSessions = subscriber.backupIp.empty() ? 0 : streamManager.activeHttpSessions(subscriber.backupIp);
-      item["active_sessions"] = Json::UInt64(primarySessions + backupSessions);
-      item["session_active"] = (primarySessions + backupSessions) > 0;
+      const size_t activeSessions = streamManager.activeSubscriberSessions(subscriber);
+      item["active_sessions"] = Json::UInt64(activeSessions);
+      item["session_active"] = activeSessions > 0;
       subscribers.append(item);
     }
     root["subscribers"] = subscribers;
@@ -1088,9 +1087,10 @@ function toggleLanguage() {
 }
 let state = {};
 let networkRefreshTimer = null;
+let subscribersModalOpen = false;
 function fetchState() {
   Promise.all([fetch('/api/state').then(r=>r.json()), fetch('/api/system-metrics').then(r=>r.json())])
-    .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics);});
+    .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics); refreshSubscriberSessions();});
 }
 function updateSystemLoad(metrics) {
   document.getElementById('cpuLoad').textContent = `${Number(metrics.cpu_percent || 0).toFixed(1)}%`;
@@ -1128,7 +1128,10 @@ function openModal(html) {
   document.getElementById('modalContent').className = 'modal-content';
   document.getElementById('modal').classList.add('active');
 }
-function closeModal() { document.getElementById('modal').classList.remove('active'); }
+function closeModal() {
+  subscribersModalOpen = false;
+  document.getElementById('modal').classList.remove('active');
+}
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
   if (raw === 'udp') return stream.cbr ? 'udp-cbr' : 'udp-vbr';
@@ -1244,8 +1247,24 @@ function openSubscribersModal() {
       </div>
     `);
     document.getElementById('modalContent').className = 'modal-content subscriber-modal';
+    subscribersModalOpen = true;
+    refreshSubscriberSessions();
   };
   renderSubscribers();
+}
+function refreshSubscriberSessions() {
+  if (!subscribersModalOpen) return;
+  const list = document.getElementById('subscriberList');
+  if (!list) return;
+  (state.subscribers || []).forEach((subscriber, index) => {
+    const row = list.querySelector(`.subscriber-row[data-index="${index}"]`);
+    const session = row?.querySelector('.subscriber-session');
+    const text = session?.querySelector('span');
+    if (!session || !text) return;
+    const active = !!subscriber.session_active;
+    session.classList.toggle('active', active);
+    text.textContent = active ? `${t('activeSession')} (${subscriber.active_sessions || 0})` : t('offlineSession');
+  });
 }
 function addSubscriber() {
   const subscribers = state.subscribers || (state.subscribers = []);
@@ -1270,7 +1289,7 @@ function updateSubscriberStatus(input) {
 function resetSubscriberSession(name) {
   fetch('/api/reset-subscriber', {
     method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})
-  }).then(()=>{ state.subscribers = (state.subscribers || []).map(subscriber => subscriber.name === name ? {...subscriber, session_active:false, active_sessions:0} : subscriber); openSubscribersModal(); });
+  }).then(()=>{ state.subscribers = (state.subscribers || []).map(subscriber => subscriber.name === name ? {...subscriber, session_active:false, active_sessions:0} : subscriber); refreshSubscriberSessions(); fetchState(); });
 }
 function saveSubscribers() {
   const rows = [...document.querySelectorAll('.subscriber-row')];
@@ -1285,7 +1304,7 @@ function saveSubscribers() {
   fetch('/api/save-subscribers', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({filtering_enabled:document.getElementById('subscriberFiltering').checked, subscribers})
-  }).then(()=>{ state.subscribers=subscribers; state.subscriber_filtering_enabled=document.getElementById('subscriberFiltering').checked; closeModal(); });
+  }).then(()=>{ state.subscribers=subscribers; state.subscriber_filtering_enabled=document.getElementById('subscriberFiltering').checked; closeModal(); fetchState(); });
 }
 function exportSubscribers() {
   const rows = [...document.querySelectorAll('.subscriber-row')];

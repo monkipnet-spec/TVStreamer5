@@ -26,6 +26,7 @@ constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
+constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
 constexpr const char* kTestPatternUri = "test://bars";
 
 bool hasElementFactory(const char* name) {
@@ -889,7 +890,7 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
 
     g_signal_connect(sink, "client-fd-removed", G_CALLBACK(StreamManager::onHttpClientFdRemoved), this);
     g_signal_emit_by_name(sink, "add", fd);
-    httpClients[fd] = {id, clientIp, "mpegts"};
+    httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts"};
     gst_object_unref(sink);
     return true;
 }
@@ -901,8 +902,11 @@ bool StreamManager::addStreamSession(const std::string& streamId, const std::str
 
     std::lock_guard<std::mutex> lock(managerMutex);
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
-    const std::string key = protocol + ":" + streamId + ":" + normalizedClientIp + ":" + std::to_string(nextSessionId.fetch_add(1, std::memory_order_relaxed));
-    adHocSessions[key] = {streamId, normalizedClientIp, protocol, socket};
+    const auto now = std::chrono::steady_clock::now();
+    const std::string key = protocol == "hls"
+        ? protocol + ":" + streamId + ":" + normalizedClientIp
+        : protocol + ":" + streamId + ":" + normalizedClientIp + ":" + std::to_string(nextSessionId.fetch_add(1, std::memory_order_relaxed));
+    adHocSessions[key] = {streamId, normalizedClientIp, protocol, now, socket};
     return true;
 }
 
@@ -933,6 +937,17 @@ void StreamManager::onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer us
     manager->httpClients.erase(fd);
 }
 
+void StreamManager::pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::time_point now) {
+    for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
+        const auto& session = it->second;
+        if (session.protocol == "hls" && now - session.lastActivity > kHlsSessionTtl) {
+            it = adHocSessions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void StreamManager::closeSrtSocket(int socket) const {
     if (socket < 0) {
         return;
@@ -957,6 +972,39 @@ size_t StreamManager::activeHttpSessions(const std::string& clientIp) const {
     return count;
 }
 
+size_t StreamManager::activeSubscriberSessions(const SubscriberConfig& subscriber) {
+    if (!subscriber.enabled || subscriber.streamIds.empty()) {
+        return 0;
+    }
+
+    const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
+    const std::string backupIp = normalizeIpAddress(subscriber.backupIp);
+    auto ipMatches = [&](const std::string& clientIp) {
+        const std::string normalizedClientIp = normalizeIpAddress(clientIp);
+        return normalizedClientIp == primaryIp || (!backupIp.empty() && normalizedClientIp == backupIp);
+    };
+    auto streamMatches = [&](const std::string& streamId) {
+        return std::find(subscriber.streamIds.begin(), subscriber.streamIds.end(), streamId) != subscriber.streamIds.end();
+    };
+
+    std::lock_guard<std::mutex> lock(managerMutex);
+    pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::now());
+    size_t count = 0;
+    for (const auto& [fd, session] : httpClients) {
+        (void)fd;
+        if (ipMatches(session.clientIp) && streamMatches(session.streamId)) {
+            ++count;
+        }
+    }
+    for (const auto& [key, session] : adHocSessions) {
+        (void)key;
+        if (ipMatches(session.clientIp) && streamMatches(session.streamId)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
     std::vector<std::pair<GstElement*, int>> sinks;
     std::vector<int> srtSockets;
@@ -964,6 +1012,7 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     {
         std::lock_guard<std::mutex> lock(managerMutex);
+        pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::now());
         for (auto it = httpClients.begin(); it != httpClients.end();) {
             if (normalizeIpAddress(it->second.clientIp) != normalizedClientIp) {
                 ++it;
@@ -1007,6 +1056,7 @@ size_t StreamManager::enforceSubscriberAccess() {
     size_t removed = 0;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
+        pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::now());
         for (auto it = httpClients.begin(); it != httpClients.end();) {
             if (isClientAllowedForStream(it->second.streamId, it->second.clientIp)) {
                 ++it;
