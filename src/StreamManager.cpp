@@ -681,14 +681,16 @@ StreamManager::~StreamManager() {
 }
 
 bool StreamManager::startStream(const StreamConfig& streamConfig) {
-    std::lock_guard<std::mutex> lock(managerMutex);
-    if (streams.count(streamConfig.id)) {
-        return false;
-    }
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        if (streams.count(streamConfig.id)) {
+            return false;
+        }
 
-    if (!gstreamerInitialized) {
-        gst_init(nullptr, nullptr);
-        gstreamerInitialized = true;
+        if (!gstreamerInitialized) {
+            gst_init(nullptr, nullptr);
+            gstreamerInitialized = true;
+        }
     }
 
     auto state = std::make_unique<StreamState>();
@@ -758,25 +760,71 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     }
 
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
-    streams[streamConfig.id] = std::move(state);
-    streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+    bool duplicateStart = false;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        if (streams.count(streamConfig.id)) {
+            duplicateStart = true;
+        } else {
+            streams[streamConfig.id] = std::move(state);
+            streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+        }
+    }
+    if (duplicateStart) {
+        state->running = false;
+        if (state->pipeline) {
+            gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        }
+        if (state->bus) {
+            gst_object_unref(state->bus);
+            state->bus = nullptr;
+        }
+        if (state->pipeline) {
+            gst_object_unref(state->pipeline);
+            state->pipeline = nullptr;
+        }
+        return false;
+    }
     notifyStreamState(streamConfig, "🟢", "Поток запущен", "Источник: основной\nURL: " + streamConfig.inputUri);
     return true;
 }
 
 bool StreamManager::stopStream(const std::string& id) {
-    std::lock_guard<std::mutex> lock(managerMutex);
-    if (!streams.count(id)) {
-        return false;
+    std::unique_ptr<StreamState> statePtr;
+    StreamConfig stoppedConfig;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = streams.find(id);
+        if (found == streams.end()) {
+            return false;
+        }
+
+        statePtr = std::move(found->second);
+        streams.erase(found);
+        stoppedConfig = statePtr->config;
+        statePtr->running = false;
+        statePtr->active = false;
+        statePtr->statusMessage = "stopped";
+
+        for (auto it = httpClients.begin(); it != httpClients.end();) {
+            if (it->second.streamId == id) {
+                it = httpClients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
+            if (it->second.streamId == id) {
+                it = adHocSessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
-    auto& state = *streams[id];
-    const StreamConfig stoppedConfig = state.config;
-    state.running = false;
+    auto& state = *statePtr;
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
-        state.active = false;
-        state.statusMessage = "stopped";
     }
     if (state.busThread.joinable()) {
         state.busThread.join();
@@ -792,17 +840,27 @@ bool StreamManager::stopStream(const std::string& id) {
     state.remapContext.reset();
     state.sourceContext.reset();
 
-    streams.erase(id);
     notifyStreamState(stoppedConfig, "⚪", "Поток остановлен", "Остановлен вручную");
     return true;
 }
 
 void StreamManager::stopAll() {
-    std::lock_guard<std::mutex> lock(managerMutex);
-    httpClients.clear();
-    for (auto& [id, statePtr] : streams) {
+    std::vector<std::unique_ptr<StreamState>> stoppedStreams;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        httpClients.clear();
+        adHocSessions.clear();
+        for (auto& [id, statePtr] : streams) {
+            (void)id;
+            statePtr->running = false;
+            statePtr->active = false;
+            stoppedStreams.push_back(std::move(statePtr));
+        }
+        streams.clear();
+    }
+
+    for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
-        state.running = false;
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
@@ -818,7 +876,6 @@ void StreamManager::stopAll() {
         state.remapContext.reset();
         state.sourceContext.reset();
     }
-    streams.clear();
 }
 
 std::vector<std::string> StreamManager::activeStreams() {

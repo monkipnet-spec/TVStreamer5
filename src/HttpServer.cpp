@@ -912,7 +912,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .button-primary{padding:8px 14px;border:none;border-radius:999px;color:#FFF;background:#1f8bff;cursor:pointer;font-size:0.88rem;transition:background .2s ease,color .2s ease,box-shadow .2s ease,opacity .2s ease}
 .button-secondary{padding:7px 12px;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:#EEE;background:rgba(255,255,255,.05);cursor:pointer;font-size:0.82rem;transition:background .2s ease,border-color .2s ease}
 .button-primary:hover{background:#0f7ce7}
-.button-primary.save-clean{background:rgba(255,255,255,.08);color:#9aa3b1;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12);cursor:default}
+.button-primary.save-clean{background:rgba(255,255,255,.08);color:#9aa3b1;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)}
 .button-primary.save-clean:hover{background:rgba(255,255,255,.08)}
 .button-primary.save-dirty{background:#ffbd4a;color:#161b25;box-shadow:0 0 0 2px rgba(255,189,74,.18)}
 .button-primary.save-dirty:hover{background:#ffc968}
@@ -1262,7 +1262,7 @@ function openSubscribersModal() {
         <button class="button-secondary" onclick="addSubscriber()">+ ${t('addSubscriber')}</button>
         <button class="button-secondary" onclick="exportSubscribers()">${t('exportSubscribers')}</button>
         <button class="button-secondary" onclick="closeModal()">${t('cancel')}</button>
-        <button id="saveSubscribersButton" class="button-primary save-clean" onclick="saveSubscribers()" disabled>${t('save')}</button>
+        <button id="saveSubscribersButton" class="button-primary save-clean" onclick="saveSubscribers()">${t('save')}</button>
       </div>
     `);
     document.getElementById('modalContent').className = 'modal-content subscriber-modal';
@@ -1302,7 +1302,6 @@ function updateSubscribersSaveButton() {
   const button = document.getElementById('saveSubscribersButton');
   if (!button) return;
   const dirty = serializeSubscriberPayload(collectSubscriberPayload()) !== subscriberFormBaseline;
-  button.disabled = !dirty;
   button.classList.toggle('save-dirty', dirty);
   button.classList.toggle('save-clean', !dirty);
 }
@@ -1360,7 +1359,6 @@ function resetSubscriberSession(name) {
 }
 function saveSubscribers() {
   const payload = collectSubscriberPayload();
-  if (serializeSubscriberPayload(payload) === subscriberFormBaseline) return;
   fetch('/api/save-subscribers', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify(payload)
