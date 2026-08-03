@@ -139,6 +139,29 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
 
 } // namespace
 
+std::string extractStreamIdFromTarget(const std::string& target) {
+    const std::string tsPrefix = "/stream/";
+    if (target.rfind(tsPrefix, 0) == 0) {
+        const auto start = tsPrefix.size();
+        if (target.size() <= start + 3 || target.substr(target.size() - 3) != ".ts") {
+            return "";
+        }
+        const auto end = target.find('.', start);
+        return cleanPathToken(target.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    }
+
+    const std::string hlsPrefix = "/hls/";
+    if (target.rfind(hlsPrefix, 0) == 0) {
+        const auto slash = target.find('/', hlsPrefix.size());
+        if (slash == std::string::npos) {
+            return "";
+        }
+        return cleanPathToken(target.substr(hlsPrefix.size(), slash - hlsPrefix.size()));
+    }
+
+    return "";
+}
+
 HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamManager& sm)
     : acceptor(ioc), configManager(cfg), streamManager(sm) {
 }
@@ -193,8 +216,14 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (handleHttpStream(socket, target)) {
               return;
             }
-            } else if (target.rfind("/hls/", 0) == 0 && serveHlsFile(target, res)) {
-                // serveHlsFile filled the response.
+            } else if (target.rfind("/hls/", 0) == 0) {
+                if (!isStreamClientAllowed(socket, target)) {
+                    res.result(http::status::forbidden);
+                    res.set(http::field::content_type, "text/plain");
+                    res.body() = "Stream access denied";
+                } else if (serveHlsFile(socket, target, res)) {
+                    // serveHlsFile filled the response.
+                }
             } else if (target == "/" || target == "/index.html") {
                 res.body() = renderIndexPage();
             } else if (target == "/api/interfaces") {
@@ -287,26 +316,31 @@ bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const
            constantTimeEquals(password, configManager.config.password);
 }
 
-bool HttpServer::isStreamClientAllowed(const tcp::socket& socket, const std::string& target) const {
+bool HttpServer::isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const {
   if (!configManager.subscribers.filteringEnabled) {
     return true;
   }
-  boost::system::error_code ec;
-  const std::string clientIp = socket.remote_endpoint(ec).address().to_string();
-  if (ec) return false;
-  const std::string prefix = "/stream/";
-  const auto start = prefix.size();
-  const auto end = target.find('.', start);
-  const std::string streamId = cleanPathToken(target.substr(start, end == std::string::npos ? std::string::npos : end - start));
-  if (streamId.empty()) return false;
+  if (streamId.empty() || clientIp.empty()) {
+    return false;
+  }
   for (const auto& subscriber : configManager.subscribers.subscribers) {
-      const bool ipMatches = subscriber.enabled && (clientIp == subscriber.primaryIp || (!subscriber.backupIp.empty() && clientIp == subscriber.backupIp));
+    const bool ipMatches = subscriber.enabled && (clientIp == subscriber.primaryIp || (!subscriber.backupIp.empty() && clientIp == subscriber.backupIp));
     const bool streamMatches = std::find(subscriber.streamIds.begin(), subscriber.streamIds.end(), streamId) != subscriber.streamIds.end();
     if (ipMatches && streamMatches) {
       return true;
     }
   }
   return false;
+}
+
+bool HttpServer::isStreamClientAllowed(const tcp::socket& socket, const std::string& target) const {
+  boost::system::error_code ec;
+  const std::string clientIp = socket.remote_endpoint(ec).address().to_string();
+  if (ec) {
+    return false;
+  }
+  const std::string streamId = extractStreamIdFromTarget(target);
+  return isClientAllowedForStream(streamId, clientIp);
 }
 
 void HttpServer::writeUnauthorized(http::response<http::string_body>& res) const {
@@ -548,7 +582,7 @@ bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target
     return true;
 }
 
-bool HttpServer::serveHlsFile(const std::string& target, http::response<http::string_body>& res) {
+bool HttpServer::serveHlsFile(const tcp::socket& socket, const std::string& target, http::response<http::string_body>& res) {
     const std::string prefix = "/hls/";
     const auto slash = target.find('/', prefix.size());
     if (slash == std::string::npos) {
@@ -575,6 +609,11 @@ bool HttpServer::serveHlsFile(const std::string& target, http::response<http::st
     std::ostringstream buffer;
     buffer << input.rdbuf();
     res.body() = buffer.str();
+    boost::system::error_code endpointError;
+    const std::string clientIp = socket.remote_endpoint(endpointError).address().to_string();
+    if (!endpointError && !clientIp.empty()) {
+        streamManager.addStreamSession(id, clientIp, "hls");
+    }
     if (filePath.extension() == ".m3u8") {
         res.set(http::field::content_type, "application/vnd.apple.mpegurl");
         res.set(http::field::cache_control, "no-cache");

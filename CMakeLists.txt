@@ -47,4 +47,6 @@ target_link_libraries(TVStreamer
     ${JSONCPP_LIBRARIES}
     ${Boost_LIBRARIES}
     pthread
+    glib-2.0
+    gio-2.0
 )

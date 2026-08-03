@@ -42,6 +42,7 @@ private:
     bool requiresAuthentication(const std::string& target) const;
     bool isAuthorized(const http::request<http::string_body>& req) const;
     bool isStreamClientAllowed(const tcp::socket& socket, const std::string& target) const;
+    bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
     void writeUnauthorized(http::response<http::string_body>& res) const;
     bool bindHttpPort(int port);
     void rebindHttpPort(int port);
@@ -50,7 +51,7 @@ private:
     std::string currentState();
     std::string qualityHistory(const std::string& target);
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
-    bool serveHlsFile(const std::string& target, http::response<http::string_body>& res);
+    bool serveHlsFile(const tcp::socket& socket, const std::string& target, http::response<http::string_body>& res);
     void handleSaveConfig(const std::string& body);
     void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);

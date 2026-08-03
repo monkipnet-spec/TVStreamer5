@@ -1,6 +1,7 @@
 #pragma once
 
 #include <gst/gst.h>
+#include <gio/gio.h>
 #include <jsoncpp/json/json.h>
 #include <array>
 #include <atomic>
@@ -71,6 +72,8 @@ public:
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
     bool addHttpClient(const std::string& id, int fd, const std::string& clientIp);
+    bool addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
+    bool removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
     size_t activeHttpSessions(const std::string& clientIp) const;
     size_t resetHttpSessions(const std::string& clientIp);
 
@@ -95,6 +98,10 @@ private:
     void updateBitrateEstimates(StreamState* state);
     static GstPadProbeReturn inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     static GstPadProbeReturn outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
+    bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
+    static gboolean onSrtCallerConnecting(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
+    static void onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
+    static void onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
 
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
@@ -102,8 +109,11 @@ private:
     struct HttpClientSession {
         std::string streamId;
         std::string clientIp;
+        std::string protocol;
     };
     std::map<int, HttpClientSession> httpClients;
+    std::map<std::string, HttpClientSession> adHocSessions;
     mutable std::mutex managerMutex;
+    std::atomic<uint64_t> nextSessionId{0};
     static void onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData);
 };
