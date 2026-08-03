@@ -320,11 +320,15 @@ bool HttpServer::isClientAllowedForStream(const std::string& streamId, const std
   if (!configManager.subscribers.filteringEnabled) {
     return true;
   }
-  if (streamId.empty() || clientIp.empty()) {
+  const std::string normalizedClientIp = normalizeIpAddress(clientIp);
+  if (streamId.empty() || normalizedClientIp.empty()) {
     return false;
   }
   for (const auto& subscriber : configManager.subscribers.subscribers) {
-    const bool ipMatches = subscriber.enabled && (clientIp == subscriber.primaryIp || (!subscriber.backupIp.empty() && clientIp == subscriber.backupIp));
+    const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
+    const std::string backupIp = normalizeIpAddress(subscriber.backupIp);
+    const bool ipMatches = subscriber.enabled &&
+      (normalizedClientIp == primaryIp || (!backupIp.empty() && normalizedClientIp == backupIp));
     const bool streamMatches = std::find(subscriber.streamIds.begin(), subscriber.streamIds.end(), streamId) != subscriber.streamIds.end();
     if (ipMatches && streamMatches) {
       return true;

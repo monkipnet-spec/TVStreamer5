@@ -351,12 +351,14 @@ subscribers, assign streams to them, export the current list as
 Active sessions can be reset from the subscriber dialog; resetting disconnects
 the subscriber's current HTTP TS sessions.
 
-Set `filtering_enabled` to `true` to restrict HTTP TS playback. A request to
-`/stream/<stream-id>.ts` is allowed only when its source IP matches the enabled
-subscriber's `primary_ip` or `backup_ip`, and `<stream-id>` is included in that
-subscriber's `stream_ids`. When filtering is disabled, HTTP TS access is not
-restricted by the subscriber list. HLS files are not subject to this subscriber
-IP filter.
+Set `filtering_enabled` to `true` to restrict HTTP TS, HLS, and SRT listener
+playback. A request to `/stream/<stream-id>.ts`, an HLS file under
+`/hls/<stream-id>/`, or an SRT caller connection is allowed only when its source
+IP matches the enabled subscriber's `primary_ip` or `backup_ip`, and the stream
+id is included in that subscriber's `stream_ids`. When filtering is disabled,
+stream playback is not restricted by the subscriber list. SRT listener access is
+checked against the configured TVStreamer5 stream id, so players do not need to
+send an SRT `streamid` value.
 
 Example:
 

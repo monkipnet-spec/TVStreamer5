@@ -27,6 +27,20 @@ std::string gstQuote(const std::string& value) {
     return result;
 }
 
+std::string normalizeIpAddress(const std::string& value) {
+    std::string normalized = value;
+    boost::algorithm::trim(normalized);
+    if (normalized.size() >= 2 && normalized.front() == '[' && normalized.back() == ']') {
+        normalized = normalized.substr(1, normalized.size() - 2);
+    }
+
+    const std::string ipv4MappedPrefix = "::ffff:";
+    if (boost::algorithm::istarts_with(normalized, ipv4MappedPrefix)) {
+        return normalized.substr(ipv4MappedPrefix.size());
+    }
+    return normalized;
+}
+
 std::vector<NetworkInterface> enumerateNetworkInterfaces() {
     std::vector<NetworkInterface> list;
     struct ifaddrs* ifaddr = nullptr;

@@ -60,7 +60,13 @@ std::string socketAddressToString(GSocketAddress* address) {
         return {};
     }
 
-    return g_inet_address_to_string(inetAddress);
+    gchar* raw = g_inet_address_to_string(inetAddress);
+    if (!raw) {
+        return {};
+    }
+    std::string result = normalizeIpAddress(raw);
+    g_free(raw);
+    return result;
 }
 
 struct SrtAccessContext {
@@ -976,11 +982,15 @@ bool StreamManager::isClientAllowedForStream(const std::string& streamId, const 
     if (!configManager.subscribers.filteringEnabled) {
         return true;
     }
-    if (streamId.empty() || clientIp.empty()) {
+    const std::string normalizedClientIp = normalizeIpAddress(clientIp);
+    if (streamId.empty() || normalizedClientIp.empty()) {
         return false;
     }
     for (const auto& subscriber : configManager.subscribers.subscribers) {
-        const bool ipMatches = subscriber.enabled && (clientIp == subscriber.primaryIp || (!subscriber.backupIp.empty() && clientIp == subscriber.backupIp));
+        const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
+        const std::string backupIp = normalizeIpAddress(subscriber.backupIp);
+        const bool ipMatches = subscriber.enabled &&
+            (normalizedClientIp == primaryIp || (!backupIp.empty() && normalizedClientIp == backupIp));
         const bool streamMatches = std::find(subscriber.streamIds.begin(), subscriber.streamIds.end(), streamId) != subscriber.streamIds.end();
         if (ipMatches && streamMatches) {
             return true;
@@ -996,10 +1006,14 @@ gboolean StreamManager::onSrtCallerConnecting(GstElement* sink, GSocketAddress* 
     }
 
     const std::string clientIp = socketAddressToString(addr);
-    const std::string streamKey = streamId ? streamId : ctx->streamId;
-    const bool allowed = ctx->manager->isClientAllowedForStream(streamKey, clientIp);
+    const std::string requestedStreamId = streamId ? streamId : "";
+    const bool allowed = ctx->manager->isClientAllowedForStream(ctx->streamId, clientIp);
     if (!allowed) {
-        std::cerr << "SRT access denied for stream " << streamKey << " from " << clientIp << std::endl;
+        std::cerr << "SRT access denied for stream " << ctx->streamId << " from " << clientIp;
+        if (!requestedStreamId.empty()) {
+            std::cerr << " requested_streamid=" << requestedStreamId;
+        }
+        std::cerr << std::endl;
     }
     return allowed ? TRUE : FALSE;
 }
