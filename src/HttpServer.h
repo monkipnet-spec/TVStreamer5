@@ -7,7 +7,9 @@
 #include <chrono>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <functional>
 #include <unordered_map>
@@ -37,15 +39,16 @@ private:
         std::string message;
     };
 
-    void doAccept();
+    void doAccept(std::shared_ptr<tcp::acceptor> listener, int port, uint64_t generation);
     void handleSession(tcp::socket socket);
     bool requiresAuthentication(const std::string& target) const;
     bool isAuthorized(const http::request<http::string_body>& req) const;
     bool isStreamClientAllowed(const tcp::socket& socket, const std::string& target) const;
     bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
     void writeUnauthorized(http::response<http::string_body>& res) const;
-    bool bindHttpPort(int port);
-    void rebindHttpPort(int port);
+    std::set<int> configuredHttpPorts() const;
+    bool bindHttpPorts(const std::set<int>& ports);
+    void refreshHttpPorts();
     std::string listInterfaces();
     std::string systemMetrics();
     std::string currentState();
@@ -61,7 +64,8 @@ private:
     std::string renderIndexPage();
     void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 
-    tcp::acceptor acceptor;
+    boost::asio::io_context& ioContext;
+    std::unordered_map<int, std::shared_ptr<tcp::acceptor>> acceptors;
     std::atomic<uint64_t> acceptGeneration{0};
     ConfigManager& configManager;
     StreamManager& streamManager;

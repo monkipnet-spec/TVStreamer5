@@ -110,6 +110,18 @@ std::string advertisedHost(const StreamConfig& cfg) {
     return cfg.outputHost;
 }
 
+int validPortOrDefault(int port, int defaultPort) {
+    return port > 0 && port <= 65535 ? port : defaultPort;
+}
+
+int streamHttpPort(const StreamConfig& cfg, int defaultPort) {
+    const std::string type = toLower(cfg.outputType);
+    if (type == "http" || type == "hls") {
+        return validPortOrDefault(cfg.outputPort, defaultPort);
+    }
+    return defaultPort;
+}
+
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = toLower(cfg.outputType);
     if (type == "srt") {
@@ -129,10 +141,10 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
             : "rtmp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
     }
     if (type == "http") {
-        return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/stream/" + cfg.id + ".ts";
+        return "http://" + advertisedHost(cfg) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/stream/" + cfg.id + ".ts";
     }
     if (type == "hls") {
-        return "http://" + advertisedHost(cfg) + ":" + std::to_string(httpPort) + "/hls/" + cfg.id + "/playlist.m3u8";
+        return "http://" + advertisedHost(cfg) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/hls/" + cfg.id + "/playlist.m3u8";
     }
     return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
 }
@@ -163,28 +175,29 @@ std::string extractStreamIdFromTarget(const std::string& target) {
 }
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamManager& sm)
-    : acceptor(ioc), configManager(cfg), streamManager(sm) {
+    : ioContext(ioc), configManager(cfg), streamManager(sm) {
 }
 
 bool HttpServer::start() {
-    return bindHttpPort(configManager.config.httpPort);
+    return bindHttpPorts(configuredHttpPorts());
 }
 
-void HttpServer::doAccept() {
-    if (!acceptor.is_open()) {
+void HttpServer::doAccept(std::shared_ptr<tcp::acceptor> listener, int port, uint64_t generation) {
+    if (!listener || !listener->is_open()) {
         return;
     }
 
-    const uint64_t generation = acceptGeneration.load();
-    acceptor.async_accept([this, generation](boost::system::error_code ec, tcp::socket socket) {
+    listener->async_accept([this, listener, port, generation](boost::system::error_code ec, tcp::socket socket) {
         if (generation != acceptGeneration.load()) {
             return;
         }
         if (!ec) {
             std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
+        } else if (ec != boost::asio::error::operation_aborted) {
+            std::cerr << "HTTP accept failed on port " << port << ": " << ec.message() << std::endl;
         }
-        if (acceptor.is_open()) {
-            doAccept();
+        if (listener->is_open()) {
+            doAccept(listener, port, generation);
         }
     });
 }
@@ -356,49 +369,86 @@ void HttpServer::writeUnauthorized(http::response<http::string_body>& res) const
     res.body() = "Unauthorized";
 }
 
-bool HttpServer::bindHttpPort(int port) {
-    if (port <= 0 || port > 65535) {
-        std::cerr << "Invalid HTTP port: " << port << std::endl;
-        return false;
+std::set<int> HttpServer::configuredHttpPorts() const {
+    std::set<int> ports;
+    if (configManager.config.httpPort > 0 && configManager.config.httpPort <= 65535) {
+        ports.insert(configManager.config.httpPort);
     }
-
-    boost::system::error_code ec;
-    ++acceptGeneration;
-    if (acceptor.is_open()) {
-        acceptor.cancel(ec);
-        acceptor.close(ec);
+    const int defaultPort = configManager.config.httpPort;
+    for (const auto& stream : configManager.config.streams) {
+        const std::string type = toLower(stream.outputType);
+        if ((type == "http" || type == "hls") && stream.outputPort > 0 && stream.outputPort <= 65535) {
+            ports.insert(streamHttpPort(stream, defaultPort));
+        }
     }
-
-    tcp::endpoint endpoint(tcp::v4(), static_cast<unsigned short>(port));
-    acceptor.open(endpoint.protocol(), ec);
-    if (ec) {
-        std::cerr << "HTTP server failed to open port " << port << ": " << ec.message() << std::endl;
-        return false;
+    if (ports.empty()) {
+        ports.insert(9000);
     }
-    acceptor.set_option(boost::asio::socket_base::reuse_address(true), ec);
-    if (ec) {
-        std::cerr << "HTTP server failed to set reuse_address: " << ec.message() << std::endl;
-        return false;
-    }
-    acceptor.bind(endpoint, ec);
-    if (ec) {
-        std::cerr << "HTTP server failed to bind port " << port << ": " << ec.message() << std::endl;
-        return false;
-    }
-    acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
-    if (ec) {
-        std::cerr << "HTTP server failed to listen on port " << port << ": " << ec.message() << std::endl;
-        return false;
-    }
-
-    doAccept();
-    std::cerr << "HTTP server listening on port " << port << std::endl;
-    return true;
+    return ports;
 }
 
-void HttpServer::rebindHttpPort(int port) {
-    boost::asio::post(acceptor.get_executor(), [this, port]() {
-        bindHttpPort(port);
+bool HttpServer::bindHttpPorts(const std::set<int>& ports) {
+    boost::system::error_code ec;
+    const uint64_t generation = acceptGeneration.fetch_add(1) + 1;
+
+    for (auto& [port, listener] : acceptors) {
+        (void)port;
+        if (listener && listener->is_open()) {
+            listener->cancel(ec);
+            listener->close(ec);
+        }
+    }
+
+    std::unordered_map<int, std::shared_ptr<tcp::acceptor>> nextAcceptors;
+    for (int port : ports) {
+        if (port <= 0 || port > 65535) {
+            std::cerr << "Invalid HTTP port: " << port << std::endl;
+            continue;
+        }
+
+        auto listener = std::make_shared<tcp::acceptor>(ioContext);
+        tcp::endpoint endpoint(tcp::v4(), static_cast<unsigned short>(port));
+        listener->open(endpoint.protocol(), ec);
+        if (ec) {
+            std::cerr << "HTTP server failed to open port " << port << ": " << ec.message() << std::endl;
+            ec.clear();
+            continue;
+        }
+        listener->set_option(boost::asio::socket_base::reuse_address(true), ec);
+        if (ec) {
+            std::cerr << "HTTP server failed to set reuse_address on port " << port << ": " << ec.message() << std::endl;
+            ec.clear();
+            continue;
+        }
+        listener->bind(endpoint, ec);
+        if (ec) {
+            std::cerr << "HTTP server failed to bind port " << port << ": " << ec.message() << std::endl;
+            ec.clear();
+            continue;
+        }
+        listener->listen(boost::asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            std::cerr << "HTTP server failed to listen on port " << port << ": " << ec.message() << std::endl;
+            ec.clear();
+            continue;
+        }
+
+        doAccept(listener, port, generation);
+        nextAcceptors[port] = std::move(listener);
+        std::cerr << "HTTP server listening on port " << port << std::endl;
+    }
+
+    const bool primaryBound = nextAcceptors.count(configManager.config.httpPort) > 0;
+    acceptors = std::move(nextAcceptors);
+    if (!primaryBound) {
+        std::cerr << "HTTP server primary port is not listening: " << configManager.config.httpPort << std::endl;
+    }
+    return primaryBound;
+}
+
+void HttpServer::refreshHttpPorts() {
+    boost::asio::post(ioContext, [this]() {
+        bindHttpPorts(configuredHttpPorts());
     });
 }
 
@@ -759,7 +809,6 @@ void HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Invalid config payload: " << errs << std::endl;
         return;
     }
-    const int previousHttpPort = configManager.config.httpPort;
     AppConfig nextConfig = AppConfig::fromJson(root);
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
@@ -775,9 +824,7 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     }
     configManager.config = nextConfig;
     configManager.save();
-    if (configManager.config.httpPort != previousHttpPort) {
-        rebindHttpPort(configManager.config.httpPort);
-    }
+    refreshHttpPorts();
 }
 
 void HttpServer::handleStartStream(const std::string& body) {
@@ -1006,6 +1053,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .about-row strong{color:#9aa3b1;font-weight:600}
 .about-row span,.about-row a{color:#fff;text-decoration:none;overflow-wrap:anywhere}
 .about-row a:hover{color:#7dd1ff}
+.about-donate{align-items:start}
+.about-donate-content{display:grid;grid-template-columns:148px minmax(0,1fr);gap:12px;align-items:center}
+.about-qr{width:148px;height:148px;display:block;background:#fff;border-radius:8px;padding:8px;box-sizing:border-box}
+.about-donate-address{font-family:monospace;font-size:.82rem;line-height:1.45}
+@media (max-width:560px){.about-donate-content{grid-template-columns:1fr}.about-qr{width:132px;height:132px}}
 .network-table{width:100%;border-collapse:collapse;color:#d7deec;font-size:.85rem}
 .network-table th,.network-table td{padding:9px 6px;text-align:right;border-bottom:1px solid rgba(255,255,255,.08)}
 .network-table th:first-child,.network-table td:first-child{text-align:left}
@@ -1072,17 +1124,19 @@ const translations = {
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
-    about:'About', name:'Name', country:'Country', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
+    about:'About', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
-    about:'About', name:'Имя', country:'Страна', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
+    about:'About', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
 };
 let language = localStorage.getItem('tvstreamer-language') || 'en';
+const donateAddress = 'UQD1uQn5WxhzKLXjL0KOVuJDcRU65pYzgt6pm_gzJM-vT-cN';
+const donateQrPath = 'M4 4h7v1H4zM12 4h1v1H12zM14 4h3v1H14zM25 4h3v1H25zM30 4h7v1H30zM4 5h1v1H4zM10 5h1v1H10zM13 5h1v1H13zM15 5h1v1H15zM17 5h2v1H17zM20 5h3v1H20zM26 5h1v1H26zM28 5h1v1H28zM30 5h1v1H30zM36 5h1v1H36zM4 6h1v1H4zM6 6h3v1H6zM10 6h1v1H10zM12 6h3v1H12zM16 6h1v1H16zM18 6h2v1H18zM22 6h1v1H22zM25 6h2v1H25zM28 6h1v1H28zM30 6h1v1H30zM32 6h3v1H32zM36 6h1v1H36zM4 7h1v1H4zM6 7h3v1H6zM10 7h1v1H10zM14 7h1v1H14zM16 7h1v1H16zM18 7h1v1H18zM20 7h1v1H20zM22 7h1v1H22zM24 7h2v1H24zM27 7h2v1H27zM30 7h1v1H30zM32 7h3v1H32zM36 7h1v1H36zM4 8h1v1H4zM6 8h3v1H6zM10 8h1v1H10zM14 8h11v1H14zM26 8h2v1H26zM30 8h1v1H30zM32 8h3v1H32zM36 8h1v1H36zM4 9h1v1H4zM10 9h1v1H10zM12 9h1v1H12zM15 9h1v1H15zM20 9h1v1H20zM22 9h1v1H22zM24 9h1v1H24zM26 9h1v1H26zM30 9h1v1H30zM36 9h1v1H36zM4 10h7v1H4zM12 10h1v1H12zM14 10h1v1H14zM16 10h1v1H16zM18 10h1v1H18zM20 10h1v1H20zM22 10h1v1H22zM24 10h1v1H24zM26 10h1v1H26zM28 10h1v1H28zM30 10h7v1H30zM13 11h1v1H13zM16 11h1v1H16zM22 11h1v1H22zM27 11h2v1H27zM4 12h1v1H4zM6 12h1v1H6zM10 12h2v1H10zM14 12h2v1H14zM17 12h1v1H17zM19 12h1v1H19zM21 12h1v1H21zM23 12h1v1H23zM25 12h1v1H25zM27 12h2v1H27zM31 12h1v1H31zM34 12h1v1H34zM36 12h1v1H36zM4 13h2v1H4zM9 13h1v1H9zM11 13h3v1H11zM16 13h1v1H16zM18 13h2v1H18zM24 13h3v1H24zM28 13h3v1H28zM35 13h2v1H35zM5 14h2v1H5zM10 14h1v1H10zM15 14h1v1H15zM17 14h7v1H17zM25 14h1v1H25zM27 14h2v1H27zM30 14h2v1H30zM34 14h1v1H34zM36 14h1v1H36zM6 15h3v1H6zM11 15h1v1H11zM16 15h1v1H16zM18 15h3v1H18zM22 15h3v1H22zM26 15h2v1H26zM29 15h5v1H29zM35 15h2v1H35zM6 16h1v1H6zM8 16h1v1H8zM10 16h1v1H10zM17 16h6v1H17zM24 16h1v1H24zM30 16h2v1H30zM33 16h2v1H33zM36 16h1v1H36zM4 17h3v1H4zM8 17h2v1H8zM13 17h1v1H13zM15 17h1v1H15zM18 17h1v1H18zM20 17h3v1H20zM24 17h2v1H24zM27 17h5v1H27zM33 17h1v1H33zM35 17h1v1H35zM4 18h2v1H4zM8 18h3v1H8zM12 18h2v1H12zM15 18h2v1H15zM18 18h1v1H18zM20 18h1v1H20zM22 18h1v1H22zM24 18h4v1H24zM30 18h1v1H30zM33 18h2v1H33zM36 18h1v1H36zM5 19h1v1H5zM8 19h2v1H8zM11 19h1v1H11zM13 19h1v1H13zM18 19h3v1H18zM23 19h2v1H23zM28 19h2v1H28zM31 19h2v1H31zM35 19h1v1H35zM6 20h1v1H6zM9 20h2v1H9zM13 20h1v1H13zM15 20h3v1H15zM21 20h1v1H21zM24 20h1v1H24zM30 20h2v1H30zM36 20h1v1H36zM4 21h1v1H4zM7 21h3v1H7zM14 21h1v1H14zM16 21h2v1H16zM19 21h1v1H19zM21 21h1v1H21zM24 21h1v1H24zM27 21h3v1H27zM31 21h1v1H31zM33 21h1v1H33zM36 21h1v1H36zM8 22h1v1H8zM10 22h1v1H10zM13 22h1v1H13zM15 22h1v1H15zM17 22h1v1H17zM19 22h1v1H19zM23 22h1v1H23zM26 22h4v1H26zM32 22h3v1H32zM36 22h1v1H36zM6 23h1v1H6zM8 23h2v1H8zM14 23h2v1H14zM18 23h1v1H18zM20 23h2v1H20zM23 23h1v1H23zM26 23h1v1H26zM30 23h1v1H30zM36 23h1v1H36zM5 24h2v1H5zM8 24h1v1H8zM10 24h2v1H10zM13 24h2v1H13zM16 24h2v1H16zM19 24h1v1H19zM21 24h1v1H21zM25 24h1v1H25zM28 24h1v1H28zM30 24h1v1H30zM32 24h1v1H32zM35 24h1v1H35zM5 25h2v1H5zM8 25h1v1H8zM17 25h2v1H17zM25 25h1v1H25zM27 25h1v1H27zM31 25h1v1H31zM33 25h1v1H33zM35 25h1v1H35zM4 26h2v1H4zM9 26h2v1H9zM12 26h1v1H12zM14 26h1v1H14zM16 26h1v1H16zM18 26h2v1H18zM21 26h1v1H21zM23 26h1v1H23zM26 26h2v1H26zM30 26h1v1H30zM32 26h2v1H32zM36 26h1v1H36zM7 27h1v1H7zM11 27h1v1H11zM13 27h1v1H13zM15 27h2v1H15zM18 27h1v1H18zM28 27h6v1H28zM4 28h4v1H4zM10 28h2v1H10zM13 28h1v1H13zM17 28h3v1H17zM23 28h3v1H23zM28 28h5v1H28zM35 28h2v1H35zM12 29h3v1H12zM18 29h1v1H18zM20 29h1v1H20zM24 29h2v1H24zM28 29h1v1H28zM32 29h1v1H32zM35 29h2v1H35zM4 30h7v1H4zM12 30h1v1H12zM14 30h1v1H14zM16 30h2v1H16zM19 30h6v1H19zM28 30h1v1H28zM30 30h1v1H30zM32 30h1v1H32zM34 30h1v1H34zM36 30h1v1H36zM4 31h1v1H4zM10 31h1v1H10zM16 31h4v1H16zM22 31h1v1H22zM27 31h2v1H27zM32 31h2v1H32zM35 31h1v1H35zM4 32h1v1H4zM6 32h3v1H6zM10 32h1v1H10zM13 32h2v1H13zM16 32h1v1H16zM19 32h14v1H19zM35 32h1v1H35zM4 33h1v1H4zM6 33h3v1H6zM10 33h1v1H10zM15 33h1v1H15zM18 33h1v1H18zM20 33h1v1H20zM22 33h1v1H22zM24 33h2v1H24zM29 33h1v1H29zM31 33h1v1H31zM35 33h2v1H35zM4 34h1v1H4zM6 34h3v1H6zM10 34h1v1H10zM12 34h1v1H12zM15 34h3v1H15zM20 34h1v1H20zM22 34h1v1H22zM24 34h2v1H24zM27 34h1v1H27zM32 34h5v1H32zM4 35h1v1H4zM10 35h1v1H10zM13 35h1v1H13zM16 35h1v1H16zM19 35h2v1H19zM22 35h3v1H22zM30 35h2v1H30zM33 35h1v1H33zM4 36h7v1H4zM12 36h2v1H12zM15 36h1v1H15zM17 36h2v1H17zM21 36h1v1H21zM26 36h1v1H26zM28 36h2v1H28zM32 36h2v1H32zM36 36h1v1H36z';
 function t(key, values={}) {
   let value = translations[language]?.[key] || translations.en[key] || key;
   Object.entries(values).forEach(([name, replacement]) => { value = value.replace(`{${name}}`, replacement); });
@@ -1410,6 +1464,13 @@ function openAboutModal() {
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
+      <div class="about-row about-donate"><strong>${t('donate')}</strong><div class="about-donate-content">
+        <svg class="about-qr" viewBox="0 0 41 41" role="img" aria-label="${t('donateQr')}" shape-rendering="crispEdges">
+          <rect width="41" height="41" fill="#fff"></rect>
+          <path d="${donateQrPath}" fill="#111"></path>
+        </svg>
+        <span class="about-donate-address">${donateAddress}</span>
+      </div></div>
     </div>
     <div class="modal-actions">
       <button class="button-primary" onclick="closeModal()">${t('close')}</button>
@@ -1469,7 +1530,7 @@ function openStreamForm(stream) {
         <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp-vbr" ${outputType==='udp-vbr'?'selected':''}>UDP MPEG-TS VBR</option><option value="udp-cbr" ${outputType==='udp-cbr'?'selected':''}>UDP MPEG-TS CBR</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
         <div class="form-row" id="streamOutputModeRow"><label>Режим SRT выхода</label><select class="compact" id="streamOutputMode" onchange="updateOutputHints()"><option value="listener" ${(!stream.output_mode || stream.output_mode==='listener')?'selected':''}>SRT Listener</option><option value="caller" ${stream.output_mode==='caller'?'selected':''}>SRT Caller</option></select></div>
         <div class="form-row"><label id="streamOutputHostLabel">Адрес выхода</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
-        <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" value="${stream.output_port||1234}" placeholder="1234" /></div>
+        <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" min="1" max="65535" value="${stream.output_port||1234}" placeholder="1234" /></div>
         <div class="form-row full"><label>URL для плеера</label><input class="compact" id="streamPreviewUrl" readonly value="${stream.vlc_link||''}" placeholder="Ссылка появится после сохранения" /></div>
         <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
         <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
@@ -1514,9 +1575,9 @@ function updateOutputHints() {
   }
   if (type === 'http' || type === 'hls') {
     hostLabel.textContent = 'Адрес для ссылки';
-    portLabel.textContent = 'Порт панели';
-    port.value = state.http_port || port.value || 9000;
-    port.disabled = true;
+    portLabel.textContent = type === 'hls' ? 'HLS порт' : 'HTTP порт';
+    port.disabled = false;
+    port.placeholder = String(state.http_port || 9000);
     host.placeholder = 'IP интерфейса или DNS';
   } else if (type === 'srt') {
     hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';

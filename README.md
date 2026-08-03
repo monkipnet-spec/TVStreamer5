@@ -311,8 +311,12 @@ SRT:  output_mode selects listener or caller. In listener mode, output_host is
       the address advertised in the SRT player URL and TVStreamer5 binds SRT to
       interface_address or 0.0.0.0. In caller mode, output_host is the remote
       SRT listener to connect to. output_port is the SRT port in both modes.
-HTTP: output_host is the address advertised in the player URL; port is web UI port.
-HLS:  output_host is the address advertised in the player URL; port is web UI port.
+HTTP: output_host is the address advertised in the player URL; output_port is
+      the HTTP TS port. TVStreamer5 listens on this port in addition to the web
+      UI port.
+HLS:  output_host is the address advertised in the player URL; output_port is
+      the HLS port. TVStreamer5 listens on this port in addition to the web UI
+      port.
 RTMP: output_host is a full RTMP/RTMPS URL or host; output_port is used for host mode.
 YouTube: output_host is the stream key or a full RTMP/RTMPS ingest URL.
 ```
