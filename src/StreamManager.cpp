@@ -328,6 +328,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         nullptr);
 
     setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
+    setBooleanPropertyIfPresent(sink, "authentication", TRUE);
     setBooleanPropertyIfPresent(sink, "wait-for-connection", FALSE);
     if (!caller) {
         setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
@@ -1081,6 +1082,12 @@ gboolean StreamManager::onSrtCallerConnecting(GstElement* sink, GSocketAddress* 
             std::cerr << " requested_streamid=" << requestedStreamId;
         }
         std::cerr << std::endl;
+    } else {
+        std::cerr << "SRT access allowed for stream " << ctx->streamId << " from " << clientIp;
+        if (!requestedStreamId.empty()) {
+            std::cerr << " requested_streamid=" << requestedStreamId;
+        }
+        std::cerr << std::endl;
     }
     return allowed ? TRUE : FALSE;
 }
@@ -1092,6 +1099,16 @@ void StreamManager::onSrtCallerAdded(GstElement* sink, gint socket, GSocketAddre
     }
     const std::string clientIp = socketAddressToString(addr);
     if (!clientIp.empty()) {
+        if (!ctx->manager->isClientAllowedForStream(ctx->streamId, clientIp)) {
+            std::cerr << "Closing unauthorized SRT socket " << socket
+                      << " for stream " << ctx->streamId
+                      << " from " << clientIp << std::endl;
+            ctx->manager->closeSrtSocket(socket);
+            return;
+        }
+        std::cerr << "SRT caller added for stream " << ctx->streamId
+                  << " from " << clientIp
+                  << " socket=" << socket << std::endl;
         ctx->manager->addStreamSession(ctx->streamId, clientIp, "srt", socket);
     }
     (void)sink;
@@ -1104,6 +1121,9 @@ void StreamManager::onSrtCallerRemoved(GstElement* sink, gint socket, GSocketAdd
     }
     const std::string clientIp = socketAddressToString(addr);
     if (!clientIp.empty()) {
+        std::cerr << "SRT caller removed for stream " << ctx->streamId
+                  << " from " << clientIp
+                  << " socket=" << socket << std::endl;
         ctx->manager->removeStreamSession(ctx->streamId, clientIp, "srt", socket);
     }
     (void)sink;
