@@ -349,7 +349,7 @@ Subscriber settings are stored separately in
 subscribers, assign streams to them, export the current list as
 `tvstreamer5-subscribers.txt`, and show the number of active HTTP sessions.
 Active sessions can be reset from the subscriber dialog; resetting disconnects
-the subscriber's current HTTP TS sessions.
+the subscriber's current HTTP TS and SRT sessions.
 
 Set `filtering_enabled` to `true` to restrict HTTP TS, HLS, and SRT listener
 playback. A request to `/stream/<stream-id>.ts`, an HLS file under
@@ -358,7 +358,8 @@ IP matches the enabled subscriber's `primary_ip` or `backup_ip`, and the stream
 id is included in that subscriber's `stream_ids`. When filtering is disabled,
 stream playback is not restricted by the subscriber list. SRT listener access is
 checked against the configured TVStreamer5 stream id, so players do not need to
-send an SRT `streamid` value.
+send an SRT `streamid` value. Saving subscriber changes also closes active HTTP
+TS and SRT sessions that no longer match the updated access list.
 
 Example:
 

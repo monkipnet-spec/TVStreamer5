@@ -845,6 +845,10 @@ void HttpServer::handleStopStream(const std::string& body) {
     }
     configManager.subscribers = std::move(next);
     configManager.saveSubscribers();
+    const size_t reset = streamManager.enforceSubscriberAccess();
+    if (reset > 0) {
+      std::cerr << "Reset unauthorized stream sessions after subscriber update: " << reset << std::endl;
+    }
   }
 
   void HttpServer::handleResetSubscriber(const std::string& body) {

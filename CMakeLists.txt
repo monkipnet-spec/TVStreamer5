@@ -9,6 +9,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 gstreamer-mpegts-1.0)
 pkg_check_modules(LIBCURL REQUIRED libcurl)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
+pkg_check_modules(SRT REQUIRED srt)
 
 find_package(Boost REQUIRED COMPONENTS system thread)
 
@@ -17,6 +18,7 @@ include_directories(
     ${GSTREAMER_INCLUDE_DIRS}
     ${LIBCURL_INCLUDE_DIRS}
     ${JSONCPP_INCLUDE_DIRS}
+    ${SRT_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS}
 )
 
@@ -24,6 +26,7 @@ link_directories(
     ${GSTREAMER_LIBRARY_DIRS}
     ${LIBCURL_LIBRARY_DIRS}
     ${JSONCPP_LIBRARY_DIRS}
+    ${SRT_LIBRARY_DIRS}
     ${Boost_LIBRARY_DIRS}
 )
 
@@ -45,6 +48,7 @@ target_link_libraries(TVStreamer
     ${GSTREAMER_LIBRARIES}
     ${LIBCURL_LIBRARIES}
     ${JSONCPP_LIBRARIES}
+    ${SRT_LIBRARIES}
     ${Boost_LIBRARIES}
     pthread
     glib-2.0

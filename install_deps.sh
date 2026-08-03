@@ -20,6 +20,7 @@ sudo apt-get install -y \
     libgstrtspserver-1.0-dev \
     libcurl4-openssl-dev \
     libjsoncpp-dev \
+    libsrt-gnutls-dev \
     libboost-system-dev \
     libboost-thread-dev \
     libboost-program-options-dev \

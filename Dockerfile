@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgstreamer-plugins-good1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
     libjsoncpp-dev \
+    libsrt-gnutls-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

@@ -13,6 +13,7 @@
 
 #include <glib.h>
 #include <gio/gio.h>
+#include <srt/srt.h>
 #include <unistd.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
@@ -892,26 +893,29 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
     return true;
 }
 
-bool StreamManager::addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol) {
+bool StreamManager::addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol, int socket) {
     if (streamId.empty() || clientIp.empty()) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(managerMutex);
-    const std::string key = protocol + ":" + streamId + ":" + clientIp + ":" + std::to_string(nextSessionId.fetch_add(1, std::memory_order_relaxed));
-    adHocSessions[key] = {streamId, clientIp, protocol};
+    const std::string normalizedClientIp = normalizeIpAddress(clientIp);
+    const std::string key = protocol + ":" + streamId + ":" + normalizedClientIp + ":" + std::to_string(nextSessionId.fetch_add(1, std::memory_order_relaxed));
+    adHocSessions[key] = {streamId, normalizedClientIp, protocol, socket};
     return true;
 }
 
-bool StreamManager::removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol) {
+bool StreamManager::removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol, int socket) {
     if (streamId.empty() || clientIp.empty()) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(managerMutex);
+    const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
         const auto& session = it->second;
-        if (session.streamId == streamId && session.clientIp == clientIp && session.protocol == protocol) {
+        const bool socketMatches = socket < 0 || session.socket == socket;
+        if (session.streamId == streamId && session.clientIp == normalizedClientIp && session.protocol == protocol && socketMatches) {
             it = adHocSessions.erase(it);
             return true;
         }
@@ -928,27 +932,39 @@ void StreamManager::onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer us
     manager->httpClients.erase(fd);
 }
 
+void StreamManager::closeSrtSocket(int socket) const {
+    if (socket < 0) {
+        return;
+    }
+    if (srt_close(static_cast<SRTSOCKET>(socket)) != 0) {
+        std::cerr << "Failed to close SRT socket " << socket << ": " << srt_getlasterror_str() << std::endl;
+    }
+}
+
 size_t StreamManager::activeHttpSessions(const std::string& clientIp) const {
     std::lock_guard<std::mutex> lock(managerMutex);
+    const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     size_t count = 0;
     for (const auto& [fd, session] : httpClients) {
         (void)fd;
-        if (session.clientIp == clientIp) ++count;
+        if (normalizeIpAddress(session.clientIp) == normalizedClientIp) ++count;
     }
     for (const auto& [key, session] : adHocSessions) {
         (void)key;
-        if (session.clientIp == clientIp) ++count;
+        if (normalizeIpAddress(session.clientIp) == normalizedClientIp) ++count;
     }
     return count;
 }
 
 size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
     std::vector<std::pair<GstElement*, int>> sinks;
+    std::vector<int> srtSockets;
     size_t removed = 0;
+    const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         for (auto it = httpClients.begin(); it != httpClients.end();) {
-            if (it->second.clientIp != clientIp) {
+            if (normalizeIpAddress(it->second.clientIp) != normalizedClientIp) {
                 ++it;
                 continue;
             }
@@ -963,7 +979,10 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
             it = httpClients.erase(it);
         }
         for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
-            if (it->second.clientIp == clientIp) {
+            if (normalizeIpAddress(it->second.clientIp) == normalizedClientIp) {
+                if (it->second.protocol == "srt" && it->second.socket >= 0) {
+                    srtSockets.push_back(it->second.socket);
+                }
                 ++removed;
                 it = adHocSessions.erase(it);
             } else {
@@ -974,6 +993,54 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
     for (const auto& [sink, fd] : sinks) {
         g_signal_emit_by_name(sink, "remove", fd);
         gst_object_unref(sink);
+    }
+    for (int socket : srtSockets) {
+        closeSrtSocket(socket);
+    }
+    return removed;
+}
+
+size_t StreamManager::enforceSubscriberAccess() {
+    std::vector<std::pair<GstElement*, int>> sinks;
+    std::vector<int> srtSockets;
+    size_t removed = 0;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        for (auto it = httpClients.begin(); it != httpClients.end();) {
+            if (isClientAllowedForStream(it->second.streamId, it->second.clientIp)) {
+                ++it;
+                continue;
+            }
+            auto found = streams.find(it->second.streamId);
+            if (found != streams.end() && found->second->pipeline) {
+                GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
+                if (sink) {
+                    sinks.emplace_back(sink, it->first);
+                }
+            }
+            ++removed;
+            it = httpClients.erase(it);
+        }
+
+        for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
+            if (isClientAllowedForStream(it->second.streamId, it->second.clientIp)) {
+                ++it;
+                continue;
+            }
+            if (it->second.protocol == "srt" && it->second.socket >= 0) {
+                srtSockets.push_back(it->second.socket);
+            }
+            ++removed;
+            it = adHocSessions.erase(it);
+        }
+    }
+
+    for (const auto& [sink, fd] : sinks) {
+        g_signal_emit_by_name(sink, "remove", fd);
+        gst_object_unref(sink);
+    }
+    for (int socket : srtSockets) {
+        closeSrtSocket(socket);
     }
     return removed;
 }
@@ -1018,26 +1085,26 @@ gboolean StreamManager::onSrtCallerConnecting(GstElement* sink, GSocketAddress* 
     return allowed ? TRUE : FALSE;
 }
 
-void StreamManager::onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData) {
+void StreamManager::onSrtCallerAdded(GstElement* sink, gint socket, GSocketAddress* addr, gpointer userData) {
     auto* ctx = static_cast<SrtAccessContext*>(userData);
     if (!ctx || !ctx->manager) {
         return;
     }
     const std::string clientIp = socketAddressToString(addr);
     if (!clientIp.empty()) {
-        ctx->manager->addStreamSession(ctx->streamId, clientIp, "srt");
+        ctx->manager->addStreamSession(ctx->streamId, clientIp, "srt", socket);
     }
     (void)sink;
 }
 
-void StreamManager::onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData) {
+void StreamManager::onSrtCallerRemoved(GstElement* sink, gint socket, GSocketAddress* addr, gpointer userData) {
     auto* ctx = static_cast<SrtAccessContext*>(userData);
     if (!ctx || !ctx->manager) {
         return;
     }
     const std::string clientIp = socketAddressToString(addr);
     if (!clientIp.empty()) {
-        ctx->manager->removeStreamSession(ctx->streamId, clientIp, "srt");
+        ctx->manager->removeStreamSession(ctx->streamId, clientIp, "srt", socket);
     }
     (void)sink;
 }
