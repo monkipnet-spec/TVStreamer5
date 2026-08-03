@@ -16,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <vector>
 #include <unistd.h>
 
 namespace {
@@ -114,8 +115,60 @@ int validPortOrDefault(int port, int defaultPort) {
     return port > 0 && port <= 65535 ? port : defaultPort;
 }
 
+std::string normalizedOutputType(const StreamConfig& cfg) {
+    std::string type = toLower(cfg.outputType);
+    if (type == "udp_vbr" || type == "udpvbr") {
+        type = "udp-vbr";
+    } else if (type == "udp_cbr" || type == "udpcbr") {
+        type = "udp-cbr";
+    }
+    if (type == "udp") {
+        return cfg.cbr ? "udp-cbr" : "udp-vbr";
+    }
+    if (type != "udp-vbr" && type != "udp-cbr" &&
+        type != "srt" && type != "http" && type != "hls" &&
+        type != "rtmp" && type != "youtube") {
+        return "udp-vbr";
+    }
+    return type;
+}
+
+StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
+    StreamOutputConfig output;
+    output.outputType = cfg.outputType;
+    output.outputMode = cfg.outputMode;
+    output.outputHost = cfg.outputHost;
+    output.outputPort = cfg.outputPort;
+    return output;
+}
+
+StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig& output) {
+    StreamConfig cfg = base;
+    cfg.outputType = output.outputType;
+    cfg.outputMode = output.outputMode;
+    cfg.outputHost = output.outputHost;
+    cfg.outputPort = output.outputPort;
+    cfg.additionalOutputs.clear();
+    const std::string type = normalizedOutputType(cfg);
+    if (type == "udp-cbr") {
+        cfg.cbr = true;
+    } else if (type == "udp-vbr") {
+        cfg.cbr = false;
+    }
+    return cfg;
+}
+
+std::vector<StreamConfig> streamOutputs(const StreamConfig& cfg) {
+    std::vector<StreamConfig> outputs;
+    outputs.push_back(configForOutput(cfg, primaryOutputConfig(cfg)));
+    for (const auto& output : cfg.additionalOutputs) {
+        outputs.push_back(configForOutput(cfg, output));
+    }
+    return outputs;
+}
+
 int streamHttpPort(const StreamConfig& cfg, int defaultPort) {
-    const std::string type = toLower(cfg.outputType);
+    const std::string type = normalizedOutputType(cfg);
     if (type == "http" || type == "hls") {
         return validPortOrDefault(cfg.outputPort, defaultPort);
     }
@@ -123,7 +176,7 @@ int streamHttpPort(const StreamConfig& cfg, int defaultPort) {
 }
 
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
-    const std::string type = toLower(cfg.outputType);
+    const std::string type = normalizedOutputType(cfg);
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
         return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
@@ -376,9 +429,11 @@ std::set<int> HttpServer::configuredHttpPorts() const {
     }
     const int defaultPort = configManager.config.httpPort;
     for (const auto& stream : configManager.config.streams) {
-        const std::string type = toLower(stream.outputType);
-        if ((type == "http" || type == "hls") && stream.outputPort > 0 && stream.outputPort <= 65535) {
-            ports.insert(streamHttpPort(stream, defaultPort));
+        for (const auto& output : streamOutputs(stream)) {
+            const std::string type = normalizedOutputType(output);
+            if ((type == "http" || type == "hls") && output.outputPort > 0 && output.outputPort <= 65535) {
+                ports.insert(streamHttpPort(output, defaultPort));
+            }
         }
     }
     if (ports.empty()) {
@@ -602,7 +657,18 @@ std::string HttpServer::currentState() {
             item["cc_errors"] = Json::UInt64(0);
             item["cc_errors_total"] = Json::UInt64(0);
         }
-        item["vlc_link"] = streamLink(cfg, configManager.config.httpPort);
+        Json::Value links(Json::arrayValue);
+        for (const auto& output : streamOutputs(cfg)) {
+            Json::Value link;
+            link["output_type"] = normalizedOutputType(output);
+            link["output_mode"] = output.outputMode;
+            link["output_host"] = output.outputHost;
+            link["output_port"] = output.outputPort;
+            link["url"] = streamLink(output, configManager.config.httpPort);
+            links.append(link);
+        }
+        item["vlc_links"] = links;
+        item["vlc_link"] = links.size() == 0 ? "" : links[0].get("url", "").asString();
         recordQualitySample(cfg, item);
         streams.append(item);
     }
@@ -1043,6 +1109,13 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .form-row input.compact,.form-row select.compact{max-width:150px}
 .row-inline{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .row-inline.compact-row input{width:100%;padding:7px 9px}
+.output-list{display:grid;gap:8px;width:100%}
+.output-row{display:grid;grid-template-columns:minmax(120px,1.1fr) minmax(106px,.8fr) minmax(130px,1fr) 86px 30px;gap:6px;align-items:end;padding:8px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);border-radius:8px}
+.output-row .form-row{gap:5px}
+.output-row input,.output-row select{box-sizing:border-box;max-width:none}
+.output-row .remove-output{width:30px;height:30px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;cursor:pointer}
+.output-row .remove-output:disabled{opacity:.35;cursor:not-allowed}
+@media (max-width:760px){.output-row{grid-template-columns:1fr 1fr}.output-row .remove-output{align-self:end}}
 .form-row-inline small-field input{width:calc(100% - 8px)}
 .form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
 .form-row .checkbox-inline input{width:16px;height:16px}
@@ -1177,10 +1250,13 @@ function fetchSystemMetrics() {
 }
 function downloadVlcPlaylist() {
   const entries = (state.streams || [])
-    .filter(stream => stream.vlc_link)
-    .map(stream => {
-      const name = String(stream.name || stream.id).replace(/[\r\n]/g, ' ').trim();
-      return `#EXTINF:-1,${name}\n${stream.vlc_link}`;
+    .flatMap(stream => {
+      const links = streamLinks(stream);
+      return links.map(link => {
+        const suffix = links.length > 1 && link.output_type ? ` ${String(link.output_type).toUpperCase()}` : '';
+        const name = String((stream.name || stream.id) + suffix).replace(/[\r\n]/g, ' ').trim();
+        return `#EXTINF:-1,${name}\n${link.url}`;
+      });
     });
   const content = `#EXTM3U\n${entries.join('\n')}\n`;
   const blob = new Blob([content], {type:'audio/x-mpegurl;charset=utf-8'});
@@ -1213,6 +1289,32 @@ function normalizedOutputType(stream) {
   if (raw === 'udp_vbr' || raw === 'udpvbr') return 'udp-vbr';
   return raw;
 }
+function outputConfigsForStream(stream) {
+  const makeOutput = output => ({
+    output_type: output.output_type || 'udp-cbr',
+    output_mode: output.output_mode || 'listener',
+    output_host: output.output_host || '127.0.0.1',
+    output_port: Number(output.output_port || 1234),
+    cbr: stream.cbr
+  });
+  if (Array.isArray(stream.outputs) && stream.outputs.length) {
+    return stream.outputs.map(makeOutput);
+  }
+  return [
+    makeOutput(stream),
+    ...(Array.isArray(stream.additional_outputs) ? stream.additional_outputs.map(makeOutput) : [])
+  ];
+}
+function streamLinks(stream) {
+  if (Array.isArray(stream.vlc_links) && stream.vlc_links.length) {
+    return stream.vlc_links.filter(link => link.url);
+  }
+  return stream.vlc_link ? [{output_type: normalizedOutputType(stream), url: stream.vlc_link}] : [];
+}
+function outputBadgeText(stream) {
+  const outputs = outputConfigsForStream(stream);
+  return outputs.length > 1 ? `${outputs.length} OUT` : normalizedOutputType(outputs[0] || stream).toUpperCase();
+}
 function streamBitrateMode(stream) {
   const type = normalizedOutputType(stream);
   if (type === 'udp-cbr') return 'CBR';
@@ -1225,8 +1327,11 @@ function render() {
   const tiles = document.getElementById('tiles');
   tiles.innerHTML = '';
   state.streams.forEach(stream => {
-    const outputType = normalizedOutputType(stream);
+    const outputs = outputConfigsForStream(stream);
+    const outputType = normalizedOutputType(outputs[0] || stream);
     const bitrateMode = streamBitrateMode(stream);
+    const links = streamLinks(stream);
+    const primaryLink = links[0]?.url || stream.vlc_link || `${stream.output_host || ''}:${stream.output_port || ''}`;
     const tile = document.createElement('div');
     tile.className = 'tile' + (stream.active ? ' active' : '');
     tile.innerHTML = `
@@ -1235,11 +1340,11 @@ function render() {
           <div class="title">${stream.name || stream.id}</div>
           <div class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
         </div>
-        <div class="badge">${bitrateMode}</div>
+        <div class="badge">${outputs.length > 1 ? outputBadgeText(stream) : bitrateMode}</div>
       </div>
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
-        <div class="info-row"><strong>${t('output')}</strong><span>${outputType.toUpperCase()} · ${stream.vlc_link || (stream.output_host + ':' + stream.output_port)}</span></div>
+        <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
         <div class="info-row"><strong>${t('activeInput')}</strong><span>${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}</span></div>
@@ -1252,7 +1357,7 @@ function render() {
         <button class="${stream.active ? 'stop-button' : 'start-button'}" onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? t('stop') : t('start')}</button>
         <button onclick="editStream('${stream.id}')">${t('edit')}</button>
         <button class="quality-button" onclick="openQualityModal('${stream.id}')">${t('chart')}</button>
-        <button class="copy-button" onclick="copyLink('${stream.vlc_link}', this)">URL</button>
+        <button class="copy-button" onclick="copyStreamLinks('${stream.id}', this)">${links.length > 1 ? 'URLs' : 'URL'}</button>
       </div>`;
     tiles.appendChild(tile);
   });
@@ -1513,14 +1618,81 @@ function openStreamModal() {
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
     interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
-    audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:''
+    audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
+  });
+}
+function outputTypeOptions(selected) {
+  const options = [
+    ['udp-vbr', 'UDP MPEG-TS VBR'],
+    ['udp-cbr', 'UDP MPEG-TS CBR'],
+    ['srt', 'SRT'],
+    ['http', 'HTTP TS'],
+    ['hls', 'HLS'],
+    ['rtmp', 'RTMP Push'],
+    ['youtube', 'YouTube']
+  ];
+  return options.map(([value, label]) => `<option value="${value}" ${selected===value?'selected':''}>${label}</option>`).join('');
+}
+function renderOutputRows(outputs, links=[], startIndex=0) {
+  return outputs.map((output, offset) => {
+    const index = startIndex + offset;
+    const type = normalizedOutputType(output);
+    const link = links[index]?.url || '';
+    return `
+      <div class="output-row" data-output-index="${index}">
+        <div class="form-row"><label>${index === 0 ? 'Основной формат' : 'Доп. формат'}</label><select data-output-field="output_type" onchange="updateOutputHints()">${outputTypeOptions(type)}</select></div>
+        <div class="form-row"><label>SRT режим</label><select data-output-field="output_mode" onchange="updateOutputHints()"><option value="listener" ${(!output.output_mode || output.output_mode==='listener')?'selected':''}>Listener</option><option value="caller" ${output.output_mode==='caller'?'selected':''}>Caller</option></select></div>
+        <div class="form-row"><label data-output-host-label>Адрес выхода</label><input data-output-field="output_host" value="${output.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
+        <div class="form-row"><label data-output-port-label>Порт</label><input data-output-field="output_port" type="number" min="1" max="65535" value="${output.output_port||1234}" placeholder="1234" /></div>
+        <button class="remove-output" type="button" onclick="removeStreamOutput(this)" ${index === 0 ? 'disabled' : ''}>×</button>
+        <div class="form-row full" style="grid-column:1/-1"><label>URL для плеера</label><input readonly value="${link}" placeholder="Ссылка появится после сохранения" /></div>
+      </div>
+    `;
+  }).join('');
+}
+function renumberOutputRows() {
+  document.querySelectorAll('.output-row').forEach((row, index) => {
+    row.dataset.outputIndex = index;
+    const label = row.querySelector('label');
+    if (label) label.textContent = index === 0 ? 'Основной формат' : 'Доп. формат';
+    const remove = row.querySelector('.remove-output');
+    if (remove) remove.disabled = index === 0;
+  });
+}
+function addStreamOutput() {
+  const list = document.getElementById('streamOutputs');
+  if (!list) return;
+  const index = list.querySelectorAll('.output-row').length;
+  const iface = document.getElementById('streamInterface')?.value || '127.0.0.1';
+  list.insertAdjacentHTML('beforeend', renderOutputRows([{output_type:'hls', output_mode:'listener', output_host:iface, output_port:state.http_port || 9000, cbr:document.getElementById('streamCbr')?.checked}], [], index));
+  updateOutputHints();
+}
+function removeStreamOutput(button) {
+  const row = button.closest('.output-row');
+  if (!row || Number(row.dataset.outputIndex || 0) === 0) return;
+  row.remove();
+  renumberOutputRows();
+  updateOutputHints();
+}
+function collectOutputRows() {
+  const rows = [...document.querySelectorAll('.output-row')];
+  return rows.map(row => {
+    const value = field => row.querySelector(`[data-output-field="${field}"]`)?.value || '';
+    return {
+      output_type: value('output_type') || 'udp-cbr',
+      output_mode: value('output_mode') || 'listener',
+      output_host: value('output_host') || '127.0.0.1',
+      output_port: Number(value('output_port') || 1234)
+    };
   });
 }
 function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
     const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
-    const outputType = normalizedOutputType(stream);
+    const outputs = outputConfigsForStream(stream);
+    const outputType = normalizedOutputType(outputs[0] || stream);
+    const links = Array.isArray(stream.vlc_links) ? stream.vlc_links : [];
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
@@ -1530,11 +1702,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
-        <div class="form-row"><label>Формат выхода</label><select class="compact" id="streamOutputType" onchange="updateOutputHints()"><option value="udp-vbr" ${outputType==='udp-vbr'?'selected':''}>UDP MPEG-TS VBR</option><option value="udp-cbr" ${outputType==='udp-cbr'?'selected':''}>UDP MPEG-TS CBR</option><option value="srt" ${outputType==='srt'?'selected':''}>SRT</option><option value="http" ${outputType==='http'?'selected':''}>HTTP TS</option><option value="hls" ${outputType==='hls'?'selected':''}>HLS</option><option value="rtmp" ${outputType==='rtmp'?'selected':''}>RTMP Push</option><option value="youtube" ${outputType==='youtube'?'selected':''}>YouTube</option></select></div>
-        <div class="form-row" id="streamOutputModeRow"><label>Режим SRT выхода</label><select class="compact" id="streamOutputMode" onchange="updateOutputHints()"><option value="listener" ${(!stream.output_mode || stream.output_mode==='listener')?'selected':''}>SRT Listener</option><option value="caller" ${stream.output_mode==='caller'?'selected':''}>SRT Caller</option></select></div>
-        <div class="form-row"><label id="streamOutputHostLabel">Адрес выхода</label><input class="compact" id="streamOutputHost" value="${stream.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
-        <div class="form-row"><label id="streamOutputPortLabel">Порт</label><input class="compact" id="streamOutputPort" type="number" min="1" max="65535" value="${stream.output_port||1234}" placeholder="1234" /></div>
-        <div class="form-row full"><label>URL для плеера</label><input class="compact" id="streamPreviewUrl" readonly value="${stream.vlc_link||''}" placeholder="Ссылка появится после сохранения" /></div>
+        <div class="form-row full"><label>Выходные форматы</label><div id="streamOutputs" class="output-list">${renderOutputRows(outputs, links)}</div><button class="button-secondary" type="button" onclick="addStreamOutput()">+ Добавить формат</button></div>
         <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
         <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
@@ -1559,65 +1727,72 @@ function openStreamForm(stream) {
   }
 }
 function updateOutputHints() {
-  const type = document.getElementById('streamOutputType')?.value || 'udp-cbr';
-  const hostLabel = document.getElementById('streamOutputHostLabel');
-  const portLabel = document.getElementById('streamOutputPortLabel');
-  const host = document.getElementById('streamOutputHost');
-  const port = document.getElementById('streamOutputPort');
-  const outputModeRow = document.getElementById('streamOutputModeRow');
-  const outputMode = document.getElementById('streamOutputMode')?.value || 'listener';
+  const rows = [...document.querySelectorAll('.output-row')];
   const cbrRow = document.getElementById('streamCbrRow');
   const cbrInput = document.getElementById('streamCbr');
-  if (!hostLabel || !portLabel || !host || !port) return;
-  if (outputModeRow) outputModeRow.style.display = type === 'srt' ? '' : 'none';
+  rows.forEach(row => {
+    const type = row.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
+    const outputMode = row.querySelector('[data-output-field="output_mode"]')?.value || 'listener';
+    const hostLabel = row.querySelector('[data-output-host-label]');
+    const portLabel = row.querySelector('[data-output-port-label]');
+    const host = row.querySelector('[data-output-field="output_host"]');
+    const port = row.querySelector('[data-output-field="output_port"]');
+    const modeRow = row.querySelector('[data-output-field="output_mode"]')?.closest('.form-row');
+    if (!hostLabel || !portLabel || !host || !port) return;
+    if (modeRow) modeRow.style.display = type === 'srt' ? '' : 'none';
+    if (type === 'http' || type === 'hls') {
+      hostLabel.textContent = 'Адрес для ссылки';
+      portLabel.textContent = type === 'hls' ? 'HLS порт' : 'HTTP порт';
+      port.disabled = false;
+      port.placeholder = String(state.http_port || 9000);
+      host.placeholder = 'IP интерфейса или DNS';
+    } else if (type === 'srt') {
+      hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';
+      portLabel.textContent = 'SRT порт';
+      port.disabled = false;
+      host.placeholder = outputMode === 'caller' ? 'server.example.com или IP' : '0.0.0.0 для listener';
+      if (outputMode === 'listener' && (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1')) {
+        host.value = '0.0.0.0';
+      } else if (outputMode === 'caller' && (!host.value || host.value === '0.0.0.0' || host.value === '239.0.0.1')) {
+        host.value = '127.0.0.1';
+      }
+    } else if (type === 'youtube') {
+      hostLabel.textContent = 'YouTube key / URL';
+      portLabel.textContent = 'Порт';
+      port.disabled = true;
+      host.placeholder = 'xxxx-xxxx-xxxx-xxxx или rtmp://a.rtmp.youtube.com/live2/...';
+    } else if (type === 'rtmp') {
+      hostLabel.textContent = 'RTMP URL / host';
+      portLabel.textContent = 'RTMP порт';
+      port.disabled = false;
+      host.placeholder = 'rtmp://server/app/key или server.example.com';
+    } else {
+      hostLabel.textContent = 'Мультикаст / UDP IP';
+      portLabel.textContent = 'UDP порт';
+      port.disabled = false;
+      host.placeholder = '239.0.0.1';
+    }
+  });
   if (cbrInput && cbrRow) {
-    const udpMode = type === 'udp-cbr' || type === 'udp-vbr';
-    cbrInput.checked = type === 'udp-cbr' || (!udpMode && cbrInput.checked);
+    const primaryType = rows[0]?.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
+    const udpMode = primaryType === 'udp-cbr' || primaryType === 'udp-vbr';
+    cbrInput.checked = primaryType === 'udp-cbr' || (!udpMode && cbrInput.checked);
     cbrInput.disabled = udpMode;
     cbrRow.style.display = udpMode ? 'none' : '';
-  }
-  if (type === 'http' || type === 'hls') {
-    hostLabel.textContent = 'Адрес для ссылки';
-    portLabel.textContent = type === 'hls' ? 'HLS порт' : 'HTTP порт';
-    port.disabled = false;
-    port.placeholder = String(state.http_port || 9000);
-    host.placeholder = 'IP интерфейса или DNS';
-  } else if (type === 'srt') {
-    hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';
-    portLabel.textContent = 'SRT порт';
-    port.disabled = false;
-    host.placeholder = outputMode === 'caller' ? 'server.example.com или IP' : '0.0.0.0 для listener';
-    if (outputMode === 'listener' && (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1')) {
-      host.value = '0.0.0.0';
-    } else if (outputMode === 'caller' && (!host.value || host.value === '0.0.0.0' || host.value === '239.0.0.1')) {
-      host.value = '127.0.0.1';
-    }
-  } else if (type === 'youtube') {
-    hostLabel.textContent = 'YouTube key / URL';
-    portLabel.textContent = 'Порт';
-    port.disabled = true;
-    host.placeholder = 'xxxx-xxxx-xxxx-xxxx или rtmp://a.rtmp.youtube.com/live2/...';
-  } else if (type === 'rtmp') {
-    hostLabel.textContent = 'RTMP URL / host';
-    portLabel.textContent = 'RTMP порт';
-    port.disabled = false;
-    host.placeholder = 'rtmp://server/app/key или server.example.com';
-  } else {
-    hostLabel.textContent = 'Мультикаст / UDP IP';
-    portLabel.textContent = 'UDP порт';
-    port.disabled = false;
-    host.placeholder = '239.0.0.1';
   }
   syncOutputHostWithInterface();
 }
 function syncOutputHostWithInterface() {
-  const type = document.getElementById('streamOutputType')?.value || 'udp-cbr';
   const iface = document.getElementById('streamInterface')?.value || '';
-  const host = document.getElementById('streamOutputHost');
-  if (!host || !iface || (type !== 'http' && type !== 'hls')) return;
-  if (!host.value || host.value === '0.0.0.0' || host.value === '127.0.0.1') {
-    host.value = iface;
-  }
+  if (!iface) return;
+  document.querySelectorAll('.output-row').forEach(row => {
+    const type = row.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
+    const host = row.querySelector('[data-output-field="output_host"]');
+    if (!host || (type !== 'http' && type !== 'hls')) return;
+    if (!host.value || host.value === '0.0.0.0' || host.value === '127.0.0.1') {
+      host.value = iface;
+    }
+  });
 }
 function saveSettings() {
   const httpPortInput = document.getElementById('httpPort');
@@ -1646,7 +1821,9 @@ function saveSettings() {
     });
 }
 function saveStream(id) {
-  const selectedOutputType = document.getElementById('streamOutputType').value;
+  const outputs = collectOutputRows();
+  const primaryOutput = outputs[0] || {output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234};
+  const selectedOutputType = primaryOutput.output_type;
   const selectedCbr = selectedOutputType === 'udp-cbr'
     ? true
     : (selectedOutputType === 'udp-vbr' ? false : document.getElementById('streamCbr').checked);
@@ -1655,9 +1832,10 @@ function saveStream(id) {
     name: document.getElementById('streamName').value,
     input_uri: document.getElementById('streamInput').value,
     output_type: selectedOutputType,
-    output_mode: document.getElementById('streamOutputMode')?.value || 'listener',
-    output_host: document.getElementById('streamOutputHost').value,
-    output_port: Number(document.getElementById('streamOutputPort').value),
+    output_mode: primaryOutput.output_mode,
+    output_host: primaryOutput.output_host,
+    output_port: primaryOutput.output_port,
+    additional_outputs: outputs.slice(1),
     backup_input_uri: document.getElementById('streamBackupInput').value,
     interface_address: document.getElementById('streamInterface').value,
     input_mode: document.getElementById('streamInputMode').value,
@@ -1732,6 +1910,12 @@ function copyLink(text, button) {
     onError();
   }
 }
+function copyStreamLinks(id, button) {
+  const stream = (state.streams || []).find(item => item.id === id);
+  if (!stream) return;
+  const text = streamLinks(stream).map(link => link.url).join('\n') || stream.vlc_link || '';
+  copyLink(text, button);
+}
 const qualityPeriods = [
   {label:'Месяц', seconds:2592000},
   {label:'Неделя', seconds:604800},
@@ -1758,6 +1942,7 @@ function formatTime(ts, period) {
 function openQualityModal(id, periodSeconds=3600) {
   const stream = state.streams.find(s=>s.id===id);
   if (!stream) return;
+  const outputs = outputConfigsForStream(stream);
   qualityChart.streamId = id;
   qualityChart.period = periodSeconds;
   document.getElementById('modalContent').className = 'modal-content quality-modal';
@@ -1766,7 +1951,7 @@ function openQualityModal(id, periodSeconds=3600) {
     <div class="quality-head">
       <div class="quality-title">
         <h2>Качество потока</h2>
-        <small>${stream.name || stream.id} · ${stream.output_host}:${stream.output_port}</small>
+        <small>${stream.name || stream.id} · ${outputs.map(output => `${normalizedOutputType(output).toUpperCase()} ${output.output_host}:${output.output_port}`).join(' · ')}</small>
       </div>
       <div class="period-tabs">${tabs}</div>
     </div>

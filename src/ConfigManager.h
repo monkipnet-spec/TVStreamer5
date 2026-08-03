@@ -6,6 +6,16 @@
 #include <string>
 #include <vector>
 
+struct StreamOutputConfig {
+    std::string outputType = "udp-cbr";
+    std::string outputMode = "listener";
+    std::string outputHost = "127.0.0.1";
+    int outputPort = 1234;
+
+    Json::Value toJson() const;
+    static StreamOutputConfig fromJson(const Json::Value& root);
+};
+
 struct StreamConfig {
     std::string id;
     std::string name;
@@ -27,6 +37,7 @@ struct StreamConfig {
     uint32_t serviceId = 1;
     std::string serviceName;
     std::string serviceProvider;
+    std::vector<StreamOutputConfig> additionalOutputs;
 
     Json::Value toJson() const;
     static StreamConfig fromJson(const Json::Value& root);

@@ -13,6 +13,7 @@ namespace UdpCbrOutput {
 GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
+    const std::string& sinkName,
     std::string& error) {
     if (config.targetBitrate == 0) {
         error = "UDP CBR target_bitrate must be greater than zero";
@@ -24,7 +25,7 @@ GstElement* createSink(
     pacing.configuredBitrate = config.targetBitrate;
     pacing.headroomPercent = kCbrSafetyHeadroomPercent;
     pacing.holdConfiguredRateWhenSafe = true;
-    return UdpTsOutput::createSink(pipeline, config, pacing, error);
+    return UdpTsOutput::createSink(pipeline, config, sinkName, pacing, error);
 }
 
 } // namespace UdpCbrOutput

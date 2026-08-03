@@ -280,8 +280,11 @@ auto
 
 ## Output Formats
 
-Each stream has an `output_type` field. Existing configs without this field are
-treated as `udp`.
+Each stream has one primary `output_type` field. To broadcast the same input
+simultaneously in more than one format, keep the primary `output_type`,
+`output_mode`, `output_host`, and `output_port` fields and add
+`additional_outputs` entries. Existing configs without these entries keep
+working as single-output streams.
 
 ```text
 udp   MPEG-TS over UDP unicast or multicast
@@ -319,6 +322,31 @@ HLS:  output_host is the address advertised in the player URL; output_port is
       port.
 RTMP: output_host is a full RTMP/RTMPS URL or host; output_port is used for host mode.
 YouTube: output_host is the stream key or a full RTMP/RTMPS ingest URL.
+```
+
+Example with simultaneous UDP multicast, SRT listener, and HLS output:
+
+```json
+{
+  "output_type": "udp-cbr",
+  "output_mode": "listener",
+  "output_host": "239.1.1.1",
+  "output_port": 1234,
+  "additional_outputs": [
+    {
+      "output_type": "srt",
+      "output_mode": "listener",
+      "output_host": "0.0.0.0",
+      "output_port": 9001
+    },
+    {
+      "output_type": "hls",
+      "output_mode": "listener",
+      "output_host": "192.168.1.20",
+      "output_port": 9000
+    }
+  ]
+}
 ```
 
 The web UI lets you choose the output interface. For UDP multicast it is used as
@@ -426,6 +454,7 @@ Minimal stream object:
   "output_mode": "listener",
   "output_host": "239.1.1.1",
   "output_port": 1234,
+  "additional_outputs": [],
   "interface_address": "",
   "cbr": true,
   "target_bitrate": 7000000,
@@ -445,5 +474,5 @@ Use `"output_type": "udp-vbr"` for transparent UDP VBR output. The legacy
 The HTTP interface port is configured with `http_port`; the same port serves
 the web UI, HTTP TS streams, and HLS files. The `login` and `password` fields
 control Basic Authentication for the web UI and API. The UI can generate a VLC
-playlist containing all available `vlc_link` URLs; save it from the
+playlist containing all primary and additional output URLs; save it from the
 `VLC playlist` control as `tvstreamer5-playlist.m3u`.

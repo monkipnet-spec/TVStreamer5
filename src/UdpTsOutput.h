@@ -22,6 +22,7 @@ struct PacingConfig {
 GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
+    const std::string& sinkName,
     const PacingConfig& pacing,
     std::string& error);
 

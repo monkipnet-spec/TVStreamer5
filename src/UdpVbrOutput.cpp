@@ -15,6 +15,7 @@ namespace UdpVbrOutput {
 GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
+    const std::string& sinkName,
     std::string& error) {
     UdpTsOutput::PacingConfig pacing;
     pacing.updateFromPcr = false;
@@ -23,7 +24,7 @@ GstElement* createSink(
         ? config.targetBitrate
         : kVbrDefaultBitrate;
     pacing.headroomPercent = kVbrPaceHeadroomPercent;
-    return UdpTsOutput::createSink(pipeline, config, pacing, error);
+    return UdpTsOutput::createSink(pipeline, config, sinkName, pacing, error);
 }
 
 } // namespace UdpVbrOutput

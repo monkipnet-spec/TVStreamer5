@@ -166,6 +166,111 @@ bool cbrMuxEnabled(const StreamConfig& cfg) {
     return cfg.cbr && cfg.targetBitrate > 0;
 }
 
+std::string srtOutputMode(const StreamConfig& cfg);
+
+StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
+    StreamOutputConfig output;
+    output.outputType = cfg.outputType;
+    output.outputMode = cfg.outputMode;
+    output.outputHost = cfg.outputHost;
+    output.outputPort = cfg.outputPort;
+    return output;
+}
+
+StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig& output) {
+    StreamConfig cfg = base;
+    cfg.outputType = output.outputType;
+    cfg.outputMode = output.outputMode;
+    cfg.outputHost = output.outputHost;
+    cfg.outputPort = output.outputPort;
+    cfg.additionalOutputs.clear();
+
+    const std::string type = outputType(cfg);
+    if (type == "udp-cbr") {
+        cfg.cbr = true;
+    } else if (type == "udp-vbr") {
+        cfg.cbr = false;
+    }
+    return cfg;
+}
+
+std::vector<StreamConfig> outputConfigs(const StreamConfig& cfg) {
+    std::vector<StreamConfig> outputs;
+    outputs.push_back(configForOutput(cfg, primaryOutputConfig(cfg)));
+    for (const auto& output : cfg.additionalOutputs) {
+        outputs.push_back(configForOutput(cfg, output));
+    }
+    return outputs;
+}
+
+std::vector<StreamConfig> pipelineOutputConfigs(const StreamConfig& cfg) {
+    std::vector<StreamConfig> outputs;
+    bool httpAdded = false;
+    bool hlsAdded = false;
+    for (const auto& output : outputConfigs(cfg)) {
+        const std::string type = outputType(output);
+        if (type == "http") {
+            if (httpAdded) {
+                continue;
+            }
+            httpAdded = true;
+        } else if (type == "hls") {
+            if (hlsAdded) {
+                continue;
+            }
+            hlsAdded = true;
+        }
+        outputs.push_back(output);
+    }
+    return outputs;
+}
+
+std::string branchName(const std::string& base, size_t branchIndex) {
+    return base + "_" + std::to_string(branchIndex);
+}
+
+bool hasSrtListenerOutput(const StreamConfig& cfg) {
+    for (const auto& output : outputConfigs(cfg)) {
+        if (outputType(output) == "srt" && srtOutputMode(output) == "listener") {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t initialConfiguredOutputBitrate(const StreamConfig& cfg) {
+    uint64_t total = 0;
+    for (const auto& output : pipelineOutputConfigs(cfg)) {
+        if (cbrMuxEnabled(output) || udpCbrOutputEnabled(output)) {
+            total += output.targetBitrate;
+        }
+    }
+    return total;
+}
+
+std::vector<GstElement*> findSinksByFactory(GstElement* pipeline, const char* expectedFactory) {
+    std::vector<GstElement*> result;
+    if (!pipeline || !expectedFactory) {
+        return result;
+    }
+
+    GstIterator* iterator = gst_bin_iterate_elements(GST_BIN(pipeline));
+    GValue item = G_VALUE_INIT;
+    while (gst_iterator_next(iterator, &item) == GST_ITERATOR_OK) {
+        GstElement* element = GST_ELEMENT(g_value_get_object(&item));
+        GstElementFactory* factory = gst_element_get_factory(element);
+        const gchar* factoryName = factory
+            ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
+            : nullptr;
+        if (factoryName && g_strcmp0(factoryName, expectedFactory) == 0) {
+            result.push_back(GST_ELEMENT(gst_object_ref(element)));
+        }
+        g_value_unset(&item);
+    }
+    gst_iterator_free(iterator);
+    return result;
+}
+
 std::string srtOutputMode(const StreamConfig& cfg) {
     const std::string mode = toLower(cfg.outputMode);
     return mode == "caller" ? "caller" : "listener";
@@ -699,10 +804,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->activeInputUri = streamConfig.testPattern ? kTestPatternUri : streamConfig.inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
-    if (streamConfig.remapEnabled) {
-        state->remapContext = std::make_unique<RemapContext>();
-        state->remapContext->config = streamConfig;
-    }
 
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
@@ -718,7 +819,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = cbrMuxEnabled(streamConfig) ? streamConfig.targetBitrate : 0;
+    state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -837,7 +938,7 @@ bool StreamManager::stopStream(const std::string& id) {
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
     }
-    state.remapContext.reset();
+    state.outputContexts.clear();
     state.sourceContext.reset();
 
     notifyStreamState(stoppedConfig, "⚪", "Поток остановлен", "Остановлен вручную");
@@ -873,7 +974,7 @@ void StreamManager::stopAll() {
         if (state.pipeline) {
             gst_object_unref(state.pipeline);
         }
-        state.remapContext.reset();
+        state.outputContexts.clear();
         state.sourceContext.reset();
     }
 }
@@ -912,9 +1013,17 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " input_mode=" << cfg.inputMode
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
-         << " output_type=" << outputType(cfg)
-         << " output_mode=" << srtOutputMode(cfg)
-         << " output=" << cfg.outputHost << ":" << cfg.outputPort
+         << " outputs=";
+    const auto outputs = outputConfigs(cfg);
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        if (i > 0) {
+            desc << ",";
+        }
+        desc << outputType(outputs[i])
+             << "/" << srtOutputMode(outputs[i])
+             << "@" << outputs[i].outputHost << ":" << outputs[i].outputPort;
+    }
+    desc
          << " iface=" << cfg.interfaceAddress
          << " service_id=" << cfg.serviceId
          << " vpid=" << cfg.videoPid
@@ -930,20 +1039,15 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
         return false;
     }
 
-    GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
-    if (!sink) {
+    auto sinks = findSinksByFactory(found->second->pipeline, "multifdsink");
+    if (sinks.empty()) {
         close(fd);
         return false;
     }
 
-    GstElementFactory* factory = gst_element_get_factory(sink);
-    const gchar* factoryName = factory
-        ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
-        : nullptr;
-    if (!factoryName || g_strcmp0(factoryName, "multifdsink") != 0) {
-        gst_object_unref(sink);
-        close(fd);
-        return false;
+    GstElement* sink = sinks.front();
+    for (size_t i = 1; i < sinks.size(); ++i) {
+        gst_object_unref(sinks[i]);
     }
 
     g_signal_connect(sink, "client-fd-removed", G_CALLBACK(StreamManager::onHttpClientFdRemoved), this);
@@ -1067,8 +1171,8 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
             }
             auto found = streams.find(it->second.streamId);
             if (found != streams.end() && found->second->pipeline) {
-                GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
-                if (sink) {
+                auto foundSinks = findSinksByFactory(found->second->pipeline, "multifdsink");
+                for (auto* sink : foundSinks) {
                     sinks.emplace_back(sink, it->first);
                 }
             }
@@ -1108,8 +1212,8 @@ size_t StreamManager::enforceSubscriberAccess() {
                       << " ip=" << it->second.clientIp << std::endl;
             auto found = streams.find(it->second.streamId);
             if (found != streams.end() && found->second->pipeline) {
-                GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
-                if (sink) {
+                auto foundSinks = findSinksByFactory(found->second->pipeline, "multifdsink");
+                for (auto* sink : foundSinks) {
                     sinks.emplace_back(sink, it->first);
                 }
             }
@@ -1155,8 +1259,7 @@ size_t StreamManager::restartSrtOutputsForStreams(const std::vector<std::string>
             }
             auto found = streams.find(streamId);
             if (found == streams.end() || !found->second->pipeline ||
-                outputType(found->second->config) != "srt" ||
-                srtOutputMode(found->second->config) != "listener") {
+                !hasSrtListenerOutput(found->second->config)) {
                 continue;
             }
             configs.push_back(found->second->config);
@@ -1207,7 +1310,7 @@ size_t StreamManager::restartAllSrtOutputs() {
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         for (const auto& [id, state] : streams) {
-            if (state->pipeline && outputType(state->config) == "srt") {
+            if (state->pipeline && hasSrtListenerOutput(state->config)) {
                 streamIds.push_back(id);
             }
         }
@@ -1329,11 +1432,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->config.inputUri = inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = state->config;
-    state->remapContext.reset();
-    if (state->config.remapEnabled) {
-        state->remapContext = std::make_unique<RemapContext>();
-        state->remapContext->config = state->config;
-    }
+    state->outputContexts.clear();
 
     GstElement* newPipeline = createPipeline(state);
     if (!newPipeline) {
@@ -1361,7 +1460,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->ccErrors = 0;
     state->ccErrorsDelta = 0;
     state->inputBitrate = 0;
-    state->outputBitrate = cbrMuxEnabled(state->config) ? state->config.targetBitrate : 0;
+    state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
     state->lastCcErrorsSample = 0;
@@ -1406,28 +1505,8 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return nullptr;
     }
 
-    const std::string type = outputType(cfg);
-    if (type == "rtmp" || type == "youtube") {
-        if (!buildRtmpOutputPipeline(state, pipeline, sourceTail)) {
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-        return pipeline;
-    }
-
-    const bool needsRemux = cfg.remapEnabled || cbrMuxEnabled(cfg);
-    bool ok = false;
-    if (needsRemux) {
-        if (!state->remapContext) {
-            state->remapContext = std::make_unique<RemapContext>();
-        }
-        state->remapContext->config = cfg;
-        ok = buildRemapPipeline(state, pipeline, sourceTail);
-    } else {
-        ok = buildPassthroughPipeline(state, pipeline, sourceTail);
-    }
-
-    if (!ok) {
+    state->outputContexts.clear();
+    if (!buildOutputBranches(state, pipeline, sourceTail)) {
         gst_object_unref(pipeline);
         return nullptr;
     }
@@ -1762,14 +1841,92 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
     return src;
 }
 
-bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
+bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
+    if (!state || !pipeline || !sourceTail) {
+        return false;
+    }
+
+    const auto outputs = pipelineOutputConfigs(state->config);
+    if (outputs.empty()) {
+        return false;
+    }
+    if (outputs.size() == 1) {
+        return buildOutputBranch(state, pipeline, sourceTail, outputs.front(), 0);
+    }
+
+    if (!hasElementFactory("tee")) {
+        std::cerr << missingElementStatus("tee") << std::endl;
+        return false;
+    }
+
+    GstElement* tee = gst_element_factory_make("tee", "output_tee");
+    if (!addElementOrFail(pipeline, tee)) {
+        return false;
+    }
+    if (!gst_element_link(sourceTail, tee)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        GstElement* queue = gst_element_factory_make("queue", branchName("tee_queue", i).c_str());
+        if (!addElementOrFail(pipeline, queue)) {
+            return false;
+        }
+        configureQueue(queue);
+
+        GstPad* teeSrcPad = gst_element_request_pad_simple(tee, "src_%u");
+        GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
+        if (!teeSrcPad || !queueSinkPad) {
+            if (teeSrcPad) gst_object_unref(teeSrcPad);
+            if (queueSinkPad) gst_object_unref(queueSinkPad);
+            return false;
+        }
+        const bool linked = gst_pad_link(teeSrcPad, queueSinkPad) == GST_PAD_LINK_OK;
+        gst_object_unref(teeSrcPad);
+        gst_object_unref(queueSinkPad);
+        if (!linked) {
+            return false;
+        }
+
+        if (!buildOutputBranch(state, pipeline, queue, outputs[i], i)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool StreamManager::buildOutputBranch(
+    StreamState* state,
+    GstElement* pipeline,
+    GstElement* sourceTail,
+    const StreamConfig& outputConfig,
+    size_t branchIndex) {
+    const std::string type = outputType(outputConfig);
+    if (type == "rtmp" || type == "youtube") {
+        return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
+    }
+
+    const bool needsRemux = outputConfig.remapEnabled || cbrMuxEnabled(outputConfig);
+    if (needsRemux) {
+        return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
+    }
+    return buildPassthroughPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
+}
+
+bool StreamManager::buildPassthroughPipeline(
+    StreamState* state,
+    GstElement* pipeline,
+    GstElement* sourceTail,
+    const StreamConfig& outputConfig,
+    size_t branchIndex) {
     if (!state) {
         return false;
     }
-    const StreamConfig& cfg = state->config;
-    GstElement* tsparse = gst_element_factory_make("tsparse", "tsparse");
-    GstElement* queue = gst_element_factory_make("queue", "output_queue");
-    GstElement* sink = createOutputSink(cfg, pipeline);
+    const StreamConfig& cfg = outputConfig;
+    GstElement* tsparse = gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
+    GstElement* queue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
+    GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
 
     if (!tsparse || !queue || !sink) {
         return false;
@@ -1790,8 +1947,13 @@ bool StreamManager::buildPassthroughPipeline(StreamState* state, GstElement* pip
     return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
 
-bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
-    if (!state || !state->remapContext) {
+bool StreamManager::buildRemapPipeline(
+    StreamState* state,
+    GstElement* pipeline,
+    GstElement* sourceTail,
+    const StreamConfig& outputConfig,
+    size_t branchIndex) {
+    if (!state) {
         return false;
     }
     if (!hasElementFactory("tsparse") || !hasElementFactory("tsdemux") || !hasElementFactory("mpegtsmux")) {
@@ -1799,14 +1961,15 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         return false;
     }
 
-    GstElement* tsparse = gst_element_factory_make("tsparse", "remap_tsparse");
-    GstElement* preDemuxQueue = gst_element_factory_make("queue", "remap_pre_demux_queue");
-    GstElement* demux = gst_element_factory_make("tsdemux", "demux");
-    GstElement* mux = gst_element_factory_make("mpegtsmux", "mux");
-    const bool cbrActive = !isUdpOutput(state->config) && cbrMuxEnabled(state->config);
-    GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
-    GstElement* pacer = cbrActive ? gst_element_factory_make("identity", "cbr_pacer") : nullptr;
-    GstElement* sink = createOutputSink(state->config, pipeline);
+    const StreamConfig& cfg = outputConfig;
+    GstElement* tsparse = gst_element_factory_make("tsparse", branchName("remap_tsparse", branchIndex).c_str());
+    GstElement* preDemuxQueue = gst_element_factory_make("queue", branchName("remap_pre_demux_queue", branchIndex).c_str());
+    GstElement* demux = gst_element_factory_make("tsdemux", branchName("demux", branchIndex).c_str());
+    GstElement* mux = gst_element_factory_make("mpegtsmux", branchName("mux", branchIndex).c_str());
+    const bool cbrActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
+    GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
+    GstElement* pacer = cbrActive ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str()) : nullptr;
+    GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
         (cbrActive && !pacer)) {
         return false;
@@ -1822,10 +1985,10 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
     }
 
     configureQueue(preDemuxQueue);
-    configureOutputQueue(outputQueue, state->config);
-    configureCbrPacer(pacer, state->config);
-    configureTsMux(mux, state->config);
-    sendServiceDescription(mux, state->config);
+    configureOutputQueue(outputQueue, cfg);
+    configureCbrPacer(pacer, cfg);
+    configureTsMux(mux, cfg);
+    sendServiceDescription(mux, cfg);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
@@ -1837,13 +2000,22 @@ bool StreamManager::buildRemapPipeline(StreamState* state, GstElement* pipeline,
         return false;
     }
 
-    state->remapContext->mux = mux;
-    state->remapContext->sink = sink;
-    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->remapContext.get());
+    auto context = std::make_unique<RemapContext>();
+    context->mux = mux;
+    context->sink = sink;
+    context->config = cfg;
+    RemapContext* contextPtr = context.get();
+    state->outputContexts.push_back(std::move(context));
+    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
     return true;
 }
 
-bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail) {
+bool StreamManager::buildRtmpOutputPipeline(
+    StreamState* state,
+    GstElement* pipeline,
+    GstElement* sourceTail,
+    const StreamConfig& outputConfig,
+    size_t branchIndex) {
     if (!state) {
         return false;
     }
@@ -1852,12 +2024,13 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
         return false;
     }
 
-    GstElement* tsparse = gst_element_factory_make("tsparse", "rtmp_tsparse");
-    GstElement* preDemuxQueue = gst_element_factory_make("queue", "rtmp_pre_demux_queue");
-    GstElement* demux = gst_element_factory_make("tsdemux", "rtmp_ts_demux");
-    GstElement* mux = gst_element_factory_make("flvmux", "rtmp_flv_mux");
-    GstElement* outputQueue = gst_element_factory_make("queue", "output_queue");
-    GstElement* sink = createOutputSink(state->config, pipeline);
+    const StreamConfig& cfg = outputConfig;
+    GstElement* tsparse = gst_element_factory_make("tsparse", branchName("rtmp_tsparse", branchIndex).c_str());
+    GstElement* preDemuxQueue = gst_element_factory_make("queue", branchName("rtmp_pre_demux_queue", branchIndex).c_str());
+    GstElement* demux = gst_element_factory_make("tsdemux", branchName("rtmp_ts_demux", branchIndex).c_str());
+    GstElement* mux = gst_element_factory_make("flvmux", branchName("rtmp_flv_mux", branchIndex).c_str());
+    GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
+    GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
         return false;
     }
@@ -1886,24 +2059,24 @@ bool StreamManager::buildRtmpOutputPipeline(StreamState* state, GstElement* pipe
         return false;
     }
 
-    if (!state->remapContext) {
-        state->remapContext = std::make_unique<RemapContext>();
-    }
-    state->remapContext->mux = mux;
-    state->remapContext->sink = sink;
-    state->remapContext->config = state->config;
-    state->remapContext->flvMux = true;
-    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->remapContext.get());
+    auto context = std::make_unique<RemapContext>();
+    context->mux = mux;
+    context->sink = sink;
+    context->config = cfg;
+    context->flvMux = true;
+    RemapContext* contextPtr = context.get();
+    state->outputContexts.push_back(std::move(context));
+    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
     return true;
 }
 
-GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline) {
+GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName) {
     const std::string type = outputType(cfg);
     if (isUdpOutputType(type)) {
         std::string error;
         GstElement* sink = udpCbrOutputEnabled(cfg)
-            ? UdpCbrOutput::createSink(pipeline, cfg, error)
-            : UdpVbrOutput::createSink(pipeline, cfg, error);
+            ? UdpCbrOutput::createSink(pipeline, cfg, sinkName, error)
+            : UdpVbrOutput::createSink(pipeline, cfg, sinkName, error);
         if (!sink) {
             std::cerr << error << std::endl;
         }
@@ -1924,7 +2097,7 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         return nullptr;
     }
 
-    GstElement* sink = gst_element_factory_make(factory, "output_sink");
+    GstElement* sink = gst_element_factory_make(factory, sinkName.c_str());
     if (!sink || !addElementOrFail(pipeline, sink)) {
         return nullptr;
     }
@@ -2198,8 +2371,6 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         return;
     }
 
-    GstIterator* iterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
-    GValue item = G_VALUE_INIT;
     gboolean inputAttached = FALSE;
     gboolean outputAttached = FALSE;
 
@@ -2219,40 +2390,30 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         gst_object_unref(inputQueue);
     }
 
-    GstElement* outputQueue = gst_bin_get_by_name(GST_BIN(state->pipeline), "output_queue");
-    if (outputQueue) {
-        GstPad* srcPad = gst_element_get_static_pad(outputQueue, "src");
-        if (srcPad) {
-            gst_pad_add_probe(
-                srcPad,
-                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
-                outputPadProbe,
-                state,
-                nullptr);
-            gst_object_unref(srcPad);
-            outputAttached = TRUE;
+    GstIterator* outputIterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
+    GValue outputItem = G_VALUE_INIT;
+    while (gst_iterator_next(outputIterator, &outputItem) == GST_ITERATOR_OK) {
+        GstElement* element = GST_ELEMENT(g_value_get_object(&outputItem));
+        const gchar* name = GST_ELEMENT_NAME(element);
+        if (name && g_str_has_prefix(name, "output_queue")) {
+            GstPad* srcPad = gst_element_get_static_pad(element, "src");
+            if (srcPad) {
+                gst_pad_add_probe(
+                    srcPad,
+                    static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                    outputPadProbe,
+                    state,
+                    nullptr);
+                gst_object_unref(srcPad);
+                outputAttached = TRUE;
+            }
         }
-        gst_object_unref(outputQueue);
+        g_value_unset(&outputItem);
     }
+    gst_iterator_free(outputIterator);
 
-    GstElement* outputSink = gst_bin_get_by_name(GST_BIN(state->pipeline), "output_sink");
-    if (!outputAttached && outputSink) {
-        GstPad* sinkPad = gst_element_get_static_pad(outputSink, "sink");
-        if (sinkPad) {
-            gst_pad_add_probe(
-                sinkPad,
-                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
-                outputPadProbe,
-                state,
-                nullptr);
-            gst_object_unref(sinkPad);
-            outputAttached = TRUE;
-        }
-    }
-    if (outputSink) {
-        gst_object_unref(outputSink);
-    }
-
+    GstIterator* iterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
+    GValue item = G_VALUE_INIT;
     while (gst_iterator_next(iterator, &item) == GST_ITERATOR_OK) {
         GstElement* element = GST_ELEMENT(g_value_get_object(&item));
         GstElementFactory* factory = gst_element_get_factory(element);
@@ -2286,7 +2447,8 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
              g_strcmp0(factoryName, "srtsink") == 0 ||
              g_strcmp0(factoryName, "rtmpsink") == 0 ||
              g_strcmp0(factoryName, "multifdsink") == 0 ||
-             g_strcmp0(factoryName, "hlssink") == 0)) {
+             g_strcmp0(factoryName, "hlssink") == 0 ||
+             g_strcmp0(factoryName, "appsink") == 0)) {
             GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
             if (sinkPad) {
                 gst_pad_add_probe(

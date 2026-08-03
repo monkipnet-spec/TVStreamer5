@@ -7,6 +7,24 @@
 #include <ctime>
 #include <iomanip>
 
+StreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {
+    StreamOutputConfig output;
+    output.outputType = root.get("output_type", "udp-cbr").asString();
+    output.outputMode = root.get("output_mode", "listener").asString();
+    output.outputHost = root.get("output_host", "127.0.0.1").asString();
+    output.outputPort = root.get("output_port", 1234).asInt();
+    return output;
+}
+
+Json::Value StreamOutputConfig::toJson() const {
+    Json::Value root;
+    root["output_type"] = outputType;
+    root["output_mode"] = outputMode;
+    root["output_host"] = outputHost;
+    root["output_port"] = outputPort;
+    return root;
+}
+
 StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     StreamConfig config;
     config.id = root.get("id", "").asString();
@@ -29,6 +47,20 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.serviceId = root.get("service_id", 1).asUInt();
     config.serviceName = root.get("service_name", "").asString();
     config.serviceProvider = root.get("service_provider", "").asString();
+    if (root.isMember("outputs") && root["outputs"].isArray() && root["outputs"].size() > 0) {
+        const auto primary = StreamOutputConfig::fromJson(root["outputs"][0]);
+        config.outputType = primary.outputType;
+        config.outputMode = primary.outputMode;
+        config.outputHost = primary.outputHost;
+        config.outputPort = primary.outputPort;
+        for (Json::ArrayIndex i = 1; i < root["outputs"].size(); ++i) {
+            config.additionalOutputs.push_back(StreamOutputConfig::fromJson(root["outputs"][i]));
+        }
+    } else if (root.isMember("additional_outputs") && root["additional_outputs"].isArray()) {
+        for (const auto& item : root["additional_outputs"]) {
+            config.additionalOutputs.push_back(StreamOutputConfig::fromJson(item));
+        }
+    }
     return config;
 }
 
@@ -54,6 +86,11 @@ Json::Value StreamConfig::toJson() const {
     root["service_id"] = serviceId;
     root["service_name"] = serviceName;
     root["service_provider"] = serviceProvider;
+    Json::Value extraOutputs(Json::arrayValue);
+    for (const auto& output : additionalOutputs) {
+        extraOutputs.append(output.toJson());
+    }
+    root["additional_outputs"] = extraOutputs;
     return root;
 }
 

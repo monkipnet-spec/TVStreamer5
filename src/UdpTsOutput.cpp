@@ -470,9 +470,12 @@ namespace UdpTsOutput {
 GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
+    const std::string& sinkName,
     const PacingConfig& pacing,
     std::string& error) {
-    GstElement* sink = gst_element_factory_make("appsink", "output_sink");
+    GstElement* sink = gst_element_factory_make(
+        "appsink",
+        sinkName.empty() ? "output_sink" : sinkName.c_str());
     if (!sink || !gst_bin_add(GST_BIN(pipeline), sink)) {
         if (sink) {
             gst_object_unref(sink);

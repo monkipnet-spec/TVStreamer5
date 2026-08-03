@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 #include "ConfigManager.h"
 #include "TelegramNotifier.h"
@@ -58,7 +59,7 @@ struct StreamState {
     std::array<bool, 8192> inputContinuityValid {};
     std::mutex inputContinuityMutex;
     std::unique_ptr<RemapContext> sourceContext;
-    std::unique_ptr<RemapContext> remapContext;
+    std::vector<std::unique_ptr<RemapContext>> outputContexts;
 };
 
 class StreamManager {
@@ -87,10 +88,12 @@ private:
     GstElement* createPipeline(StreamState* state);
     GstElement* createSourceChain(StreamState* state, GstElement* pipeline, GstElement*& terminalElement);
     GstElement* createTestPatternChain(const StreamConfig& cfg, GstElement* pipeline, GstElement*& terminalElement);
-    bool buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
-    bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
-    bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
-    GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline);
+    bool buildOutputBranches(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
+    bool buildOutputBranch(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
+    bool buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
+    bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
+    bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
+    GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
