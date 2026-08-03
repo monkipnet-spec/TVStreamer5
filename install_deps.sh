@@ -10,22 +10,6 @@ fi
 
 APT_GET=("${SUDO[@]}" apt-get)
 
-install_first_available() {
-    local description="$1"
-    shift
-
-    for package in "$@"; do
-        if apt-cache show "${package}" >/dev/null 2>&1; then
-            echo "Installing ${description}: ${package}"
-            "${APT_GET[@]}" install -y "${package}"
-            return
-        fi
-    done
-
-    echo "Unable to find package for ${description}. Tried: $*" >&2
-    exit 1
-}
-
 "${APT_GET[@]}" update
 "${APT_GET[@]}" install -y \
     build-essential \
@@ -52,17 +36,6 @@ install_first_available() {
     git \
     wget \
     ca-certificates
-
-install_first_available "SRT development files" \
-    libsrt-gnutls-dev \
-    libsrt-openssl-dev \
-    libsrt-dev
-
-if ! pkg-config --exists srt; then
-    echo "SRT pkg-config metadata was not found after installation." >&2
-    echo "Install a package that provides srt.pc, then rerun CMake." >&2
-    exit 1
-fi
 
 "${APT_GET[@]}" clean
 

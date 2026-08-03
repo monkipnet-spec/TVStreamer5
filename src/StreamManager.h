@@ -72,8 +72,8 @@ public:
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
     bool addHttpClient(const std::string& id, int fd, const std::string& clientIp);
-    bool addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol, int socket = -1);
-    bool removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol, int socket = -1);
+    bool addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
+    bool removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
     size_t activeHttpSessions(const std::string& clientIp) const;
     size_t activeSubscriberSessions(const SubscriberConfig& subscriber);
     size_t resetHttpSessions(const std::string& clientIp);
@@ -104,7 +104,6 @@ private:
     static GstPadProbeReturn outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
     void pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::time_point now);
-    void closeSrtSocket(int socket) const;
     static gboolean onSrtCallerConnecting(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
     static void onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
     static void onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
@@ -117,7 +116,6 @@ private:
         std::string clientIp;
         std::string protocol;
         std::chrono::steady_clock::time_point lastActivity = std::chrono::steady_clock::now();
-        int socket = -1;
     };
     std::map<int, HttpClientSession> httpClients;
     std::map<std::string, HttpClientSession> adHocSessions;

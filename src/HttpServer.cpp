@@ -870,7 +870,7 @@ void HttpServer::handleStopStream(const std::string& body) {
       if (!subscriber.backupIp.empty() && subscriber.backupIp != subscriber.primaryIp) {
         reset += streamManager.resetHttpSessions(subscriber.backupIp);
       }
-      const size_t restarted = streamManager.restartAllSrtOutputs();
+      const size_t restarted = streamManager.restartSrtOutputsForStreams(subscriber.streamIds);
       std::cerr << "Reset subscriber sessions: " << name << " (" << reset
                 << "), restarted_srt_outputs=" << restarted << std::endl;
       return;

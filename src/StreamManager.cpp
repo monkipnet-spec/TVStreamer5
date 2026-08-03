@@ -13,7 +13,6 @@
 
 #include <glib.h>
 #include <gio/gio.h>
-#include <srt/srt.h>
 #include <unistd.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
@@ -27,6 +26,8 @@ constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
+constexpr int kSrtRestartAttempts = 4;
+constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr const char* kTestPatternUri = "test://bars";
 
 bool hasElementFactory(const char* name) {
@@ -895,7 +896,7 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
     return true;
 }
 
-bool StreamManager::addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol, int socket) {
+bool StreamManager::addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol) {
     if (streamId.empty() || clientIp.empty()) {
         return false;
     }
@@ -906,11 +907,11 @@ bool StreamManager::addStreamSession(const std::string& streamId, const std::str
     const std::string key = protocol == "hls"
         ? protocol + ":" + streamId + ":" + normalizedClientIp
         : protocol + ":" + streamId + ":" + normalizedClientIp + ":" + std::to_string(nextSessionId.fetch_add(1, std::memory_order_relaxed));
-    adHocSessions[key] = {streamId, normalizedClientIp, protocol, now, socket};
+    adHocSessions[key] = {streamId, normalizedClientIp, protocol, now};
     return true;
 }
 
-bool StreamManager::removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol, int socket) {
+bool StreamManager::removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol) {
     if (streamId.empty() || clientIp.empty()) {
         return false;
     }
@@ -919,8 +920,7 @@ bool StreamManager::removeStreamSession(const std::string& streamId, const std::
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
         const auto& session = it->second;
-        const bool socketMatches = socket < 0 || session.socket == socket;
-        if (session.streamId == streamId && session.clientIp == normalizedClientIp && session.protocol == protocol && socketMatches) {
+        if (session.streamId == streamId && session.clientIp == normalizedClientIp && session.protocol == protocol) {
             it = adHocSessions.erase(it);
             return true;
         }
@@ -945,15 +945,6 @@ void StreamManager::pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::t
         } else {
             ++it;
         }
-    }
-}
-
-void StreamManager::closeSrtSocket(int socket) const {
-    if (socket < 0) {
-        return;
-    }
-    if (srt_close(static_cast<SRTSOCKET>(socket)) != 0) {
-        std::cerr << "Failed to close SRT socket " << socket << ": " << srt_getlasterror_str() << std::endl;
     }
 }
 
@@ -1096,31 +1087,27 @@ size_t StreamManager::enforceSubscriberAccess() {
 }
 
 size_t StreamManager::restartSrtOutputsForStreams(const std::vector<std::string>& streamIds) {
-    struct RestartTarget {
-        std::string id;
-        GstElement* pipeline = nullptr;
-    };
-
-    std::vector<RestartTarget> targets;
+    std::vector<StreamConfig> configs;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         for (const auto& streamId : streamIds) {
-            if (streamId.empty() || std::find_if(targets.begin(), targets.end(), [&streamId](const RestartTarget& target) {
-                    return target.id == streamId;
-                }) != targets.end()) {
+            if (streamId.empty() || std::find_if(configs.begin(), configs.end(), [&streamId](const StreamConfig& config) {
+                    return config.id == streamId;
+                }) != configs.end()) {
                 continue;
             }
             auto found = streams.find(streamId);
-            if (found == streams.end() || !found->second->pipeline || outputType(found->second->config) != "srt") {
+            if (found == streams.end() || !found->second->pipeline ||
+                outputType(found->second->config) != "srt" ||
+                srtOutputMode(found->second->config) != "listener") {
                 continue;
             }
-            gst_object_ref(found->second->pipeline);
-            targets.push_back({streamId, found->second->pipeline});
+            configs.push_back(found->second->config);
         }
 
-        for (const auto& target : targets) {
+        for (const auto& config : configs) {
             for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
-                if (it->second.protocol == "srt" && it->second.streamId == target.id) {
+                if (it->second.protocol == "srt" && it->second.streamId == config.id) {
                     it = adHocSessions.erase(it);
                 } else {
                     ++it;
@@ -1130,16 +1117,30 @@ size_t StreamManager::restartSrtOutputsForStreams(const std::vector<std::string>
     }
 
     size_t restarted = 0;
-    for (const auto& target : targets) {
-        std::cerr << "Restarting SRT output to drop clients for stream " << target.id << std::endl;
-        gst_element_set_state(target.pipeline, GST_STATE_NULL);
-        const GstStateChangeReturn ret = gst_element_set_state(target.pipeline, GST_STATE_PLAYING);
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to restart SRT output for stream " << target.id << std::endl;
-        } else {
-            ++restarted;
+    for (const auto& config : configs) {
+        std::cerr << "Rebuilding SRT listener to drop clients for stream " << config.id << std::endl;
+        if (!stopStream(config.id)) {
+            std::cerr << "Unable to stop SRT listener for stream " << config.id << std::endl;
+            continue;
         }
-        gst_object_unref(target.pipeline);
+
+        bool started = false;
+        for (int attempt = 1; attempt <= kSrtRestartAttempts; ++attempt) {
+            std::this_thread::sleep_for(kSrtRestartRetryDelay);
+            if (startStream(config)) {
+                started = true;
+                break;
+            }
+            std::cerr << "SRT listener restart attempt " << attempt
+                      << " failed for stream " << config.id << std::endl;
+        }
+
+        if (started) {
+            ++restarted;
+        } else {
+            std::cerr << "SRT listener remains stopped after restart attempts for stream "
+                      << config.id << std::endl;
+        }
     }
     return restarted;
 }
@@ -1203,7 +1204,7 @@ gboolean StreamManager::onSrtCallerConnecting(GstElement* sink, GSocketAddress* 
     return allowed ? TRUE : FALSE;
 }
 
-void StreamManager::onSrtCallerAdded(GstElement* sink, gint socket, GSocketAddress* addr, gpointer userData) {
+void StreamManager::onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData) {
     auto* ctx = static_cast<SrtAccessContext*>(userData);
     if (!ctx || !ctx->manager) {
         return;
@@ -1211,21 +1212,19 @@ void StreamManager::onSrtCallerAdded(GstElement* sink, gint socket, GSocketAddre
     const std::string clientIp = socketAddressToString(addr);
     if (!clientIp.empty()) {
         if (!ctx->manager->isClientAllowedForStream(ctx->streamId, clientIp)) {
-            std::cerr << "Closing unauthorized SRT socket " << socket
-                      << " for stream " << ctx->streamId
+            std::cerr << "Rebuilding SRT listener after unauthorized caller for stream " << ctx->streamId
                       << " from " << clientIp << std::endl;
-            ctx->manager->closeSrtSocket(socket);
+            ctx->manager->restartSrtOutputsForStreams({ctx->streamId});
             return;
         }
         std::cerr << "SRT caller added for stream " << ctx->streamId
-                  << " from " << clientIp
-                  << " socket=" << socket << std::endl;
-        ctx->manager->addStreamSession(ctx->streamId, clientIp, "srt", socket);
+                  << " from " << clientIp << std::endl;
+        ctx->manager->addStreamSession(ctx->streamId, clientIp, "srt");
     }
     (void)sink;
 }
 
-void StreamManager::onSrtCallerRemoved(GstElement* sink, gint socket, GSocketAddress* addr, gpointer userData) {
+void StreamManager::onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData) {
     auto* ctx = static_cast<SrtAccessContext*>(userData);
     if (!ctx || !ctx->manager) {
         return;
@@ -1233,9 +1232,8 @@ void StreamManager::onSrtCallerRemoved(GstElement* sink, gint socket, GSocketAdd
     const std::string clientIp = socketAddressToString(addr);
     if (!clientIp.empty()) {
         std::cerr << "SRT caller removed for stream " << ctx->streamId
-                  << " from " << clientIp
-                  << " socket=" << socket << std::endl;
-        ctx->manager->removeStreamSession(ctx->streamId, clientIp, "srt", socket);
+                  << " from " << clientIp << std::endl;
+        ctx->manager->removeStreamSession(ctx->streamId, clientIp, "srt");
     }
     (void)sink;
 }
