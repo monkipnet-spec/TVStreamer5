@@ -197,6 +197,8 @@ void HttpServer::handleSession(tcp::socket socket) {
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.set(http::field::server, "TVStreamer5");
         res.set(http::field::content_type, "text/html; charset=UTF-8");
+        res.set(http::field::cache_control, "no-store");
+        res.set(http::field::pragma, "no-cache");
         res.keep_alive(req.keep_alive());
 
         const std::string target(req.target());
@@ -1089,7 +1091,7 @@ let state = {};
 let networkRefreshTimer = null;
 let subscribersModalOpen = false;
 function fetchState() {
-  Promise.all([fetch('/api/state').then(r=>r.json()), fetch('/api/system-metrics').then(r=>r.json())])
+  Promise.all([fetch('/api/state', {cache:'no-store'}).then(r=>r.json()), fetch('/api/system-metrics', {cache:'no-store'}).then(r=>r.json())])
     .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics); refreshSubscriberSessions();});
 }
 function updateSystemLoad(metrics) {
@@ -1103,7 +1105,7 @@ function updateSystemLoad(metrics) {
   `).join('') : `<tr><td colspan="3" class="network-empty">${t('interfacesNotFound')}</td></tr>`;
 }
 function fetchSystemMetrics() {
-  fetch('/api/system-metrics').then(r=>r.json()).then(updateSystemLoad).catch(()=>{});
+  fetch('/api/system-metrics', {cache:'no-store'}).then(r=>r.json()).then(updateSystemLoad).catch(()=>{});
 }
 function downloadVlcPlaylist() {
   const entries = (state.streams || [])
@@ -1124,6 +1126,7 @@ function downloadVlcPlaylist() {
   URL.revokeObjectURL(url);
 }
 function openModal(html) {
+  subscribersModalOpen = false;
   document.getElementById('modalContent').innerHTML = html;
   document.getElementById('modalContent').className = 'modal-content';
   document.getElementById('modal').classList.add('active');
@@ -1304,7 +1307,7 @@ function saveSubscribers() {
   fetch('/api/save-subscribers', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({filtering_enabled:document.getElementById('subscriberFiltering').checked, subscribers})
-  }).then(()=>{ state.subscribers=subscribers; state.subscriber_filtering_enabled=document.getElementById('subscriberFiltering').checked; closeModal(); fetchState(); });
+  }).then(()=>{ state.subscribers=subscribers; state.subscriber_filtering_enabled=document.getElementById('subscriberFiltering').checked; refreshSubscriberSessions(); fetchState(); });
 }
 function exportSubscribers() {
   const rows = [...document.querySelectorAll('.subscriber-row')];

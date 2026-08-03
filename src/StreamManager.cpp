@@ -1062,6 +1062,9 @@ size_t StreamManager::enforceSubscriberAccess() {
                 ++it;
                 continue;
             }
+            std::cerr << "Disconnecting unauthorized " << it->second.protocol
+                      << " session stream=" << it->second.streamId
+                      << " ip=" << it->second.clientIp << std::endl;
             auto found = streams.find(it->second.streamId);
             if (found != streams.end() && found->second->pipeline) {
                 GstElement* sink = gst_bin_get_by_name(GST_BIN(found->second->pipeline), "output_sink");
@@ -1078,6 +1081,9 @@ size_t StreamManager::enforceSubscriberAccess() {
                 ++it;
                 continue;
             }
+            std::cerr << "Disconnecting unauthorized " << it->second.protocol
+                      << " session stream=" << it->second.streamId
+                      << " ip=" << it->second.clientIp << std::endl;
             if (it->second.protocol == "srt" && it->second.socket >= 0) {
                 srtSockets.push_back(it->second.socket);
             }
