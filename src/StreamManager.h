@@ -78,6 +78,8 @@ public:
     size_t activeSubscriberSessions(const SubscriberConfig& subscriber);
     size_t resetHttpSessions(const std::string& clientIp);
     size_t enforceSubscriberAccess();
+    size_t restartSrtOutputsForStreams(const std::vector<std::string>& streamIds);
+    size_t restartAllSrtOutputs();
 
 private:
     bool gstreamerInitialized;

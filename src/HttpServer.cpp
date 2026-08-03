@@ -850,6 +850,10 @@ void HttpServer::handleStopStream(const std::string& body) {
     if (reset > 0) {
       std::cerr << "Reset unauthorized stream sessions after subscriber update: " << reset << std::endl;
     }
+    const size_t restarted = streamManager.restartAllSrtOutputs();
+    if (restarted > 0) {
+      std::cerr << "Restarted SRT outputs after subscriber update: " << restarted << std::endl;
+    }
   }
 
   void HttpServer::handleResetSubscriber(const std::string& body) {
@@ -866,7 +870,9 @@ void HttpServer::handleStopStream(const std::string& body) {
       if (!subscriber.backupIp.empty() && subscriber.backupIp != subscriber.primaryIp) {
         reset += streamManager.resetHttpSessions(subscriber.backupIp);
       }
-      std::cerr << "Reset subscriber sessions: " << name << " (" << reset << ")" << std::endl;
+      const size_t restarted = streamManager.restartAllSrtOutputs();
+      std::cerr << "Reset subscriber sessions: " << name << " (" << reset
+                << "), restarted_srt_outputs=" << restarted << std::endl;
       return;
     }
   }
@@ -903,9 +909,13 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .system-load .metric span{color:#7dd1ff;font-weight:700;min-width:38px;text-align:right}
 .network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
 .network-button:hover{background:rgba(57,189,248,.24)}
-.button-primary{padding:8px 14px;border:none;border-radius:999px;color:#FFF;background:#1f8bff;cursor:pointer;font-size:0.88rem;transition:background .2s ease}
+.button-primary{padding:8px 14px;border:none;border-radius:999px;color:#FFF;background:#1f8bff;cursor:pointer;font-size:0.88rem;transition:background .2s ease,color .2s ease,box-shadow .2s ease,opacity .2s ease}
 .button-secondary{padding:7px 12px;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:#EEE;background:rgba(255,255,255,.05);cursor:pointer;font-size:0.82rem;transition:background .2s ease,border-color .2s ease}
 .button-primary:hover{background:#0f7ce7}
+.button-primary.save-clean{background:rgba(255,255,255,.08);color:#9aa3b1;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12);cursor:default}
+.button-primary.save-clean:hover{background:rgba(255,255,255,.08)}
+.button-primary.save-dirty{background:#ffbd4a;color:#161b25;box-shadow:0 0 0 2px rgba(255,189,74,.18)}
+.button-primary.save-dirty:hover{background:#ffc968}
 .button-secondary:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
 .container{padding:10px 12px 12px;max-width:1180px;margin:0 auto}
 .stats-panel{display:grid;grid-template-columns:repeat(2,minmax(100px,1fr));gap:10px;padding:8px 12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px}
@@ -1090,6 +1100,7 @@ function toggleLanguage() {
 let state = {};
 let networkRefreshTimer = null;
 let subscribersModalOpen = false;
+let subscriberFormBaseline = '';
 function fetchState() {
   Promise.all([fetch('/api/state', {cache:'no-store'}).then(r=>r.json()), fetch('/api/system-metrics', {cache:'no-store'}).then(r=>r.json())])
     .then(([data, metrics])=>{state=data; state.system_metrics=metrics; render(); updateSystemLoad(metrics); refreshSubscriberSessions();});
@@ -1246,14 +1257,49 @@ function openSubscribersModal() {
         <button class="button-secondary" onclick="addSubscriber()">+ ${t('addSubscriber')}</button>
         <button class="button-secondary" onclick="exportSubscribers()">${t('exportSubscribers')}</button>
         <button class="button-secondary" onclick="closeModal()">${t('cancel')}</button>
-        <button class="button-primary" onclick="saveSubscribers()">${t('save')}</button>
+        <button id="saveSubscribersButton" class="button-primary save-clean" onclick="saveSubscribers()" disabled>${t('save')}</button>
       </div>
     `);
     document.getElementById('modalContent').className = 'modal-content subscriber-modal';
     subscribersModalOpen = true;
+    if (!subscriberFormBaseline) {
+      subscriberFormBaseline = serializeSubscriberPayload(collectSubscriberPayload());
+    }
+    wireSubscriberDirtyTracking();
+    updateSubscribersSaveButton();
     refreshSubscriberSessions();
   };
+  subscriberFormBaseline = '';
   renderSubscribers();
+}
+function serializeSubscriberPayload(payload) {
+  return JSON.stringify(payload);
+}
+function collectSubscriberPayload() {
+  const rows = [...document.querySelectorAll('.subscriber-row')];
+  const subscribers = rows.map(row => {
+    const value = field => row.querySelector(`[data-field="${field}"]`)?.value.trim() || '';
+    return {
+      name:value('name'), primary_ip:value('primary_ip'), backup_ip:value('backup_ip'), added_at:row.dataset.addedAt || '',
+      enabled:row.querySelector('[data-field="enabled"]')?.checked !== false,
+      stream_ids:[...row.querySelectorAll('[data-stream-id]:checked')].map(input=>input.dataset.streamId)
+    };
+  });
+  return {filtering_enabled:document.getElementById('subscriberFiltering')?.checked === true, subscribers};
+}
+function wireSubscriberDirtyTracking() {
+  const list = document.getElementById('subscriberList');
+  list?.addEventListener('input', updateSubscribersSaveButton);
+  list?.addEventListener('change', updateSubscribersSaveButton);
+  document.getElementById('subscriberFiltering')?.addEventListener('change', updateSubscribersSaveButton);
+}
+function updateSubscribersSaveButton() {
+  const button = document.getElementById('saveSubscribersButton');
+  if (!button) return;
+  const dirty = serializeSubscriberPayload(collectSubscriberPayload()) !== subscriberFormBaseline;
+  button.disabled = !dirty;
+  button.classList.toggle('save-dirty', dirty);
+  button.classList.toggle('save-clean', !dirty);
 }
 function refreshSubscriberSessions() {
   if (!subscribersModalOpen) return;
@@ -1270,24 +1316,37 @@ function refreshSubscriberSessions() {
   });
 }
 function addSubscriber() {
-  const subscribers = state.subscribers || (state.subscribers = []);
-  subscribers.push({name:'', primary_ip:'', backup_ip:'', added_at:new Date().toISOString().slice(0, 10), enabled:true, stream_ids:[]});
+  const payload = collectSubscriberPayload();
+  payload.subscribers.push({name:'', primary_ip:'', backup_ip:'', added_at:new Date().toISOString().slice(0, 10), enabled:true, stream_ids:[]});
+  state.subscribers = payload.subscribers;
+  state.subscriber_filtering_enabled = payload.filtering_enabled;
+  const baseline = subscriberFormBaseline;
   openSubscribersModal();
+  subscriberFormBaseline = baseline;
+  updateSubscribersSaveButton();
 }
 function removeSubscriber(index) {
-  (state.subscribers || []).splice(index, 1);
+  const payload = collectSubscriberPayload();
+  payload.subscribers.splice(index, 1);
+  state.subscribers = payload.subscribers;
+  state.subscriber_filtering_enabled = payload.filtering_enabled;
+  const baseline = subscriberFormBaseline;
   openSubscribersModal();
+  subscriberFormBaseline = baseline;
+  updateSubscribersSaveButton();
 }
 function updateSubscriberStreamSummary(index) {
   const row = document.querySelector(`.subscriber-row[data-index="${index}"]`);
   const summary = document.getElementById(`subscriberStreamsSummary-${index}`);
   if (!row || !summary) return;
   summary.textContent = `${t('streams')} (${row.querySelectorAll('[data-stream-id]:checked').length})`;
+  updateSubscribersSaveButton();
 }
 function updateSubscriberStatus(input) {
   const label = input.closest('.subscriber-enabled');
   const text = label?.querySelector('span');
   if (text) text.textContent = input.checked ? t('enabled') : t('disabled');
+  updateSubscribersSaveButton();
 }
 function resetSubscriberSession(name) {
   fetch('/api/reset-subscriber', {
@@ -1295,19 +1354,19 @@ function resetSubscriberSession(name) {
   }).then(()=>{ state.subscribers = (state.subscribers || []).map(subscriber => subscriber.name === name ? {...subscriber, session_active:false, active_sessions:0} : subscriber); refreshSubscriberSessions(); fetchState(); });
 }
 function saveSubscribers() {
-  const rows = [...document.querySelectorAll('.subscriber-row')];
-  const subscribers = rows.map(row => {
-    const value = field => row.querySelector(`[data-field="${field}"]`)?.value.trim() || '';
-    return {
-      name:value('name'), primary_ip:value('primary_ip'), backup_ip:value('backup_ip'), added_at:row.dataset.addedAt || '',
-      enabled:row.querySelector('[data-field="enabled"]')?.checked !== false,
-      stream_ids:[...row.querySelectorAll('[data-stream-id]:checked')].map(input=>input.dataset.streamId)
-    };
-  });
+  const payload = collectSubscriberPayload();
+  if (serializeSubscriberPayload(payload) === subscriberFormBaseline) return;
   fetch('/api/save-subscribers', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({filtering_enabled:document.getElementById('subscriberFiltering').checked, subscribers})
-  }).then(()=>{ state.subscribers=subscribers; state.subscriber_filtering_enabled=document.getElementById('subscriberFiltering').checked; refreshSubscriberSessions(); fetchState(); });
+    body:JSON.stringify(payload)
+  }).then(()=>{
+    state.subscribers=payload.subscribers;
+    state.subscriber_filtering_enabled=payload.filtering_enabled;
+    subscriberFormBaseline = serializeSubscriberPayload(payload);
+    updateSubscribersSaveButton();
+    refreshSubscriberSessions();
+    fetchState();
+  });
 }
 function exportSubscribers() {
   const rows = [...document.querySelectorAll('.subscriber-row')];
