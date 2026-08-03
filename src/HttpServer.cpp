@@ -891,15 +891,16 @@ void HttpServer::handleStopStream(const std::string& body) {
         }
       }
     }
+    if (configManager.subscribers.toJson() == next.toJson()) {
+      std::cerr << "Subscriber update unchanged; skipping session reset" << std::endl;
+      return;
+    }
+
     configManager.subscribers = std::move(next);
     configManager.saveSubscribers();
     const size_t reset = streamManager.enforceSubscriberAccess();
     if (reset > 0) {
       std::cerr << "Reset unauthorized stream sessions after subscriber update: " << reset << std::endl;
-    }
-    const size_t restarted = streamManager.restartAllSrtOutputs();
-    if (restarted > 0) {
-      std::cerr << "Restarted SRT outputs after subscriber update: " << restarted << std::endl;
     }
   }
 
@@ -1413,13 +1414,15 @@ function resetSubscriberSession(name) {
 }
 function saveSubscribers() {
   const payload = collectSubscriberPayload();
+  const serialized = serializeSubscriberPayload(payload);
+  if (serialized === subscriberFormBaseline) return;
   fetch('/api/save-subscribers', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify(payload)
   }).then(()=>{
     state.subscribers=payload.subscribers;
     state.subscriber_filtering_enabled=payload.filtering_enabled;
-    subscriberFormBaseline = serializeSubscriberPayload(payload);
+    subscriberFormBaseline = serialized;
     updateSubscribersSaveButton();
     refreshSubscriberSessions();
     fetchState();
