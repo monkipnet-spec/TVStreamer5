@@ -1,8 +1,12 @@
 #include "UdpInput.h"
 
+#include <gio/gio.h>
+
 #include <iostream>
 #include <regex>
+#include <sys/socket.h>
 #include <unordered_set>
+#include <vector>
 
 #include "utils.h"
 
@@ -15,29 +19,169 @@ bool isMulticastHost(const std::string& host) {
     return std::regex_search(host, pattern);
 }
 
-std::string interfaceNameOrAddress(const std::string& address) {
-    for (const auto& iface : enumerateNetworkInterfaces()) {
-        if (iface.address == address) {
-            return iface.name;
-        }
-    }
-    return address;
-}
-
-std::string allInterfaceNames() {
-    std::string names;
+std::vector<std::string> multicastInterfaceNames(
+    const std::string& configuredInterface,
+    std::string& error) {
+    std::vector<std::string> names;
     std::unordered_set<std::string> added;
     for (const auto& iface : enumerateNetworkInterfaces()) {
-        if (iface.name.empty() || !iface.isUp || !iface.supportsMulticast ||
-            !added.insert(iface.name).second) {
+        if (!configuredInterface.empty() &&
+            iface.address != configuredInterface && iface.name != configuredInterface) {
             continue;
         }
-        if (!names.empty()) {
-            names += ',';
+
+        if (iface.name.empty() || !iface.isUp || !iface.supportsMulticast) {
+            if (!configuredInterface.empty()) {
+                error = "selected multicast input interface is down or does not support multicast: " +
+                    configuredInterface;
+                return {};
+            }
+            continue;
         }
-        names += iface.name;
+        if (added.insert(iface.name).second) {
+            names.push_back(iface.name);
+        }
+    }
+
+    if (!configuredInterface.empty() && names.empty() && error.empty()) {
+        error = "selected multicast input interface was not found: " + configuredInterface;
     }
     return names;
+}
+
+std::string joinedInterfaceNames(const std::vector<std::string>& interfaces) {
+    std::string result;
+    for (const auto& iface : interfaces) {
+        if (!result.empty()) {
+            result += ',';
+        }
+        result += iface;
+    }
+    return result;
+}
+
+std::string gErrorMessage(const std::string& prefix, GError* error) {
+    std::string result = prefix;
+    if (error && error->message) {
+        result += ": ";
+        result += error->message;
+    }
+    if (error) {
+        g_error_free(error);
+    }
+    return result;
+}
+
+GSocket* createMulticastSocket(
+    const std::string& group,
+    int port,
+    const std::string& configuredInterface,
+    std::vector<std::string>& joinedInterfaces,
+    std::string& error) {
+    GError* socketError = nullptr;
+    GSocket* socket = g_socket_new(
+        G_SOCKET_FAMILY_IPV4,
+        G_SOCKET_TYPE_DATAGRAM,
+        G_SOCKET_PROTOCOL_UDP,
+        &socketError);
+    if (!socket) {
+        error = gErrorMessage("failed to create multicast input socket", socketError);
+        return nullptr;
+    }
+
+    // Bind to the wildcard address, as multicast receivers normally do. The
+    // group and the selected VLAN are applied separately below. This avoids
+    // relying on udpsrc's platform-dependent multicast bind behaviour.
+    GInetAddress* anyAddress = g_inet_address_new_any(G_SOCKET_FAMILY_IPV4);
+    GSocketAddress* bindAddress = anyAddress
+        ? g_inet_socket_address_new(anyAddress, static_cast<guint16>(port))
+        : nullptr;
+    if (anyAddress) {
+        g_object_unref(anyAddress);
+    }
+    if (!bindAddress) {
+        g_object_unref(socket);
+        error = "failed to create multicast wildcard bind address";
+        return nullptr;
+    }
+
+    if (!g_socket_bind(socket, bindAddress, TRUE, &socketError)) {
+        g_object_unref(bindAddress);
+        g_object_unref(socket);
+        error = gErrorMessage(
+            "failed to bind multicast input socket to 0.0.0.0:" + std::to_string(port),
+            socketError);
+        return nullptr;
+    }
+    g_object_unref(bindAddress);
+
+    GInetAddress* groupAddress = g_inet_address_new_from_string(group.c_str());
+    if (!groupAddress || !g_inet_address_get_is_multicast(groupAddress)) {
+        if (groupAddress) {
+            g_object_unref(groupAddress);
+        }
+        g_object_unref(socket);
+        error = "invalid IPv4 multicast group: " + group;
+        return nullptr;
+    }
+
+    std::string interfaceError;
+    const auto interfaces = multicastInterfaceNames(configuredInterface, interfaceError);
+    if (!interfaceError.empty()) {
+        g_object_unref(groupAddress);
+        g_object_unref(socket);
+        error = interfaceError;
+        return nullptr;
+    }
+
+    if (interfaces.empty()) {
+        if (!g_socket_join_multicast_group(socket, groupAddress, FALSE, nullptr, &socketError)) {
+            g_object_unref(groupAddress);
+            g_object_unref(socket);
+            error = gErrorMessage("failed to join multicast group " + group, socketError);
+            return nullptr;
+        }
+        joinedInterfaces.push_back("route-default");
+    } else {
+        for (const auto& iface : interfaces) {
+            socketError = nullptr;
+            if (g_socket_join_multicast_group(
+                    socket, groupAddress, FALSE, iface.c_str(), &socketError)) {
+                joinedInterfaces.push_back(iface);
+                continue;
+            }
+
+            const std::string joinError = gErrorMessage(
+                "failed to join multicast group " + group + " on " + iface,
+                socketError);
+            if (!configuredInterface.empty()) {
+                g_object_unref(groupAddress);
+                g_object_unref(socket);
+                error = joinError;
+                return nullptr;
+            }
+            std::cerr << "UDP input warning: " << joinError << std::endl;
+        }
+        if (joinedInterfaces.empty()) {
+            g_object_unref(groupAddress);
+            g_object_unref(socket);
+            error = "failed to join multicast group " + group + " on any active interface";
+            return nullptr;
+        }
+    }
+
+    g_object_unref(groupAddress);
+
+    // Request the receive buffer before handing the socket to udpsrc. Failure
+    // is non-fatal because Linux may clamp it to net.core.rmem_max.
+    socketError = nullptr;
+    if (!g_socket_set_option(
+            socket, SOL_SOCKET, SO_RCVBUF, kSocketBufferSize, &socketError)) {
+        std::cerr << "UDP input warning: "
+                  << gErrorMessage("failed to set multicast receive buffer", socketError)
+                  << std::endl;
+    }
+    return socket;
 }
 
 std::string effectiveInputInterfaceAddress(
@@ -110,44 +254,50 @@ GstElement* build(
     const std::string inputInterfaceAddress =
         effectiveInputInterfaceAddress(config, multicastInput, wildcardUriHost);
 
-    // For multicast, udpsrc must receive the group address so it can join it.
-    // A unicast URI host is commonly the sender/destination address (FFmpeg and
-    // VLC syntax), and binding a receiving socket to that remote address fails
-    // with EADDRNOTAVAIL. Always bind unicast to a selected local interface or
-    // to all local interfaces instead.
+    // Multicast uses a wildcard-bound socket with an explicit group membership
+    // created above. A unicast URI host is commonly the sender/destination
+    // address (FFmpeg and VLC syntax), and binding a receiving socket to that
+    // remote address fails with EADDRNOTAVAIL. Bind unicast to a selected local
+    // interface or to all local interfaces instead.
     const std::string listenAddress = multicastInput
-        ? uriHost
+        ? "0.0.0.0"
         : (inputInterfaceAddress.empty() ? "0.0.0.0" : inputInterfaceAddress);
 
-    g_object_set(src,
-        "address", listenAddress.c_str(),
-        "port", port,
-        "reuse", TRUE,
-        "auto-multicast", multicastInput ? TRUE : FALSE,
-        "do-timestamp", FALSE,
-        "buffer-size", kSocketBufferSize,
-        nullptr);
-
-    std::string multicastInterfaces;
+    std::vector<std::string> joinedInterfaces;
     if (multicastInput) {
-        // udpsrc otherwise joins the group only on the interface selected by
-        // the kernel's multicast route. Its multicast-iface property accepts
-        // a comma-separated list, so the UI's "all interfaces" option must
-        // explicitly pass every available interface.
-        multicastInterfaces = inputInterfaceAddress.empty()
-            ? allInterfaceNames()
-            : interfaceNameOrAddress(inputInterfaceAddress);
-        if (!multicastInterfaces.empty()) {
-            g_object_set(src, "multicast-iface", multicastInterfaces.c_str(), nullptr);
+        GSocket* socket = createMulticastSocket(
+            uriHost, port, inputInterfaceAddress, joinedInterfaces, error);
+        if (!socket) {
+            return nullptr;
         }
+        g_object_set(src,
+            "address", uriHost.c_str(),
+            "port", port,
+            "socket", socket,
+            "close-socket", TRUE,
+            "reuse", TRUE,
+            "auto-multicast", FALSE,
+            "do-timestamp", FALSE,
+            "buffer-size", kSocketBufferSize,
+            nullptr);
+        g_object_unref(socket);
+    } else {
+        g_object_set(src,
+            "address", listenAddress.c_str(),
+            "port", port,
+            "reuse", TRUE,
+            "auto-multicast", FALSE,
+            "do-timestamp", FALSE,
+            "buffer-size", kSocketBufferSize,
+            nullptr);
     }
 
     std::cerr << "UDP input: protocol=" << toLower(match[1].str())
               << " uri_host=" << (uriHost.empty() ? "@" : uriHost)
               << " listen=" << listenAddress << ":" << port;
     if (multicastInput) {
-        std::cerr << " multicast_iface="
-                  << (multicastInterfaces.empty() ? "route-default" : multicastInterfaces);
+        std::cerr << " multicast_join=" << uriHost
+                  << " multicast_iface=" << joinedInterfaceNames(joinedInterfaces);
     }
     std::cerr << std::endl;
 
