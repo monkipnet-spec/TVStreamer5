@@ -1,5 +1,6 @@
 #include "UdpInput.h"
 
+#include <iostream>
 #include <regex>
 
 #include "utils.h"
@@ -20,6 +21,21 @@ std::string interfaceNameOrAddress(const std::string& address) {
         }
     }
     return address;
+}
+
+std::string effectiveInputInterfaceAddress(
+    const StreamConfig& config,
+    bool multicastInput,
+    bool wildcardUriHost) {
+    if (config.inputInterfaceAddressConfigured) {
+        return config.inputInterfaceAddress;
+    }
+
+    // Configs created before input_interface_address existed used the output
+    // interface for multicast and udp://@:port. An explicitly configured empty
+    // input interface now means "listen on all interfaces" and must not fall
+    // back. An explicit unicast URI is safely received on all local addresses.
+    return (multicastInput || wildcardUriHost) ? config.interfaceAddress : "";
 }
 
 void configureQueue(GstElement* queue) {
@@ -71,34 +87,44 @@ GstElement* build(
         error = "UDP/RTP input port is out of range";
         return nullptr;
     }
-    std::string host = match[2].str();
-    const bool bindAny = host.empty() || host == "@" || host == "0.0.0.0";
-    if (bindAny) {
-        host = "0.0.0.0";
-    }
-    const std::string inputInterfaceAddress = config.inputInterfaceAddress.empty()
-        ? config.interfaceAddress
-        : config.inputInterfaceAddress;
-    const bool multicastInput = isMulticastHost(host);
-    if (!multicastInput && bindAny && !inputInterfaceAddress.empty()) {
-        host = inputInterfaceAddress;
-    }
+    const std::string uriHost = match[2].str();
+    const bool multicastInput = isMulticastHost(uriHost);
+    const bool wildcardUriHost = uriHost.empty() || uriHost == "0.0.0.0";
+    const std::string inputInterfaceAddress =
+        effectiveInputInterfaceAddress(config, multicastInput, wildcardUriHost);
+
+    // For multicast, udpsrc must receive the group address so it can join it.
+    // A unicast URI host is commonly the sender/destination address (FFmpeg and
+    // VLC syntax), and binding a receiving socket to that remote address fails
+    // with EADDRNOTAVAIL. Always bind unicast to a selected local interface or
+    // to all local interfaces instead.
+    const std::string listenAddress = multicastInput
+        ? uriHost
+        : (inputInterfaceAddress.empty() ? "0.0.0.0" : inputInterfaceAddress);
 
     g_object_set(src,
-        "address", host.c_str(),
+        "address", listenAddress.c_str(),
         "port", port,
         "reuse", TRUE,
+        "auto-multicast", multicastInput ? TRUE : FALSE,
         "do-timestamp", FALSE,
         "buffer-size", kSocketBufferSize,
         nullptr);
 
     if (multicastInput) {
-        g_object_set(src, "auto-multicast", TRUE, nullptr);
         if (!inputInterfaceAddress.empty()) {
             const std::string iface = interfaceNameOrAddress(inputInterfaceAddress);
             g_object_set(src, "multicast-iface", iface.c_str(), nullptr);
         }
     }
+
+    std::cerr << "UDP input: protocol=" << toLower(match[1].str())
+              << " uri_host=" << (uriHost.empty() ? "@" : uriHost)
+              << " listen=" << listenAddress << ":" << port;
+    if (multicastInput && !inputInterfaceAddress.empty()) {
+        std::cerr << " multicast_iface=" << interfaceNameOrAddress(inputInterfaceAddress);
+    }
+    std::cerr << std::endl;
 
     if (toLower(match[1].str()) == "rtp") {
         GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");

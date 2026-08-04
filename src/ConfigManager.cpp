@@ -47,6 +47,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
     config.outputPort = root.get("output_port", 1234).asInt();
     config.interfaceAddress = root.get("interface_address", "").asString();
+    config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");
     config.inputInterfaceAddress = root.get("input_interface_address", "").asString();
     config.inputMode = root.get("input_mode", "auto").asString();
     config.testPattern = root.get("test_pattern", false).asBool();
@@ -89,7 +90,9 @@ Json::Value StreamConfig::toJson() const {
     root["output_host"] = outputHost;
     root["output_port"] = outputPort;
     root["interface_address"] = interfaceAddress;
-    root["input_interface_address"] = inputInterfaceAddress;
+    if (inputInterfaceAddressConfigured) {
+        root["input_interface_address"] = inputInterfaceAddress;
+    }
     root["input_mode"] = inputMode;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;

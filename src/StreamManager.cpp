@@ -1061,11 +1061,14 @@ uint64_t StreamManager::queryPipelineBitrate(GstElement* pipeline) {
     return 0;
 }
 std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
+    const std::string inputInterface = cfg.inputInterfaceAddressConfigured
+        ? cfg.inputInterfaceAddress
+        : cfg.interfaceAddress;
     std::ostringstream desc;
     desc << "manual-pipeline"
          << " input=" << cfg.inputUri
          << " input_mode=" << cfg.inputMode
-         << " input_iface=" << (cfg.inputInterfaceAddress.empty() ? cfg.interfaceAddress : cfg.inputInterfaceAddress)
+         << " input_iface=" << (inputInterface.empty() ? "auto" : inputInterface)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
          << " outputs=";
