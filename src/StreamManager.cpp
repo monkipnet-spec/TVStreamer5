@@ -1984,7 +1984,7 @@ bool StreamManager::buildOutputBranch(
         return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
 
-    const bool needsRemux = outputConfig.remapEnabled || cbrMuxEnabled(outputConfig);
+    const bool needsRemux = outputConfig.remapEnabled;
     if (needsRemux) {
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
@@ -2003,25 +2003,33 @@ bool StreamManager::buildPassthroughPipeline(
     const StreamConfig& cfg = outputConfig;
     GstElement* tsparse = gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
     GstElement* queue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
+    const bool cbrPacingActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
+    GstElement* pacer = cbrPacingActive
+        ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str())
+        : nullptr;
     GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
 
-    if (!tsparse || !queue || !sink) {
+    if (!tsparse || !queue || !sink || (cbrPacingActive && !pacer)) {
         return false;
     }
 
     if (!addElementOrFail(pipeline, tsparse) ||
-        !addElementOrFail(pipeline, queue)) {
+        !addElementOrFail(pipeline, queue) ||
+        (pacer && !addElementOrFail(pipeline, pacer))) {
         return false;
     }
 
     configureOutputQueue(queue, cfg);
+    configureCbrPacer(pacer, cfg);
     configureTsPacketAlignment(tsparse);
     if (isUdpOutput(cfg)) {
         setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
         setUInt64PropertyIfPresent(tsparse, "smoothing-latency", kTsSmoothingLatency);
     }
 
-    return gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
+    return pacer
+        ? gst_element_link_many(sourceTail, tsparse, queue, pacer, sink, nullptr)
+        : gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
 }
 
 bool StreamManager::buildRemapPipeline(
