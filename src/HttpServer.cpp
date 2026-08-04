@@ -7,15 +7,19 @@
 #include <boost/beast/version.hpp>
 #include <boost/algorithm/string.hpp>
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -175,6 +179,57 @@ int streamHttpPort(const StreamConfig& cfg, int defaultPort) {
     return defaultPort;
 }
 
+std::map<std::string, StreamConfig> streamConfigById(const std::vector<StreamConfig>& streams) {
+    std::map<std::string, StreamConfig> result;
+    for (const auto& stream : streams) {
+        if (!stream.id.empty()) {
+            result[stream.id] = stream;
+        }
+    }
+    return result;
+}
+
+bool sameStreamConfig(const StreamConfig& left, const StreamConfig& right) {
+    return left.toJson() == right.toJson();
+}
+
+std::vector<std::string> currentProcessArgs() {
+    std::vector<std::string> args;
+    std::ifstream input("/proc/self/cmdline", std::ios::binary);
+    std::string arg;
+    while (std::getline(input, arg, '\0')) {
+        args.push_back(arg);
+    }
+    if (args.empty()) {
+        args.push_back("TVStreamer");
+    }
+    return args;
+}
+
+void closeInheritedFileDescriptors() {
+    long maxFd = sysconf(_SC_OPEN_MAX);
+    if (maxFd < 0 || maxFd > 65536) {
+        maxFd = 65536;
+    }
+    for (int fd = 3; fd < maxFd; ++fd) {
+        close(fd);
+    }
+}
+
+[[noreturn]] void execCurrentProcess(const std::vector<std::string>& args) {
+    std::vector<std::string> argvStorage = args;
+    std::vector<char*> argv;
+    argv.reserve(argvStorage.size() + 1);
+    for (auto& arg : argvStorage) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
+    execv("/proc/self/exe", argv.data());
+    std::cerr << "Program restart failed: " << std::strerror(errno) << std::endl;
+    std::_Exit(1);
+}
+
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = normalizedOutputType(cfg);
     if (type == "srt") {
@@ -326,6 +381,10 @@ void HttpServer::handleSession(tcp::socket socket) {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/restart-program") {
+                handleRestartProgram();
+                res.set(http::field::content_type, "application/json");
+                res.body() = "{\"result\": \"restarting\"}";
             } else if (target == "/api/delete-stream") {
               handleDeleteStream(req.body());
               res.set(http::field::content_type, "application/json");
@@ -875,6 +934,9 @@ void HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Invalid config payload: " << errs << std::endl;
         return;
     }
+    const AppConfig previousConfig = configManager.config;
+    const auto previousStreams = streamConfigById(previousConfig.streams);
+    const auto managedSnapshot = streamManager.snapshot();
     AppConfig nextConfig = AppConfig::fromJson(root);
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
@@ -888,9 +950,36 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("http_port") || nextConfig.httpPort <= 0 || nextConfig.httpPort > 65535) {
         nextConfig.httpPort = configManager.config.httpPort;
     }
+    const auto nextStreams = streamConfigById(nextConfig.streams);
+    std::vector<std::string> streamsToStop;
+    std::vector<StreamConfig> streamsToRestart;
+    for (const auto& [id, state] : managedSnapshot) {
+        (void)state;
+        const auto next = nextStreams.find(id);
+        if (next == nextStreams.end()) {
+            streamsToStop.push_back(id);
+            continue;
+        }
+        const auto previous = previousStreams.find(id);
+        if (previous == previousStreams.end() || !sameStreamConfig(previous->second, next->second)) {
+            streamsToRestart.push_back(next->second);
+        }
+    }
+
     configManager.config = nextConfig;
     configManager.save();
     refreshHttpPorts();
+
+    for (const auto& id : streamsToStop) {
+        std::cerr << "Stopping removed stream after config save: " << id << std::endl;
+        streamManager.stopStream(id);
+    }
+    for (const auto& stream : streamsToRestart) {
+        std::cerr << "Hard restarting stream after config change: " << stream.id << std::endl;
+        if (!streamManager.restartStream(stream)) {
+            std::cerr << "Hard restart failed for stream: " << stream.id << std::endl;
+        }
+    }
 }
 
 void HttpServer::handleStartStream(const std::string& body) {
@@ -903,7 +992,11 @@ void HttpServer::handleStartStream(const std::string& body) {
         return;
     }
     auto cfg = StreamConfig::fromJson(root);
-    streamManager.startStream(cfg);
+    if (!streamManager.startStream(cfg) &&
+        !streamManager.isStreamActive(cfg.id) &&
+        streamManager.snapshot().count(cfg.id) > 0) {
+        streamManager.restartStream(cfg);
+    }
 }
 
 void HttpServer::handleStopStream(const std::string& body) {
@@ -917,6 +1010,17 @@ void HttpServer::handleStopStream(const std::string& body) {
     }
     std::string id = root.get("id", "").asString();
     streamManager.stopStream(id);
+}
+
+void HttpServer::handleRestartProgram() {
+    const auto args = currentProcessArgs();
+    std::thread([this, args]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::cerr << "Restarting TVStreamer5 process" << std::endl;
+        streamManager.stopAll();
+        closeInheritedFileDescriptors();
+        execCurrentProcess(args);
+    }).detach();
 }
 
   void HttpServer::handleDeleteStream(const std::string& body) {
@@ -1023,6 +1127,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .system-load .metric span{color:#7dd1ff;font-weight:700;min-width:38px;text-align:right}
 .network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
 .network-button:hover{background:rgba(57,189,248,.24)}
+.restart-button{border-color:rgba(255,184,77,.28);color:#ffe0a3;background:rgba(255,184,77,.1)}
+.restart-button:hover{background:rgba(255,184,77,.2);border-color:rgba(255,184,77,.38)}
+.restart-button:disabled{opacity:.65;cursor:wait}
 .button-primary{padding:8px 14px;border:none;border-radius:999px;color:#FFF;background:#1f8bff;cursor:pointer;font-size:0.88rem;transition:background .2s ease,color .2s ease,box-shadow .2s ease,opacity .2s ease}
 .button-secondary{padding:7px 12px;border:1px solid rgba(255,255,255,.14);border-radius:999px;color:#EEE;background:rgba(255,255,255,.05);cursor:pointer;font-size:0.82rem;transition:background .2s ease,border-color .2s ease}
 .button-primary:hover{background:#0f7ce7}
@@ -1182,6 +1289,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 <button class="button-secondary" onclick="openTelegramModal()">Telegram API</button>
 <button class="button-secondary" onclick="downloadVlcPlaylist()" data-i18n="playlist">VLC playlist</button>
 <button class="button-secondary" onclick="openSubscribersModal()" data-i18n="subscribers">Subscribers</button>
+<button class="button-secondary restart-button" onclick="restartProgram()" data-i18n="restartProgram">Restart</button>
 <button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
 <button class="button-secondary" onclick="openAboutModal()">About</button>
 </div>
@@ -1197,6 +1305,7 @@ const translations = {
     subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', user:'User', addStream:'+ Add stream',
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
+    restartProgram:'Restart', restartConfirm:'Restart TVStreamer5 now?', restarting:'Restarting...',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
     about:'About', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
@@ -1204,6 +1313,7 @@ const translations = {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', user:'Пользователь', addStream:'+ Добавить поток',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
+    restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreamer5 сейчас?', restarting:'Перезапуск...',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
     about:'About', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
@@ -1376,6 +1486,19 @@ function deleteStream(id) {
   if (!stream || !window.confirm(`${t('removeConfirm')} «${stream.name || stream.id}»?`)) return;
   fetch('/api/delete-stream', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
     .then(()=>{ closeModal(); setTimeout(fetchState, 300); });
+}
+function restartProgram() {
+  if (!window.confirm(t('restartConfirm'))) return;
+  const button = document.querySelector('.restart-button');
+  if (button) {
+    button.disabled = true;
+    button.textContent = t('restarting');
+  }
+  fetch('/api/restart-program', {method:'POST'})
+    .catch(()=>{})
+    .finally(()=>{
+      setTimeout(()=>window.location.reload(), 3500);
+    });
 }
 function openNetworkModal() {
   document.getElementById('modalContent').className = 'modal-content network-modal';

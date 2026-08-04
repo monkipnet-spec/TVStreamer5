@@ -58,6 +58,7 @@ private:
     void handleSaveConfig(const std::string& body);
     void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
+    void handleRestartProgram();
     void handleDeleteStream(const std::string& body);
     void handleSaveSubscribers(const std::string& body);
     void handleResetSubscriber(const std::string& body);

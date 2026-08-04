@@ -68,8 +68,10 @@ public:
     ~StreamManager();
 
     bool startStream(const StreamConfig& streamConfig);
+    bool restartStream(const StreamConfig& streamConfig);
     bool stopStream(const std::string& id);
     void stopAll();
+    bool isStreamActive(const std::string& id);
     std::vector<std::string> activeStreams();
     std::map<std::string, StreamState*> snapshot();
     bool addHttpClient(const std::string& id, int fd, const std::string& clientIp);

@@ -945,6 +945,15 @@ bool StreamManager::stopStream(const std::string& id) {
     return true;
 }
 
+bool StreamManager::restartStream(const StreamConfig& streamConfig) {
+    std::cerr << "Hard restarting stream: " << streamConfig.id << std::endl;
+    const bool stopped = stopStream(streamConfig.id);
+    if (stopped) {
+        std::this_thread::sleep_for(kSrtRestartRetryDelay);
+    }
+    return startStream(streamConfig);
+}
+
 void StreamManager::stopAll() {
     std::vector<std::unique_ptr<StreamState>> stoppedStreams;
     {
@@ -977,6 +986,12 @@ void StreamManager::stopAll() {
         state.outputContexts.clear();
         state.sourceContext.reset();
     }
+}
+
+bool StreamManager::isStreamActive(const std::string& id) {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    auto found = streams.find(id);
+    return found != streams.end() && found->second->active.load();
 }
 
 std::vector<std::string> StreamManager::activeStreams() {
