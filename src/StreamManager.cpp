@@ -326,6 +326,14 @@ std::string telegramEscape(const std::string& value) {
     return escaped;
 }
 
+bool telegramUsesEnglish(const ConfigManager& manager) {
+    return toLower(manager.config.language) == "en";
+}
+
+std::string telegramText(const ConfigManager& manager, const char* ru, const char* en) {
+    return telegramUsesEnglish(manager) ? en : ru;
+}
+
 std::string displayName(const StreamConfig& cfg) {
     return cfg.name.empty() ? cfg.id : cfg.name;
 }
@@ -909,7 +917,11 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         }
         return false;
     }
-    notifyStreamState(streamConfig, "🟢", "Поток запущен", "Источник: основной\nURL: " + streamConfig.inputUri);
+    notifyStreamState(
+        streamConfig,
+        "🟢",
+        telegramText(configManager, "Поток запущен", "Stream started"),
+        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + streamConfig.inputUri);
     return true;
 }
 
@@ -964,7 +976,11 @@ bool StreamManager::stopStream(const std::string& id) {
     state.outputContexts.clear();
     state.sourceContext.reset();
 
-    notifyStreamState(stoppedConfig, "⚪", "Поток остановлен", "Остановлен вручную");
+    notifyStreamState(
+        stoppedConfig,
+        "⚪",
+        telegramText(configManager, "Поток остановлен", "Stream stopped"),
+        telegramText(configManager, "Остановлен вручную", "Stopped manually"));
     return true;
 }
 
@@ -1446,9 +1462,10 @@ void StreamManager::notifyStreamState(
         ? "TVStreamer5"
         : configManager.config.serverName;
     std::ostringstream message;
+    const bool english = telegramUsesEnglish(configManager);
     message << color << " <b>" << telegramEscape(title) << "</b>\n"
-            << "Сервер: <b>" << telegramEscape(serverName) << "</b>\n"
-            << "Канал: <b>" << telegramEscape(displayName(cfg)) << "</b>\n"
+            << (english ? "Server" : "Сервер") << ": <b>" << telegramEscape(serverName) << "</b>\n"
+            << (english ? "Channel" : "Канал") << ": <b>" << telegramEscape(displayName(cfg)) << "</b>\n"
             << "ID: <code>" << telegramEscape(cfg.id) << "</code>";
     if (!details.empty()) {
         message << "\n" << telegramEscape(details);
@@ -2602,8 +2619,8 @@ void StreamManager::monitorBus(const std::string& id) {
                 notifyStreamState(
                     state->config,
                     "🟢",
-                    "Входной сигнал восстановлен",
-                    "Активный источник: основной\nURL: " + state->activeInputUri);
+                    telegramText(configManager, "Входной сигнал восстановлен", "Input signal restored"),
+                    telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
             }
             state->inputLossNotified = false;
             if (state->primaryRetryPending && !state->usingBackup) {
@@ -2613,8 +2630,8 @@ void StreamManager::monitorBus(const std::string& id) {
                 notifyStreamState(
                     state->config,
                     "🟢",
-                    "Основной поток восстановлен",
-                    "Активный источник: основной\nURL: " + state->activeInputUri);
+                    telegramText(configManager, "Основной поток восстановлен", "Primary stream restored"),
+                    telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
             }
         }
 
@@ -2624,23 +2641,26 @@ void StreamManager::monitorBus(const std::string& id) {
                 notifyStreamState(
                     state->config,
                     "🟡",
-                    "Основной поток пропал",
-                    "Нет входных данных 5 секунд\nПереключаюсь на резерв\nBackup: " + state->config.backupInputUri);
+                    telegramText(configManager, "Основной поток пропал", "Primary stream lost"),
+                    telegramText(configManager, "Нет входных данных 5 секунд", "No input data for 5 seconds") +
+                        "\n" + telegramText(configManager, "Переключаюсь на резерв", "Switching to backup") +
+                        "\nBackup: " + state->config.backupInputUri);
                 if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                     notifyStreamState(
                         state->config,
                         "🟠",
-                        "Работаю с резервного источника",
-                        "Активный источник: резерв\nURL: " + state->activeInputUri);
+                        telegramText(configManager, "Работаю с резервного источника", "Running from backup source"),
+                        telegramText(configManager, "Активный источник: резерв", "Active source: backup") + "\nURL: " + state->activeInputUri);
                 } else {
                     state->inputLossNotified = true;
                     notifyStreamState(
                         state->config,
                         "🔴",
-                        "Не удалось включить резерв",
-                        "Backup pipeline не стартовал\nBackup: " + state->config.backupInputUri);
+                        telegramText(configManager, "Не удалось включить резерв", "Failed to start backup"),
+                        telegramText(configManager, "Backup pipeline не стартовал", "Backup pipeline did not start") +
+                            "\nBackup: " + state->config.backupInputUri);
                 }
             } else if (state->usingBackup && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
                 const std::string primaryUri = state->primaryInputUri;
@@ -2649,8 +2669,9 @@ void StreamManager::monitorBus(const std::string& id) {
                     notifyStreamState(
                         state->config,
                         "🔵",
-                        "Проверяю основной источник",
-                        "Временно возвращаюсь на основной URL\nURL: " + primaryUri);
+                        telegramText(configManager, "Проверяю основной источник", "Checking primary source"),
+                        telegramText(configManager, "Временно возвращаюсь на основной URL", "Temporarily switching back to the primary URL") +
+                            "\nURL: " + primaryUri);
                     if (restartPipelineWithInput(state, primaryUri, false)) {
                         bus = state->bus;
                         state->inputLossNotified = false;
@@ -2660,8 +2681,9 @@ void StreamManager::monitorBus(const std::string& id) {
                 notifyStreamState(
                     state->config,
                     "🟡",
-                    "Основной пока недоступен",
-                    "Возвращаюсь на резервный источник\nBackup: " + state->config.backupInputUri);
+                    telegramText(configManager, "Основной пока недоступен", "Primary is still unavailable"),
+                    telegramText(configManager, "Возвращаюсь на резервный источник", "Returning to backup source") +
+                        "\nBackup: " + state->config.backupInputUri);
                 if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
@@ -2672,8 +2694,10 @@ void StreamManager::monitorBus(const std::string& id) {
                 notifyStreamState(
                     state->config,
                     "🔴",
-                    "Нет входного сигнала",
-                    "Входных данных нет 5 секунд\nРезервная ссылка не задана\nURL: " + state->activeInputUri);
+                    telegramText(configManager, "Нет входного сигнала", "No input signal"),
+                    telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
+                        "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
+                        "\nURL: " + state->activeInputUri);
             }
         }
 
@@ -2695,7 +2719,11 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: " + message;
                 state->active = false;
-                notifyStreamState(state->config, "🔴", "Ошибка потока", "Причина: " + message);
+                notifyStreamState(
+                    state->config,
+                    "🔴",
+                    telegramText(configManager, "Ошибка потока", "Stream error"),
+                    telegramText(configManager, "Причина", "Reason") + ": " + message);
                 gst_message_unref(msg);
                 return;
             }
@@ -2719,7 +2747,11 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
                 state->statusMessage = "ended";
                 state->active = false;
-                notifyStreamState(state->config, "⚫", "Поток завершился", "GStreamer получил EOS");
+                notifyStreamState(
+                    state->config,
+                    "⚫",
+                    telegramText(configManager, "Поток завершился", "Stream ended"),
+                    telegramText(configManager, "GStreamer получил EOS", "GStreamer received EOS"));
                 gst_message_unref(msg);
                 return;
             default:

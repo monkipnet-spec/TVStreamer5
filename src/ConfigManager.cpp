@@ -115,6 +115,7 @@ Json::Value AppConfig::toJson() const {
     root["password"] = password;
     root["server_name"] = serverName;
     root["http_port"] = httpPort;
+    root["language"] = language;
     root["telegram_token"] = telegramToken;
     root["telegram_chat_id"] = telegramChatId;
     Json::Value list(Json::arrayValue);
@@ -131,6 +132,10 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     config.password = root.get("password", "admin").asString();
     config.serverName = root.get("server_name", "TVStreamer5").asString();
     config.httpPort = root.get("http_port", 9000).asInt();
+    config.language = root.get("language", "en").asString();
+    if (config.language != "ru" && config.language != "en") {
+        config.language = "en";
+    }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
     if (root.isMember("streams") && root["streams"].isArray()) {

@@ -51,6 +51,7 @@ struct AppConfig {
     std::string password = "admin";
     std::string serverName = "TVStreamer5";
     int httpPort = 9000;
+    std::string language = "en";
     std::string telegramToken;
     std::string telegramChatId;
     std::vector<StreamConfig> streams;

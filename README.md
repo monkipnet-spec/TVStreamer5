@@ -433,17 +433,17 @@ when the subscriber dialog is saved.
 ## Telegram Notifications
 
 Configure `telegram_token` and `telegram_chat_id` in the web UI or config file
-to enable notifications. Messages use Telegram HTML formatting and colored
-status indicators:
+to enable notifications. Messages use Telegram HTML formatting, colored status
+indicators, and the configured UI language (`language`: `en` or `ru`):
 
 ```text
-🟢 Поток запущен / основной восстановлен
-🟡 Основной поток пропал / идет переключение
-🟠 Поток работает с резервного источника
-🔵 Проверка основного источника
-🔴 Ошибка потока или нет входного сигнала
+🟢 Поток запущен / Stream started
+🟡 Основной поток пропал / Primary stream lost
+🟠 Поток работает с резервного источника / Running from backup source
+🔵 Проверка основного источника / Checking primary source
+🔴 Ошибка потока или нет входного сигнала / Stream error or no input signal
 ⚫ GStreamer EOS
-⚪ Поток остановлен вручную
+⚪ Поток остановлен вручную / Stream stopped manually
 ```
 
 Notifications include the stream name, stream ID, human-readable reason, and the
