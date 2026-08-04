@@ -1265,9 +1265,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .quality-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:10px}
 .quality-title{display:flex;flex-direction:column;gap:4px}
 .quality-title small{color:#9aa3b1}
+.quality-toolbar{display:flex;justify-content:flex-end;align-items:flex-start;gap:8px;flex-wrap:wrap}
 .period-tabs{display:flex;gap:6px;flex-wrap:wrap}
 .period-tabs button{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#d7deec;border-radius:8px;cursor:pointer;font-size:.72rem}
 .period-tabs button.active{background:#1f8bff;color:#fff;border-color:#1f8bff}
+.quality-refresh{display:flex;align-items:center;gap:6px;color:#9aa3b1;font-size:.72rem;white-space:nowrap}
+.quality-refresh select{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:#121825;color:#d7deec;border-radius:8px;font-size:.72rem}
 .quality-board{position:relative;border:1px solid rgba(255,255,255,.1);background:#0f1622;border-radius:10px;padding:10px 10px 8px}
 .quality-board canvas{display:block;width:100%;height:320px;cursor:copy}
 .quality-legend{display:grid;grid-template-columns:1fr auto auto auto auto;gap:8px 18px;align-items:center;margin:10px 0 0;color:#cfd8ea;font-size:.78rem}
@@ -1291,7 +1294,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .quality-errors div{display:flex;gap:8px;padding:3px 0}
 .quality-empty{padding:30px;text-align:center;color:#9aa3b1}
 .quality-copy{color:#7dd1ff;font-size:.78rem;min-height:18px;margin-top:-4px}
-@media (max-width:760px){.quality-board canvas{height:260px}.quality-legend{grid-template-columns:1fr 48px repeat(4,56px);overflow-x:auto}.quality-stats{grid-template-columns:minmax(190px,1fr) 48px repeat(4,56px);overflow-x:auto}}
+@media (max-width:760px){.quality-toolbar{justify-content:flex-start}.quality-board canvas{height:260px}.quality-legend{grid-template-columns:1fr 48px repeat(4,56px);overflow-x:auto}.quality-stats{grid-template-columns:minmax(190px,1fr) 48px repeat(4,56px);overflow-x:auto}}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .form-grid.full{grid-template-columns:1fr}
 .form-row.full{grid-column:1/-1}
@@ -1481,6 +1484,9 @@ function openModal(html) {
 }
 function closeModal() {
   subscribersModalOpen = false;
+  stopQualityAutoRefresh();
+  clearInterval(networkRefreshTimer);
+  networkRefreshTimer = null;
   document.getElementById('modal').classList.remove('active');
 }
 function normalizedOutputType(stream) {
@@ -2182,7 +2188,35 @@ const qualityPeriods = [
   {label:'10 минут', seconds:600},
   {label:'Минута', seconds:60}
 ];
-let qualityChart = {streamId:'', period:3600, samples:[], points:[]};
+const qualityRefreshOptions = [
+  {label:'Выкл', ms:0},
+  {label:'2 сек', ms:2000},
+  {label:'5 сек', ms:5000},
+  {label:'10 сек', ms:10000},
+  {label:'30 сек', ms:30000}
+];
+function storedQualityRefreshMs() {
+  const stored = localStorage.getItem('tvstreamer-quality-refresh-ms');
+  const value = stored === null ? 2000 : Number(stored);
+  return qualityRefreshOptions.some(option => option.ms === value) ? value : 2000;
+}
+let qualityChart = {streamId:'', period:3600, samples:[], points:[], refreshMs:storedQualityRefreshMs(), timer:null};
+function stopQualityAutoRefresh() {
+  clearInterval(qualityChart.timer);
+  qualityChart.timer = null;
+}
+function restartQualityAutoRefresh() {
+  stopQualityAutoRefresh();
+  if (!qualityChart.streamId || !qualityChart.refreshMs) return;
+  qualityChart.timer = setInterval(() => {
+    loadQualityHistory(qualityChart.streamId, qualityChart.period);
+  }, qualityChart.refreshMs);
+}
+function setQualityAutoRefresh(ms) {
+  qualityChart.refreshMs = qualityRefreshOptions.some(option => option.ms === ms) ? ms : 0;
+  localStorage.setItem('tvstreamer-quality-refresh-ms', String(qualityChart.refreshMs));
+  restartQualityAutoRefresh();
+}
 function qualityColor(level) {
   return {ok:'#17c261', warn:'#ffbd4a', error:'#ff5f5f', offline:'#7c879b'}[level] || '#9aa3b1';
 }
@@ -2198,17 +2232,22 @@ function openQualityModal(id, periodSeconds=3600) {
   const stream = state.streams.find(s=>s.id===id);
   if (!stream) return;
   const outputs = outputConfigsForStream(stream);
+  stopQualityAutoRefresh();
   qualityChart.streamId = id;
   qualityChart.period = periodSeconds;
   document.getElementById('modalContent').className = 'modal-content quality-modal';
   const tabs = qualityPeriods.map(p=>`<button class="${p.seconds===periodSeconds?'active':''}" onclick="loadQualityHistory('${id}', ${p.seconds})">${p.label}</button>`).join('');
+  const refreshOptions = qualityRefreshOptions.map(option => `<option value="${option.ms}" ${option.ms===qualityChart.refreshMs?'selected':''}>${option.label}</option>`).join('');
   document.getElementById('modalContent').innerHTML = modalCloseButton() + `
     <div class="quality-head">
       <div class="quality-title">
         <h2>Качество потока</h2>
         <small>${stream.name || stream.id} · ${outputs.map(output => `${normalizedOutputType(output).toUpperCase()} ${output.output_host}:${output.output_port}`).join(' · ')}</small>
       </div>
-      <div class="period-tabs">${tabs}</div>
+      <div class="quality-toolbar">
+        <div class="period-tabs">${tabs}</div>
+        <label class="quality-refresh"><span>Автообновление</span><select onchange="setQualityAutoRefresh(Number(this.value))">${refreshOptions}</select></label>
+      </div>
     </div>
     <div class="quality-board">
       <canvas id="qualityCanvas" width="1160" height="320"></canvas>
@@ -2217,7 +2256,7 @@ function openQualityModal(id, periodSeconds=3600) {
       <strong>Расшифровка</strong>
       <span>Зеленый - текущий bitrate потока по левой шкале Mbit/s.</span>
       <span>Оранжевый - CC-errors по правой шкале; всплески обычно означают потерю или перестановку TS-пакетов.</span>
-      <span>Клик по графику копирует ближайшее измерение.</span>
+      <span>Клик по графику копирует картинку графика.</span>
     </div>
     <div id="qualityCopyNotice" class="quality-copy"></div>
     <div id="qualityDetails" class="quality-details"></div>
@@ -2228,6 +2267,7 @@ function openQualityModal(id, periodSeconds=3600) {
   `;
   document.getElementById('modal').classList.add('active');
   loadQualityHistory(id, periodSeconds);
+  restartQualityAutoRefresh();
 }
 function loadQualityHistory(id, periodSeconds) {
   qualityChart.period = periodSeconds;
@@ -2314,10 +2354,11 @@ function drawQualityChart(data) {
     details.innerHTML = '<div class="quality-card"><strong>Нет данных</strong>История собирается в памяти во время работы приложения.</div>';
     errors.innerHTML = '';
     qualityChart.points = [];
+    canvas.onclick = () => copyQualityChartImage(canvas);
     return;
   }
 
-  const left = 74, right = 48, top = 36, bottom = 70;
+  const left = 74, right = 64, top = 36, bottom = 70;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
   const plotRight = left + plotW;
@@ -2330,7 +2371,20 @@ function drawQualityChart(data) {
   const bitrateStep = maxBitrateMbit <= 20 ? 2 : (maxBitrateMbit <= 50 ? 5 : 10);
   const leftMaxMbit = Math.max(bitrateStep, Math.ceil(maxBitrateMbit * 1.12 / bitrateStep) * bitrateStep);
   const maxCcErrors = Math.max(1, ...ccValues);
-  const rightMax = Math.max(5, Math.ceil(maxCcErrors * 1.25 / 5) * 5);
+  const niceAxis = (maxValue, targetTicks) => {
+    const rawMax = Math.max(1, Number(maxValue || 0));
+    const roughStep = rawMax / Math.max(1, targetTicks);
+    const exponent = Math.floor(Math.log10(roughStep));
+    const base = Math.pow(10, exponent);
+    const fraction = roughStep / base;
+    const niceFraction = fraction <= 1 ? 1 : (fraction <= 2 ? 2 : (fraction <= 5 ? 5 : 10));
+    const step = niceFraction * base;
+    return {max: Math.ceil(rawMax / step) * step, step};
+  };
+  const rightTickCount = Math.max(4, Math.min(8, Math.floor(plotH / 38)));
+  const rightAxis = niceAxis(Math.max(5, maxCcErrors * 1.25), rightTickCount);
+  const rightMax = Math.max(5, rightAxis.max);
+  const rightStep = Math.max(1, rightAxis.step);
 
   ctx.fillStyle = '#cfd8ea';
   ctx.font = '700 13px Arial';
@@ -2364,10 +2418,10 @@ function drawQualityChart(data) {
     ctx.stroke();
     ctx.fillText(value === 0 ? '0 bit/s' : `${value} Mbit/s`, left - 8, y + 4);
   }
-  ctx.textAlign = 'left';
-  for (let value=0; value<=rightMax; value+=5) {
+  ctx.textAlign = 'right';
+  for (let value=0; value<=rightMax + rightStep * .5; value+=rightStep) {
     const y = plotBottom - (value / rightMax) * plotH;
-    ctx.fillText(String(value), plotRight + 8, y + 4);
+    ctx.fillText(String(Math.round(value)), width - 8, y + 4);
   }
 
   ctx.textAlign = 'center';
@@ -2442,29 +2496,9 @@ function drawQualityChart(data) {
   errors.innerHTML = bad.length
     ? bad.map(s=>`<div><span style="color:${(s.cc_errors || 0) > 0 ? '#ff6a1a' : qualityColor(s.level)}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message} · CC: ${s.cc_errors || 0}</span></div>`).join('')
     : '<div><span style="color:#17c261">●</span><span>За выбранный период CC-errors и других ошибок нет</span></div>';
-  canvas.onclick = ev => copyQualityPoint(ev, canvas);
+  canvas.onclick = () => copyQualityChartImage(canvas);
 }
-function copyQualityPoint(ev, canvas) {
-  if (!qualityChart.points.length) return;
-  const rect = canvas.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
-  const y = ev.clientY - rect.top;
-  let nearest = qualityChart.points[0];
-  let best = Number.MAX_VALUE;
-  qualityChart.points.forEach(point => {
-    const dist = Math.hypot(point.x - x, point.y - y);
-    if (dist < best) { best = dist; nearest = point; }
-  });
-  const s = nearest.sample;
-  const text = [
-    `Время: ${formatTime(s.ts, qualityChart.period)}`,
-    `Уровень: ${s.level}`,
-    `Вход: ${s.input_kbps} kbps`,
-    `Выход: ${s.output_kbps} kbps`,
-    `CC-errors: ${s.cc_errors || 0}`,
-    `Статус: ${s.status}`,
-    `Расшифровка: ${s.message}`
-  ].join('\n');
+function copyQualityChartImage(canvas) {
   const notice = document.getElementById('qualityCopyNotice');
   const show = message => {
     if (!notice) return;
@@ -2472,19 +2506,23 @@ function copyQualityPoint(ev, canvas) {
     clearTimeout(notice.copyTimer);
     notice.copyTimer = setTimeout(()=>{ notice.textContent = ''; }, 1800);
   };
-  const onSuccess = () => show('Измерение скопировано в буфер обмена');
-  const onError = () => {
-    if (fallbackCopyText(text)) {
-      onSuccess();
-    } else {
-      show('Не удалось скопировать измерение');
-    }
-  };
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(onSuccess).catch(onError);
-  } else {
-    onError();
+  if (!canvas || !navigator.clipboard || !window.ClipboardItem || !window.isSecureContext) {
+    show('Браузер не разрешил копировать картинку графика');
+    return;
   }
+  let item;
+  try {
+    const png = new Promise((resolve, reject) => {
+      canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('empty canvas image')), 'image/png');
+    });
+    item = new ClipboardItem({'image/png': png});
+  } catch (error) {
+    show('Браузер не поддерживает копирование картинки графика');
+    return;
+  }
+  navigator.clipboard.write([item])
+    .then(() => show('Картинка графика скопирована в буфер обмена'))
+    .catch(() => show('Не удалось скопировать картинку графика'));
 }
 function loadInterfaces() {
   return fetch('/api/interfaces')

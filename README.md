@@ -33,6 +33,12 @@ controls, live quality and system metrics, protocol-specific player links, a
 downloadable VLC playlist, subscriber management, and an English/Russian
 interface switch.
 
+The quality chart shows bitrate history together with CC-error history on a
+separate right-side axis, using adaptive labels so large error spikes remain
+readable. The chart dialog includes selectable auto-refresh intervals, including
+a disabled mode, and clicking the chart copies the current chart image to the
+clipboard for reports or support messages.
+
 The web UI and its API use HTTP Basic Authentication with the `login` and
 `password` values from `tvstreamer5-config.json`. The `/health` endpoint is
 available without authentication for health checks. HTTP TS and HLS player
