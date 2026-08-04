@@ -361,9 +361,15 @@ after TVStreamer5 restarts. Streams with `auto_start` disabled stay stopped.
 ## Backup Failover
 
 Set `backup_input_uri` to enable source failover. If the active input produces no
-data for 2 seconds, TVStreamer5 switches from the primary input to the backup
+data for 5 seconds, TVStreamer5 switches from the primary input to the backup
 input. While running on backup, it periodically checks the primary source and
 switches back automatically when data appears again.
+
+The backup can also be a local replacement file. Set `backup_input_type` to
+`file`, point `backup_input_uri` to the file path, and set `backup_file_loop` to
+`true` when the file should repeat until the primary source returns. The web UI
+can upload a selected file into the local `backup-files/` directory and fill that
+path automatically.
 
 The stream tile shows the currently active input:
 
@@ -448,6 +454,8 @@ Minimal stream object:
   "name": "Channel 1",
   "input_uri": "rtsp://user:password@192.168.1.10:554/stream1",
   "backup_input_uri": "srt://192.168.1.10:9000",
+  "backup_input_type": "url",
+  "backup_file_loop": false,
   "input_mode": "auto",
   "test_pattern": false,
   "output_type": "udp-cbr",

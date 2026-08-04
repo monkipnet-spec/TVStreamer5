@@ -46,6 +46,25 @@ std::string queryValue(const std::string& target, const std::string& key) {
     return "";
 }
 
+std::string urlDecode(const std::string& value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            const std::string hex = value.substr(i + 1, 2);
+            char* end = nullptr;
+            const long ch = std::strtol(hex.c_str(), &end, 16);
+            if (end && *end == '\0') {
+                decoded.push_back(static_cast<char>(ch));
+                i += 2;
+                continue;
+            }
+        }
+        decoded.push_back(value[i] == '+' ? ' ' : value[i]);
+    }
+    return decoded;
+}
+
 int64_t unixNowSeconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -59,6 +78,27 @@ std::string cleanPathToken(const std::string& value, bool allowDot = false) {
         }
     }
     return cleaned;
+}
+
+std::string cleanFileName(const std::string& value) {
+    std::string name;
+    for (char ch : value) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_' || ch == '.') {
+            name.push_back(ch);
+        } else if (std::isspace(static_cast<unsigned char>(ch))) {
+            name.push_back('_');
+        }
+    }
+    if (name.empty() || name == "." || name == "..") {
+        name = "backup-file.ts";
+    }
+    if (!name.empty() && name.front() == '.') {
+        name.insert(name.begin(), '_');
+    }
+    if (name.size() > 96) {
+        name = name.substr(name.size() - 96);
+    }
+    return name;
 }
 
 std::string base64Decode(const std::string& value) {
@@ -313,8 +353,10 @@ void HttpServer::doAccept(std::shared_ptr<tcp::acceptor> listener, int port, uin
 void HttpServer::handleSession(tcp::socket socket) {
     try {
         boost::beast::flat_buffer buffer;
-        http::request<http::string_body> req;
-        http::read(socket, buffer, req);
+        http::request_parser<http::string_body> parser;
+        parser.body_limit(512ULL * 1024ULL * 1024ULL);
+        http::read(socket, buffer, parser);
+        http::request<http::string_body> req = parser.release();
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.set(http::field::server, "TVStreamer5");
         res.set(http::field::content_type, "text/html; charset=UTF-8");
@@ -393,6 +435,9 @@ void HttpServer::handleSession(tcp::socket socket) {
                 handleSaveSubscribers(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
+            } else if (target.rfind("/api/upload-backup-file", 0) == 0) {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleUploadBackupFile(target, req.body());
             } else if (target == "/api/reset-subscriber") {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
@@ -700,7 +745,9 @@ std::string HttpServer::currentState() {
                 : (streamState->activeInputUri.empty() ? cfg.inputUri : streamState->activeInputUri);
             item["active_input_label"] = cfg.testPattern
                 ? "Тест"
-                : (streamState->usingBackup ? "Резерв" : "Основной");
+                : (streamState->usingBackup
+                    ? (toLower(cfg.backupInputType) == "file" ? "Файл замены" : "Резерв")
+                    : "Основной");
             item["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
             item["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
             item["cc_errors"] = Json::UInt64(streamState->ccErrorsDelta.load());
@@ -982,6 +1029,39 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     }
 }
 
+std::string HttpServer::handleUploadBackupFile(const std::string& target, const std::string& body) {
+    Json::Value root;
+    if (body.empty()) {
+        root["error"] = "empty file";
+    } else {
+        const std::string streamId = cleanPathToken(urlDecode(queryValue(target, "stream_id")));
+        const std::string requestedName = cleanFileName(urlDecode(queryValue(target, "filename")));
+        const std::string prefix = streamId.empty() ? "stream" : streamId;
+        const auto directory = std::filesystem::current_path() / "backup-files";
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        if (ec) {
+            root["error"] = "failed to create backup-files directory";
+        } else {
+            const auto destination = directory /
+                (prefix + "-" + std::to_string(unixNowSeconds()) + "-" + requestedName);
+            std::ofstream output(destination, std::ios::binary);
+            if (!output.is_open()) {
+                root["error"] = "failed to open destination file";
+            } else {
+                output.write(body.data(), static_cast<std::streamsize>(body.size()));
+                output.close();
+                root["path"] = destination.string();
+                root["filename"] = requestedName;
+                root["size"] = Json::UInt64(body.size());
+            }
+        }
+    }
+
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, root);
+}
+
 void HttpServer::handleStartStream(const std::string& body) {
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
@@ -1223,6 +1303,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .output-row .remove-output{width:30px;height:30px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;cursor:pointer}
 .output-row .remove-output:disabled{opacity:.35;cursor:not-allowed}
 @media (max-width:760px){.output-row{grid-template-columns:1fr 1fr}.output-row .remove-output{align-self:end}}
+.backup-source{display:grid;grid-template-columns:140px minmax(220px,1fr);gap:8px;width:100%}
+.backup-source input,.backup-source select{box-sizing:border-box;max-width:none}
+.backup-file-row{grid-column:1/-1;display:flex;align-items:center;gap:10px;min-height:32px}
+.backup-file-row input{padding:0;background:transparent;border:0;color:#cfd8ea}
+.backup-file-row span{color:#7dd1ff;font-size:.78rem;overflow-wrap:anywhere}
+@media (max-width:760px){.backup-source{grid-template-columns:1fr}.backup-file-row{flex-direction:column;align-items:flex-start}}
 .form-row-inline small-field input{width:calc(100% - 8px)}
 .form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
 .form-row .checkbox-inline input{width:16px;height:16px}
@@ -1457,7 +1543,7 @@ function render() {
         <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
         <div class="info-row"><strong>${t('activeInput')}</strong><span>${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
-        <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span>${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
@@ -1739,7 +1825,7 @@ function openTelegramModal() {
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
-    name:'', input_uri:'', backup_input_uri:'', output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
+    name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
     interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
@@ -1809,6 +1895,43 @@ function collectOutputRows() {
     };
   });
 }
+function updateBackupInputMode() {
+  const type = document.getElementById('streamBackupInputType')?.value || 'url';
+  const pathInput = document.getElementById('streamBackupInput');
+  const fileRow = document.getElementById('streamBackupFileRow');
+  const loopRow = document.getElementById('streamBackupFileLoopRow');
+  if (pathInput) {
+    pathInput.placeholder = type === 'file'
+      ? '/path/to/replacement.ts или загрузите файл ниже'
+      : 'http://192.168.1.2/...';
+  }
+  if (fileRow) fileRow.style.display = type === 'file' ? '' : 'none';
+  if (loopRow) loopRow.style.display = type === 'file' ? '' : 'none';
+}
+function uploadBackupReplacementFile(streamId, input) {
+  const file = input?.files?.[0];
+  const status = document.getElementById('streamBackupUploadStatus');
+  const backupInput = document.getElementById('streamBackupInput');
+  const typeSelect = document.getElementById('streamBackupInputType');
+  if (!file || !backupInput) return;
+  if (typeSelect) typeSelect.value = 'file';
+  updateBackupInputMode();
+  if (status) status.textContent = 'Загрузка...';
+  fetch(`/api/upload-backup-file?stream_id=${encodeURIComponent(streamId)}&filename=${encodeURIComponent(file.name)}`, {
+    method:'POST',
+    headers:{'Content-Type':'application/octet-stream'},
+    body:file
+  }).then(r=>r.json()).then(result=>{
+    if (result.path) {
+      backupInput.value = result.path;
+      if (status) status.textContent = `Файл загружен: ${result.filename || file.name}`;
+    } else {
+      if (status) status.textContent = result.error || 'Не удалось загрузить файл';
+    }
+  }).catch(()=>{
+    if (status) status.textContent = 'Ошибка загрузки файла';
+  });
+}
 function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
@@ -1821,7 +1944,8 @@ function openStreamForm(stream) {
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://127.0.0.1:9087, rtmp://camera/live/stream или https://host/live.m3u8" /></div>
-        <div class="form-row full"><label>Входной URL (Резервный)</label><input class="compact" id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /></div>
+        <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
+        <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
         <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
@@ -1840,6 +1964,7 @@ function openStreamForm(stream) {
       </div>
     `);
     document.getElementById('streamCbr').checked = outputType === 'udp-cbr' || (outputType !== 'udp-vbr' && stream.cbr);
+    updateBackupInputMode();
     updateOutputHints();
   };
 
@@ -1960,6 +2085,8 @@ function saveStream(id) {
     output_port: primaryOutput.output_port,
     additional_outputs: outputs.slice(1),
     backup_input_uri: document.getElementById('streamBackupInput').value,
+    backup_input_type: document.getElementById('streamBackupInputType').value,
+    backup_file_loop: document.getElementById('streamBackupInputType').value === 'file' && document.getElementById('streamBackupFileLoop').checked,
     interface_address: document.getElementById('streamInterface').value,
     input_mode: document.getElementById('streamInputMode').value,
     test_pattern: document.getElementById('streamTestPattern').checked,

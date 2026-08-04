@@ -285,6 +285,29 @@ bool isRtmpUri(const std::string& uriLower) {
            uriLower.rfind("rtmpts://", 0) == 0;
 }
 
+bool isLocalFileInput(const std::string& input) {
+    const std::string inputLower = toLower(input);
+    return inputLower.rfind("file://", 0) == 0 || input.find("://") == std::string::npos;
+}
+
+bool isBackupFileInput(const StreamConfig& cfg, const std::string& input) {
+    return toLower(cfg.backupInputType) == "file" || isLocalFileInput(input);
+}
+
+std::string fileLocationFromInput(const std::string& input) {
+    if (toLower(input).rfind("file://", 0) != 0) {
+        return input;
+    }
+
+    gchar* location = gst_uri_get_location(input.c_str());
+    if (!location) {
+        return input.substr(7);
+    }
+    std::string result(location);
+    g_free(location);
+    return result;
+}
+
 std::string hlsDirectory(const StreamConfig& cfg) {
     return "/tmp/tvstreamer5-hls/" + cfg.id;
 }
@@ -1748,7 +1771,8 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return nullptr;
     }
 
-    g_object_set(src, "location", input.c_str(), nullptr);
+    const std::string location = fileLocationFromInput(input);
+    g_object_set(src, "location", location.c_str(), nullptr);
     if (!gst_element_link(src, queue)) {
         return nullptr;
     }
@@ -2675,6 +2699,23 @@ void StreamManager::monitorBus(const std::string& id) {
                 return;
             }
             case GST_MESSAGE_EOS:
+                if (state->usingBackup &&
+                    state->config.backupFileLoop &&
+                    isBackupFileInput(state->config, state->activeInputUri) &&
+                    state->pipeline) {
+                    const gboolean looped = gst_element_seek_simple(
+                        state->pipeline,
+                        GST_FORMAT_TIME,
+                        static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+                        0);
+                    if (looped) {
+                        state->statusMessage = "running on backup file loop";
+                        state->lastInputActivity = std::chrono::steady_clock::now();
+                        gst_message_unref(msg);
+                        continue;
+                    }
+                    std::cerr << "Failed to loop backup file for stream: " << id << std::endl;
+                }
                 state->statusMessage = "ended";
                 state->active = false;
                 notifyStreamState(state->config, "⚫", "Поток завершился", "GStreamer получил EOS");

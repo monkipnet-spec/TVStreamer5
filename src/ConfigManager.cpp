@@ -31,6 +31,17 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.name = root.get("name", "").asString();
     config.inputUri = root.get("input_uri", "").asString();
     config.backupInputUri = root.get("backup_input_uri", "").asString();
+    config.backupInputType = root.get("backup_input_type", "").asString();
+    if (config.backupInputType.empty()) {
+        const std::string backupUri = config.backupInputUri;
+        config.backupInputType =
+            backupUri.empty()
+                ? "url"
+                : (backupUri.rfind("file://", 0) == 0 || backupUri.find("://") == std::string::npos
+                ? "file"
+                : "url");
+    }
+    config.backupFileLoop = root.get("backup_file_loop", false).asBool();
     config.outputType = root.get("output_type", "udp-cbr").asString();
     config.outputMode = root.get("output_mode", "listener").asString();
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
@@ -70,6 +81,8 @@ Json::Value StreamConfig::toJson() const {
     root["name"] = name;
     root["input_uri"] = inputUri;
     root["backup_input_uri"] = backupInputUri;
+    root["backup_input_type"] = backupInputType;
+    root["backup_file_loop"] = backupFileLoop;
     root["output_type"] = outputType;
     root["output_mode"] = outputMode;
     root["output_host"] = outputHost;

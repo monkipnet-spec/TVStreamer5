@@ -5,5 +5,6 @@ cmake_install.cmake
 Makefile
 tvstreamer5-config.json
 tvstreamer5-subscribers.json
+backup-files/
 .vscode/
 *.log
