@@ -454,7 +454,7 @@ void updateContinuityErrors(StreamState* state, GstBufferList* list) {
     }
 }
 
-void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
+void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilteringEnabled) {
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
     const std::string targetHost = cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::"
@@ -472,7 +472,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
         nullptr);
 
     setIntPropertyIfPresent(sink, "mode", caller ? 1 : 2);
-    setBooleanPropertyIfPresent(sink, "authentication", TRUE);
+    setBooleanPropertyIfPresent(sink, "authentication", accessFilteringEnabled ? TRUE : FALSE);
     setBooleanPropertyIfPresent(sink, "wait-for-connection", FALSE);
     if (!caller) {
         setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
@@ -490,6 +490,14 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg) {
     if (cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
+
+    std::cerr << "SRT output: mode=" << mode
+              << " uri=" << uri
+              << " advertised=" << (cfg.outputHost.empty() ? "auto" : cfg.outputHost)
+              << ":" << cfg.outputPort
+              << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
+              << " auth=" << (accessFilteringEnabled ? "on" : "off")
+              << std::endl;
 }
 
 std::string rtmpOutputLocation(const StreamConfig& cfg) {
@@ -1460,6 +1468,22 @@ void StreamManager::onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* a
     (void)sink;
 }
 
+void StreamManager::onSrtCallerRejected(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData) {
+    auto* ctx = static_cast<SrtAccessContext*>(userData);
+    if (!ctx) {
+        return;
+    }
+    const std::string clientIp = socketAddressToString(addr);
+    const std::string requestedStreamId = streamId ? streamId : "";
+    std::cerr << "SRT caller rejected for stream " << ctx->streamId
+              << " from " << (clientIp.empty() ? "unknown" : clientIp);
+    if (!requestedStreamId.empty()) {
+        std::cerr << " requested_streamid=" << requestedStreamId;
+    }
+    std::cerr << std::endl;
+    (void)sink;
+}
+
 void StreamManager::notifyStreamState(
     const StreamConfig& cfg,
     const std::string& color,
@@ -2190,10 +2214,13 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
     if (type == "srt") {
         auto* ctx = new SrtAccessContext{this, cfg.id};
         g_object_set_data_full(G_OBJECT(sink), "srt-access-context", ctx, freeSrtAccessContext);
-        g_signal_connect_data(sink, "caller-connecting", G_CALLBACK(StreamManager::onSrtCallerConnecting), ctx, nullptr, static_cast<GConnectFlags>(0));
+        if (configManager.subscribers.filteringEnabled) {
+            g_signal_connect_data(sink, "caller-connecting", G_CALLBACK(StreamManager::onSrtCallerConnecting), ctx, nullptr, static_cast<GConnectFlags>(0));
+            g_signal_connect_data(sink, "caller-rejected", G_CALLBACK(StreamManager::onSrtCallerRejected), ctx, nullptr, static_cast<GConnectFlags>(0));
+        }
         g_signal_connect_data(sink, "caller-added", G_CALLBACK(StreamManager::onSrtCallerAdded), ctx, nullptr, static_cast<GConnectFlags>(0));
         g_signal_connect_data(sink, "caller-removed", G_CALLBACK(StreamManager::onSrtCallerRemoved), ctx, nullptr, static_cast<GConnectFlags>(0));
-        configureSrtSink(sink, cfg);
+        configureSrtSink(sink, cfg, configManager.subscribers.filteringEnabled);
     } else if (type == "http") {
         configureHttpSink(sink, cfg);
     } else if (type == "hls") {

@@ -112,6 +112,7 @@ private:
     static gboolean onSrtCallerConnecting(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
     static void onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
     static void onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
+    static void onSrtCallerRejected(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
 
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;

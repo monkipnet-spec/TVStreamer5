@@ -1152,6 +1152,7 @@ void HttpServer::handleRestartProgram() {
         }
       }
     }
+    const bool filteringModeChanged = configManager.subscribers.filteringEnabled != next.filteringEnabled;
     if (configManager.subscribers.toJson() == next.toJson()) {
       std::cerr << "Subscriber update unchanged; skipping session reset" << std::endl;
       return;
@@ -1162,6 +1163,10 @@ void HttpServer::handleRestartProgram() {
     const size_t reset = streamManager.enforceSubscriberAccess();
     if (reset > 0) {
       std::cerr << "Reset unauthorized stream sessions after subscriber update: " << reset << std::endl;
+    }
+    if (filteringModeChanged) {
+      const size_t restarted = streamManager.restartAllSrtOutputs();
+      std::cerr << "Restarted SRT outputs after filtering mode change: " << restarted << std::endl;
     }
   }
 
