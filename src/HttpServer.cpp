@@ -1258,7 +1258,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
 .modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
-.modal-content.quality-modal{width:min(920px,100%)}
+.modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99)}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
 .modal-content h2{margin-top:0;font-size:1.25rem;margin-bottom:14px;color:#fff}
@@ -1268,25 +1268,30 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .period-tabs{display:flex;gap:6px;flex-wrap:wrap}
 .period-tabs button{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#d7deec;border-radius:8px;cursor:pointer;font-size:.72rem}
 .period-tabs button.active{background:#1f8bff;color:#fff;border-color:#1f8bff}
-.quality-board{position:relative;border:1px solid rgba(255,255,255,.08);background:#101722;border-radius:10px;padding:8px}
-.quality-board canvas{display:block;width:100%;height:230px;cursor:copy}
-.quality-board.cc-board{margin-top:10px}
-.quality-board.cc-board canvas{height:150px;cursor:default}
-.quality-legend{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0;color:#cfd8ea;font-size:.78rem}
-.quality-legend span{display:flex;align-items:center;gap:5px}
+.quality-board{position:relative;border:1px solid rgba(255,255,255,.1);background:#0f1622;border-radius:10px;padding:10px 10px 8px}
+.quality-board canvas{display:block;width:100%;height:320px;cursor:copy}
+.quality-legend{display:grid;grid-template-columns:1fr auto auto auto auto;gap:8px 18px;align-items:center;margin:10px 0 0;color:#cfd8ea;font-size:.78rem}
+.quality-legend .legend-head{color:#8f9bad;font-weight:700;text-align:right}
+.quality-legend .legend-name{display:flex;align-items:center;gap:6px;min-width:0}
+.quality-legend span{white-space:nowrap}
 .quality-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
 .quality-ok{background:#17c261}.quality-warn{background:#ffbd4a}.quality-error{background:#ff5f5f}.quality-offline{background:#7c879b}
-.quality-line{width:22px;height:3px;border-radius:999px;display:inline-block}
-.quality-input{background:#58a6ff}.quality-output{background:#17c261}.quality-cc{background:#ff5f5f}
+.quality-line{width:10px;height:10px;border-radius:2px;display:inline-block;box-shadow:0 0 0 1px rgba(255,255,255,.18)}
+.quality-input{background:#26ef46}.quality-output{background:#ffc42e}.quality-cc{background:#ff6a1a}
 .quality-decode{display:grid;gap:5px;margin:8px 0 10px;padding:8px 10px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:8px;color:#cfd8ea;font-size:.78rem;line-height:1.35}
 .quality-decode strong{color:#fff}
-.quality-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:10px}
+.quality-details{margin-top:10px}
+.quality-stats{display:grid;grid-template-columns:minmax(240px,1fr) 52px repeat(4,70px);gap:4px 10px;align-items:center;color:#cfd8ea;font-size:.78rem}
+.quality-stats .metric-name{display:flex;align-items:center;gap:6px;min-width:0;overflow-wrap:anywhere}
+.quality-stats .unit,.quality-stats .value,.quality-stats .head{text-align:right}
+.quality-stats .head{color:#8f9bad;font-weight:700}
 .quality-card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:8px;padding:8px;color:#cfd8ea;font-size:.78rem}
 .quality-card strong{display:block;color:#fff;margin-bottom:4px}
 .quality-errors{margin-top:10px;max-height:150px;overflow:auto;border-top:1px solid rgba(255,255,255,.08);padding-top:8px;color:#cfd8ea;font-size:.78rem}
 .quality-errors div{display:flex;gap:8px;padding:3px 0}
 .quality-empty{padding:30px;text-align:center;color:#9aa3b1}
 .quality-copy{color:#7dd1ff;font-size:.78rem;min-height:18px;margin-top:-4px}
+@media (max-width:760px){.quality-board canvas{height:260px}.quality-legend{grid-template-columns:1fr 48px repeat(4,56px);overflow-x:auto}.quality-stats{grid-template-columns:minmax(190px,1fr) 48px repeat(4,56px);overflow-x:auto}}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .form-grid.full{grid-template-columns:1fr}
 .form-row.full{grid-column:1/-1}
@@ -2206,22 +2211,13 @@ function openQualityModal(id, periodSeconds=3600) {
       <div class="period-tabs">${tabs}</div>
     </div>
     <div class="quality-board">
-      <canvas id="qualityCanvas" width="860" height="230"></canvas>
-    </div>
-    <div class="quality-board cc-board">
-      <canvas id="ccCanvas" width="860" height="150"></canvas>
-    </div>
-    <div class="quality-legend">
-      <span><i class="quality-line quality-input"></i>Входной битрейт</span>
-      <span><i class="quality-line quality-output"></i>Исходящий битрейт</span>
-      <span><i class="quality-line quality-cc"></i>CC-errors на отдельном графике</span>
-      <span>Клик по графику копирует измерение в буфер</span>
+      <canvas id="qualityCanvas" width="1160" height="320"></canvas>
     </div>
     <div class="quality-decode">
       <strong>Расшифровка</strong>
-      <span>Синий - входной битрейт MPEG-TS на входе приложения.</span>
-      <span>Зеленый - исходящий битрейт после обработки и отправки.</span>
-      <span>Красный - CC-errors: разрывы continuity counter во входном MPEG-TS, обычно означают потерю/перестановку TS-пакетов.</span>
+      <span>Зеленый - текущий bitrate потока по левой шкале Mbit/s.</span>
+      <span>Оранжевый - CC-errors по правой шкале; всплески обычно означают потерю или перестановку TS-пакетов.</span>
+      <span>Клик по графику копирует ближайшее измерение.</span>
     </div>
     <div id="qualityCopyNotice" class="quality-copy"></div>
     <div id="qualityDetails" class="quality-details"></div>
@@ -2250,10 +2246,9 @@ function renderQualityTabs(periodSeconds) {
 }
 function drawQualityChart(data) {
   const canvas = document.getElementById('qualityCanvas');
-  const ccCanvas = document.getElementById('ccCanvas');
   const details = document.getElementById('qualityDetails');
   const errors = document.getElementById('qualityErrors');
-  if (!canvas || !ccCanvas || !details || !errors) return;
+  if (!canvas || !details || !errors) return;
   const setupCanvas = (target, height) => {
     const targetRect = target.getBoundingClientRect();
     const targetRatio = window.devicePixelRatio || 1;
@@ -2263,126 +2258,189 @@ function drawQualityChart(data) {
     targetContext.setTransform(targetRatio, 0, 0, targetRatio, 0, 0);
     return {ctx: targetContext, width: target.width / targetRatio, height};
   };
-  const chart = setupCanvas(canvas, 230);
-  const ccChart = setupCanvas(ccCanvas, 150);
+  const chart = setupCanvas(canvas, 320);
   const ctx = chart.ctx;
-  const ccCtx = ccChart.ctx;
   const width = chart.width;
   const height = chart.height;
-  const ccWidth = ccChart.width;
-  const ccHeight = ccChart.height;
   ctx.clearRect(0, 0, width, height);
-  ccCtx.clearRect(0, 0, ccWidth, ccHeight);
+  ctx.fillStyle = '#0f1622';
+  ctx.fillRect(0, 0, width, height);
+
   const samples = data.samples || [];
+  const stream = (state.streams || []).find(item => item.id === qualityChart.streamId) || {};
+  const streamName = stream.name || data.id || 'Поток';
+  const streamLinkText = (stream.vlc_links && stream.vlc_links[0]?.url) || stream.vlc_link || stream.input_uri || '';
+  const title = `${state.server_name || 'TVStreamer5'}: Поток: ${streamName}${streamLinkText ? ` (${streamLinkText})` : ''}`;
+  const edgeTime = ts => {
+    const date = new Date(ts * 1000);
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${day}-${month} ${hours}:${minutes}`;
+  };
+  const formatMbitValue = kbps => {
+    if (!kbps) return '0 bit/s';
+    const mbps = kbps / 1000;
+    const digits = mbps >= 10 ? 2 : 3;
+    return `${Number(mbps.toFixed(digits))} Mbit/s`;
+  };
+  const formatMetricNumber = value => Number(value || 0).toLocaleString('ru-RU', {maximumFractionDigits: 3});
+  const statsFor = values => {
+    const normalized = values.map(value => Number(value || 0));
+    if (!normalized.length) return {last:0, min:0, avg:0, max:0};
+    const sum = normalized.reduce((total, value) => total + value, 0);
+    return {
+      last: normalized[normalized.length - 1],
+      min: Math.min(...normalized),
+      avg: sum / normalized.length,
+      max: Math.max(...normalized)
+    };
+  };
+  const statsRow = (dotClass, name, unit, stats, formatter) => `
+    <div class="metric-name"><i class="quality-line ${dotClass}"></i>${name}</div>
+    <div class="unit">${unit}</div>
+    <div class="value">${formatter(stats.last)}</div>
+    <div class="value">${formatter(stats.min)}</div>
+    <div class="value">${formatter(stats.avg)}</div>
+    <div class="value">${formatter(stats.max)}</div>
+  `;
+
   if (!samples.length) {
-    ctx.fillStyle = '#9aa3b1';
+    ctx.fillStyle = '#cfd8ea';
+    ctx.font = '700 13px Arial';
     ctx.textAlign = 'center';
     ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
-    ccCtx.fillStyle = '#9aa3b1';
-    ccCtx.textAlign = 'center';
-    ccCtx.fillText('Нет данных CC-errors', ccWidth / 2, ccHeight / 2);
     details.innerHTML = '<div class="quality-card"><strong>Нет данных</strong>История собирается в памяти во время работы приложения.</div>';
     errors.innerHTML = '';
     qualityChart.points = [];
     return;
   }
-  const left = 54, right = 46, top = 16, bottom = 34;
+
+  const left = 74, right = 48, top = 36, bottom = 70;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
-  const ccLeft = 54, ccRight = 46, ccTop = 16, ccBottom = 28;
-  const ccPlotW = ccWidth - ccLeft - ccRight;
-  const ccPlotH = ccHeight - ccTop - ccBottom;
+  const plotRight = left + plotW;
+  const plotBottom = top + plotH;
   const endTs = data.generated_at || Math.floor(Date.now()/1000);
   const startTs = endTs - (data.period_seconds || qualityChart.period);
-  const maxBitrate = Math.max(1000, ...samples.map(s=>Math.max(s.input_kbps || 0, s.output_kbps || 0))) * 1.15;
-  ctx.strokeStyle = 'rgba(255,255,255,.09)';
-  ctx.fillStyle = '#8e99aa';
-  ctx.font = '9px Arial';
-  ctx.textAlign = 'right';
-  for (let i=0;i<=4;i++) {
-    const y = top + plotH * i / 4;
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
-    const kbps = Math.round(maxBitrate * (1 - i / 4));
-    ctx.fillText(kbps + 'k', left - 7, y + 4);
-  }
+  const bitrateValues = samples.map(s => s.output_kbps || s.input_kbps || 0);
+  const ccValues = samples.map(s => s.cc_errors || 0);
+  const maxBitrateMbit = Math.max(1, ...bitrateValues.map(value => value / 1000));
+  const bitrateStep = maxBitrateMbit <= 20 ? 2 : (maxBitrateMbit <= 50 ? 5 : 10);
+  const leftMaxMbit = Math.max(bitrateStep, Math.ceil(maxBitrateMbit * 1.12 / bitrateStep) * bitrateStep);
+  const maxCcErrors = Math.max(1, ...ccValues);
+  const rightMax = Math.max(5, Math.ceil(maxCcErrors * 1.25 / 5) * 5);
+
+  ctx.fillStyle = '#cfd8ea';
+  ctx.font = '700 13px Arial';
   ctx.textAlign = 'center';
-  ctx.fillStyle = '#8e99aa';
-  for (let i=0;i<=6;i++) {
-    const x = left + plotW * i / 6;
-    const ts = startTs + (endTs - startTs) * i / 6;
-    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + plotH); ctx.stroke();
-    ctx.fillText(formatTime(ts, data.period_seconds), x, height - 10);
+  let titleText = title;
+  while (ctx.measureText(titleText).width > plotW && titleText.length > 24) {
+    titleText = titleText.slice(0, -4) + '...';
   }
+  ctx.fillText(titleText, width / 2, 18);
+
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,.24)';
+  ctx.beginPath();
+  ctx.moveTo(left, top - 8);
+  ctx.lineTo(left, plotBottom);
+  ctx.lineTo(plotRight, plotBottom);
+  ctx.moveTo(plotRight, top - 8);
+  ctx.lineTo(plotRight, plotBottom);
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(255,255,255,.13)';
+  ctx.setLineDash([2, 2]);
+  ctx.fillStyle = '#c8d0dc';
+  ctx.font = '11px Arial';
+  ctx.textAlign = 'right';
+  for (let value=0; value<=leftMaxMbit; value+=bitrateStep) {
+    const y = plotBottom - (value / leftMaxMbit) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(plotRight, y);
+    ctx.stroke();
+    ctx.fillText(value === 0 ? '0 bit/s' : `${value} Mbit/s`, left - 8, y + 4);
+  }
+  ctx.textAlign = 'left';
+  for (let value=0; value<=rightMax; value+=5) {
+    const y = plotBottom - (value / rightMax) * plotH;
+    ctx.fillText(String(value), plotRight + 8, y + 4);
+  }
+
+  ctx.textAlign = 'center';
+  const tickCount = Math.max(4, Math.min(20, Math.floor(plotW / 64)));
+  for (let i=0;i<=tickCount;i++) {
+    const correctedX = left + plotW * i / tickCount;
+    const ts = startTs + (endTs - startTs) * i / tickCount;
+    ctx.beginPath();
+    ctx.moveTo(correctedX, top);
+    ctx.lineTo(correctedX, plotBottom);
+    ctx.stroke();
+    const edge = i === 0 || i === tickCount;
+    ctx.save();
+    ctx.translate(correctedX, height - 10);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillStyle = edge ? '#ff7f7f' : '#c8d0dc';
+    ctx.textAlign = 'left';
+    ctx.fillText(edge ? edgeTime(ts) : formatTime(ts, data.period_seconds), 0, 4);
+    ctx.restore();
+  }
+  ctx.setLineDash([]);
+
   const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
-  const yFor = kbps => top + plotH - (Math.min(kbps, maxBitrate) / maxBitrate) * plotH;
-  const drawLine = (field, color) => {
+  const bitrateYFor = kbps => plotBottom - Math.min(kbps / 1000, leftMaxMbit) / leftMaxMbit * plotH;
+  const ccYFor = value => plotBottom - Math.min(value, rightMax) / rightMax * plotH;
+  const drawSeries = (values, color, yFor, widthPx=2) => {
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = widthPx;
     ctx.beginPath();
     let started = false;
-    samples.forEach(s => {
-      const value = s[field] || 0;
+    samples.forEach((s, index) => {
+      const value = values[index] || 0;
       const x = xFor(s.ts);
       const y = yFor(value);
       if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
     });
     ctx.stroke();
   };
-  drawLine('input_kbps', '#58a6ff');
-  drawLine('output_kbps', '#17c261');
+
+  ctx.fillStyle = 'rgba(255,106,26,.26)';
+  samples.forEach(s => {
+    const errors = s.cc_errors || 0;
+    if (!errors) return;
+    const x = xFor(s.ts);
+    const y = ccYFor(errors);
+    ctx.fillRect(x - 2, y, 4, plotBottom - y);
+  });
+  drawSeries(ccValues, '#ff6a1a', ccYFor, 2);
+  drawSeries(bitrateValues, '#26ef46', bitrateYFor, 2.5);
+
   qualityChart.points = [];
-  const lastSample = samples[samples.length - 1] || {};
   samples.forEach(s => {
     const x = xFor(s.ts);
-    const y = yFor(s.output_kbps || s.input_kbps || 0);
-    ctx.fillStyle = qualityColor(s.level);
+    const y = bitrateYFor(s.output_kbps || s.input_kbps || 0);
+    ctx.fillStyle = (s.cc_errors || 0) > 0 ? '#ff6a1a' : qualityColor(s.level);
     ctx.beginPath();
-    ctx.arc(x, y, s.level !== 'ok' ? 5 : 3, 0, Math.PI * 2);
+    ctx.arc(x, y, s.level !== 'ok' || (s.cc_errors || 0) > 0 ? 4 : 2.5, 0, Math.PI * 2);
     ctx.fill();
     qualityChart.points.push({x, y, sample:s});
   });
-  const maxCcErrors = Math.max(1, ...samples.map(s=>s.cc_errors || 0));
-  const ccYFor = value => ccTop + ccPlotH - (Math.min(value, maxCcErrors) / maxCcErrors) * ccPlotH;
-  ccCtx.strokeStyle = 'rgba(255,255,255,.09)';
-  ccCtx.fillStyle = '#ff9c9c';
-  ccCtx.font = '9px Arial';
-  ccCtx.textAlign = 'right';
-  for (let i=0;i<=4;i++) {
-    const y = ccTop + ccPlotH * i / 4;
-    ccCtx.beginPath(); ccCtx.moveTo(ccLeft, y); ccCtx.lineTo(ccWidth - ccRight, y); ccCtx.stroke();
-    ccCtx.fillText(Math.round(maxCcErrors * (1 - i / 4)) + ' cc', ccLeft - 7, y + 4);
-  }
-  ccCtx.textAlign = 'center';
-  ccCtx.fillStyle = '#8e99aa';
-  for (let i=0;i<=6;i++) {
-    const x = ccLeft + ccPlotW * i / 6;
-    const ts = startTs + (endTs - startTs) * i / 6;
-    ccCtx.beginPath(); ccCtx.moveTo(x, ccTop); ccCtx.lineTo(x, ccTop + ccPlotH); ccCtx.stroke();
-    ccCtx.fillText(formatTime(ts, data.period_seconds), x, ccHeight - 8);
-  }
-  const ccXFor = ts => ccLeft + ((ts - startTs) / Math.max(1, endTs - startTs)) * ccPlotW;
-  ccCtx.strokeStyle = '#ff5f5f';
-  ccCtx.fillStyle = 'rgba(255,95,95,.28)';
-  ccCtx.lineWidth = 2;
-  ccCtx.beginPath();
-  let ccStarted = false;
-  samples.forEach(s => {
-    const x = ccXFor(s.ts);
-    const y = ccYFor(s.cc_errors || 0);
-    if ((s.cc_errors || 0) > 0) ccCtx.fillRect(x - 2, y, 4, ccTop + ccPlotH - y);
-    if (!ccStarted) { ccCtx.moveTo(x, y); ccStarted = true; } else { ccCtx.lineTo(x, y); }
-  });
-  ccCtx.stroke();
-  const summary = data.summary || {};
+
+  const bitrateStats = statsFor(bitrateValues);
+  const ccStats = statsFor(ccValues);
   details.innerHTML = `
-    <div class="quality-card"><strong>Период</strong>${formatTime(startTs, data.period_seconds)} — ${formatTime(endTs, data.period_seconds)}</div>
-    <div class="quality-card"><strong>Сэмплы</strong>${samples.length}</div>
-    <div class="quality-card"><strong>Вход / выход</strong>${Math.round(lastSample.input_kbps || 0)} / ${Math.round(lastSample.output_kbps || 0)} kbps</div>
-    <div class="quality-card"><strong>CC-errors</strong>${summary.cc_errors || 0} за период</div>
+    <div class="quality-stats">
+      <div></div><div></div><div class="head">посл</div><div class="head">мин</div><div class="head">сред</div><div class="head">макс</div>
+      ${statsRow('quality-input', `${streamName} bitrate`, '[все]', bitrateStats, formatMbitValue)}
+      ${statsRow('quality-cc', `${streamName} cc`, '[все]', ccStats, value => formatMetricNumber(value))}
+    </div>
   `;
   const bad = samples.filter(s=>s.level !== 'ok' || (s.cc_errors || 0) > 0).slice(-30).reverse();
   errors.innerHTML = bad.length
-    ? bad.map(s=>`<div><span style="color:${(s.cc_errors || 0) > 0 ? '#ff5f5f' : qualityColor(s.level)}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message} · CC: ${s.cc_errors || 0}</span></div>`).join('')
+    ? bad.map(s=>`<div><span style="color:${(s.cc_errors || 0) > 0 ? '#ff6a1a' : qualityColor(s.level)}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message} · CC: ${s.cc_errors || 0}</span></div>`).join('')
     : '<div><span style="color:#17c261">●</span><span>За выбранный период CC-errors и других ошибок нет</span></div>';
   canvas.onclick = ev => copyQualityPoint(ev, canvas);
 }
