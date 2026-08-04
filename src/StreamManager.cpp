@@ -338,6 +338,12 @@ std::string displayName(const StreamConfig& cfg) {
     return cfg.name.empty() ? cfg.id : cfg.name;
 }
 
+std::string configuredInputInterfaceAddress(const StreamConfig& cfg) {
+    return cfg.inputInterfaceAddressConfigured
+        ? cfg.inputInterfaceAddress
+        : cfg.interfaceAddress;
+}
+
 uint64_t bufferListSize(GstBufferList* list) {
     if (!list) {
         return 0;
@@ -1061,9 +1067,7 @@ uint64_t StreamManager::queryPipelineBitrate(GstElement* pipeline) {
     return 0;
 }
 std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
-    const std::string inputInterface = cfg.inputInterfaceAddressConfigured
-        ? cfg.inputInterfaceAddress
-        : cfg.interfaceAddress;
+    const std::string inputInterface = configuredInputInterfaceAddress(cfg);
     std::ostringstream desc;
     desc << "manual-pipeline"
          << " input=" << cfg.inputUri
@@ -1683,6 +1687,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
     if (inputLower.rfind("srt://", 0) == 0) {
         std::string mode = toLower(cfg.inputMode);
+        const std::string inputInterface = configuredInputInterfaceAddress(cfg);
         const char* factory = (mode == "listener") ? "srtsrc" : "srtclientsrc";
         if (!hasElementFactory(factory)) {
             std::cerr << missingElementStatus(factory) << std::endl;
@@ -1699,7 +1704,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
         setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
         setIntPropertyIfPresent(src, "latency", 500);
-        setStringPropertyIfPresent(src, "localaddress", cfg.interfaceAddress);
+        setStringPropertyIfPresent(src, "localaddress", inputInterface);
         if (mode == "listener") {
             setIntPropertyIfPresent(src, "mode", 2);
             setBooleanPropertyIfPresent(src, "wait-for-connection", TRUE);
@@ -1733,6 +1738,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             location = "http://" + input.substr(6);
         }
 
+        const std::string inputInterface = configuredInputInterfaceAddress(cfg);
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
         GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
         GstElement* queue = addQueue("input_queue", 5000000000ULL);
@@ -1744,6 +1750,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
         g_object_set(src, "location", location.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
         setIntPropertyIfPresent(src, "timeout", 15);
+        if (!inputInterface.empty()) {
+            std::cerr << "HLS input: input_iface=" << inputInterface
+                      << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
+                      << std::endl;
+        }
         setIntPropertyIfPresent(demux, "connection-speed", static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1)));
 
         if (!gst_element_link(src, demux)) {
@@ -1767,8 +1778,14 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
+        const std::string inputInterface = configuredInputInterfaceAddress(cfg);
         g_object_set(src, "location", input.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
         setIntPropertyIfPresent(src, "timeout", 15);
+        if (!inputInterface.empty()) {
+            std::cerr << "HTTP input: input_iface=" << inputInterface
+                      << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
+                      << std::endl;
+        }
 
         if (!gst_element_link(src, queue)) {
             return nullptr;

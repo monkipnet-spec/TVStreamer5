@@ -45,6 +45,20 @@ available without authentication for health checks. HTTP TS and HLS player
 links are also unauthenticated; enable subscriber filtering when HTTP TS access
 must be restricted by client IP.
 
+## Screenshots
+
+Dashboard:
+
+![TVStreamer5 dashboard](docs/screenshots/dashboard.png)
+
+Stream settings:
+
+![TVStreamer5 stream settings](docs/screenshots/stream-settings.png)
+
+Network interface load:
+
+![TVStreamer5 network interface load](docs/screenshots/network.png)
+
 ## Install on Linux
 
 Build the binary first:
@@ -240,8 +254,10 @@ Useful checks while testing:
 ```bash
 ip -br addr
 ip route get 239.1.1.1
+ip route get 192.168.148.1
 ss -u -n -a
 sudo tcpdump -ni eth0 udp port 1234
+sudo tcpdump -ni vlan655 host 192.168.148.1
 ```
 
 Optional variables:
@@ -355,19 +371,24 @@ Example with simultaneous UDP multicast, SRT listener, and HLS output:
 }
 ```
 
-The web UI lets you choose the UDP input interface separately from the output
+The web UI lets you choose the input interface separately from the output
 interface. For UDP multicast, `input_interface_address` is used as the multicast
 interface. For UDP/RTP unicast, the receiver binds to that local address, or to
 `0.0.0.0` when `Auto / all interfaces` is selected; the URI host is never used as
-a local unicast bind address. If `input_interface_address` is absent, older
-configs can still fall back to `interface_address`. An explicitly empty value
-means all active IPv4 interfaces that support multicast, including VLAN devices
-such as `enp2s0.123`. To pin reception to a VLAN, create and bring up the VLAN
-device in the host OS, assign it an IPv4 address, and select that address under
-`UDP input interface`. For SRT output, `interface_address` is used as the local
-listener address when supported by the GStreamer SRT plugin. RTSP and RTMP
-camera input and RTMP/YouTube output remux common H.264/H.265/AAC streams
-without transcoding where supported.
+a local unicast bind address. For SRT input, `input_interface_address` is used as
+the SRT `localaddress` when the installed GStreamer SRT plugin supports it. If
+`input_interface_address` is absent, older configs can still fall back to
+`interface_address`. An explicitly empty value means all active IPv4 interfaces
+that support multicast, including VLAN devices such as `enp2s0.123`. To pin UDP
+or SRT reception to a VLAN, create and bring up the VLAN device in the host OS,
+assign it an IPv4 address, and select that address under `Input interface`.
+HTTP/HLS inputs use GStreamer's `souphttpsrc`; current GStreamer versions do not
+expose a source-address bind property there, so Linux routing chooses the
+interface. To force HTTP/HLS input through a VLAN, add a route to the source
+address or network via the VLAN device. For SRT output, `interface_address` is
+used as the local listener address when supported by the GStreamer SRT plugin.
+RTSP and RTMP camera input and RTMP/YouTube output remux common
+H.264/H.265/AAC streams without transcoding where supported.
 
 Enable `auto_start` in a stream's settings to start that stream automatically
 after TVStreamer5 restarts. Streams with `auto_start` disabled stay stopped.

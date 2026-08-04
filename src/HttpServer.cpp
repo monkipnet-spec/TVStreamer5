@@ -141,8 +141,14 @@ bool constantTimeEquals(const std::string& left, const std::string& right) {
     return diff == 0;
 }
 
-std::string advertisedHost(const StreamConfig& cfg) {
-    if (cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::") {
+bool isLoopbackHost(const std::string& host) {
+    const std::string lower = toLower(host);
+    return lower == "localhost" || lower == "127.0.0.1" || lower == "::1";
+}
+
+std::string advertisedHost(const StreamConfig& cfg, bool replaceLoopback = false) {
+    if (cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::" ||
+        (replaceLoopback && isLoopbackHost(cfg.outputHost))) {
         if (!cfg.interfaceAddress.empty()) {
             return cfg.interfaceAddress;
         }
@@ -274,7 +280,8 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = normalizedOutputType(cfg);
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
-        return "srt://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
+        const bool listener = toLower(cfg.outputMode) != "caller";
+        return "srt://" + advertisedHost(cfg, listener) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
     }
     if (type == "youtube") {
         const std::string hostLower = toLower(cfg.outputHost);
@@ -289,10 +296,10 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
             : "rtmp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
     }
     if (type == "http") {
-        return "http://" + advertisedHost(cfg) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/stream/" + cfg.id + ".ts";
+        return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/stream/" + cfg.id + ".ts";
     }
     if (type == "hls") {
-        return "http://" + advertisedHost(cfg) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/hls/" + cfg.id + "/playlist.m3u8";
+        return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/hls/" + cfg.id + "/playlist.m3u8";
     }
     return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
 }
@@ -2020,7 +2027,7 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>UDP интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
+        <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
@@ -2112,8 +2119,9 @@ function syncOutputHostWithInterface() {
   if (!iface) return;
   document.querySelectorAll('.output-row').forEach(row => {
     const type = row.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
+    const outputMode = row.querySelector('[data-output-field="output_mode"]')?.value || 'listener';
     const host = row.querySelector('[data-output-field="output_host"]');
-    if (!host || (type !== 'http' && type !== 'hls')) return;
+    if (!host || (type !== 'http' && type !== 'hls' && !(type === 'srt' && outputMode === 'listener'))) return;
     if (!host.value || host.value === '0.0.0.0' || host.value === '127.0.0.1') {
       host.value = iface;
     }
