@@ -6,6 +6,8 @@
 struct NetworkInterface {
     std::string name;
     std::string address;
+    bool isUp = false;
+    bool supportsMulticast = false;
 };
 
 std::string toLower(const std::string& value);

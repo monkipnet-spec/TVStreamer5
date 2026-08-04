@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <regex>
+#include <unordered_set>
 
 #include "utils.h"
 
@@ -21,6 +22,22 @@ std::string interfaceNameOrAddress(const std::string& address) {
         }
     }
     return address;
+}
+
+std::string allInterfaceNames() {
+    std::string names;
+    std::unordered_set<std::string> added;
+    for (const auto& iface : enumerateNetworkInterfaces()) {
+        if (iface.name.empty() || !iface.isUp || !iface.supportsMulticast ||
+            !added.insert(iface.name).second) {
+            continue;
+        }
+        if (!names.empty()) {
+            names += ',';
+        }
+        names += iface.name;
+    }
+    return names;
 }
 
 std::string effectiveInputInterfaceAddress(
@@ -111,18 +128,26 @@ GstElement* build(
         "buffer-size", kSocketBufferSize,
         nullptr);
 
+    std::string multicastInterfaces;
     if (multicastInput) {
-        if (!inputInterfaceAddress.empty()) {
-            const std::string iface = interfaceNameOrAddress(inputInterfaceAddress);
-            g_object_set(src, "multicast-iface", iface.c_str(), nullptr);
+        // udpsrc otherwise joins the group only on the interface selected by
+        // the kernel's multicast route. Its multicast-iface property accepts
+        // a comma-separated list, so the UI's "all interfaces" option must
+        // explicitly pass every available interface.
+        multicastInterfaces = inputInterfaceAddress.empty()
+            ? allInterfaceNames()
+            : interfaceNameOrAddress(inputInterfaceAddress);
+        if (!multicastInterfaces.empty()) {
+            g_object_set(src, "multicast-iface", multicastInterfaces.c_str(), nullptr);
         }
     }
 
     std::cerr << "UDP input: protocol=" << toLower(match[1].str())
               << " uri_host=" << (uriHost.empty() ? "@" : uriHost)
               << " listen=" << listenAddress << ":" << port;
-    if (multicastInput && !inputInterfaceAddress.empty()) {
-        std::cerr << " multicast_iface=" << interfaceNameOrAddress(inputInterfaceAddress);
+    if (multicastInput) {
+        std::cerr << " multicast_iface="
+                  << (multicastInterfaces.empty() ? "route-default" : multicastInterfaces);
     }
     std::cerr << std::endl;
 

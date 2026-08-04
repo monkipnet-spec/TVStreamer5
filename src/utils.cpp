@@ -3,6 +3,7 @@
 #include <boost/algorithm/string.hpp>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>
 
@@ -59,7 +60,12 @@ std::vector<NetworkInterface> enumerateNetworkInterfaces() {
 
         std::string name(ifa->ifa_name);
         if (name == "lo") continue;
-        list.push_back({name, std::string(host)});
+        list.push_back({
+            name,
+            std::string(host),
+            (ifa->ifa_flags & IFF_UP) != 0,
+            (ifa->ifa_flags & IFF_MULTICAST) != 0
+        });
     }
 
     freeifaddrs(ifaddr);
