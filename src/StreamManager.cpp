@@ -1049,6 +1049,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     desc << "manual-pipeline"
          << " input=" << cfg.inputUri
          << " input_mode=" << cfg.inputMode
+         << " input_iface=" << (cfg.inputInterfaceAddress.empty() ? cfg.interfaceAddress : cfg.inputInterfaceAddress)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
          << " outputs=";

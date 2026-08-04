@@ -28,6 +28,7 @@ struct StreamConfig {
     std::string outputHost = "127.0.0.1";
     int outputPort = 1234;
     std::string interfaceAddress;
+    std::string inputInterfaceAddress;
     std::string inputMode = "auto";
     bool testPattern = false;
     bool autoStart = false;

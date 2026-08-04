@@ -1258,6 +1258,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
 .modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
+.modal-content.stream-modal{width:min(680px,100%)}
 .modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99)}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
@@ -1302,6 +1303,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .form-row label{font-size:.78rem;color:#9aa3b1}
 .form-row input,.form-row select{width:100%;max-width:210px;padding:7px 9px;background:#121825;border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#EEE;font-size:.8rem}
 .form-row input.compact,.form-row select.compact{max-width:150px}
+.input-main-row{display:grid;grid-template-columns:minmax(260px,1fr) minmax(150px,190px) minmax(130px,150px);gap:8px;width:100%;align-items:end}
+.input-main-row input,.input-main-row select{box-sizing:border-box;max-width:none}
+.input-main-row .form-row{min-width:0}
 .row-inline{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .row-inline.compact-row input{width:100%;padding:7px 9px}
 .output-list{display:grid;gap:8px;width:100%}
@@ -1316,7 +1320,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .backup-file-row{grid-column:1/-1;display:flex;align-items:center;gap:10px;min-height:32px}
 .backup-file-row input{padding:0;background:transparent;border:0;color:#cfd8ea}
 .backup-file-row span{color:#7dd1ff;font-size:.78rem;overflow-wrap:anywhere}
-@media (max-width:760px){.backup-source{grid-template-columns:1fr}.backup-file-row{flex-direction:column;align-items:flex-start}}
+@media (max-width:760px){.input-main-row{grid-template-columns:1fr}.backup-source{grid-template-columns:1fr}.backup-file-row{flex-direction:column;align-items:flex-start}}
 .form-row-inline small-field input{width:calc(100% - 8px)}
 .form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
 .form-row .checkbox-inline input{width:16px;height:16px}
@@ -1837,7 +1841,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -1946,7 +1950,9 @@ function uploadBackupReplacementFile(streamId, input) {
 function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
-    const options = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
+    const outputOptions = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
+    const selectedInputInterface = stream.input_interface_address || stream.interface_address || '';
+    const inputOptions = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===selectedInputInterface?'selected':''}>${i.name} (${i.address})</option>`).join('');
     const outputs = outputConfigsForStream(stream);
     const outputType = normalizedOutputType(outputs[0] || stream);
     const links = Array.isArray(stream.vlc_links) ? stream.vlc_links : [];
@@ -1954,12 +1960,11 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><label>Входной URL (Основной)</label><input class="compact" id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://127.0.0.1:9087, rtmp://camera/live/stream или https://host/live.m3u8" /></div>
+        <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://127.0.0.1:9087, rtmp://camera/live/stream или https://host/live.m3u8" /></div><div class="form-row"><label>UDP интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
-        <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${options}</select></div>
-        <div class="form-row"><label>Режим входа</label><select class="compact" id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div>
+        <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${outputOptions}</select></div>
         <div class="form-row full"><label>Выходные форматы</label><div id="streamOutputs" class="output-list">${renderOutputRows(outputs, links)}</div><button class="button-secondary" type="button" onclick="addStreamOutput()">+ Добавить формат</button></div>
         <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
         <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
@@ -1974,6 +1979,7 @@ function openStreamForm(stream) {
         <button class="button-primary" onclick="saveStream('${stream.id}')">Сохранить</button>
       </div>
     `);
+    document.getElementById('modalContent').classList.add('stream-modal');
     document.getElementById('streamCbr').checked = outputType === 'udp-cbr' || (outputType !== 'udp-vbr' && stream.cbr);
     updateBackupInputMode();
     updateOutputHints();
@@ -2099,6 +2105,7 @@ function saveStream(id) {
     backup_input_type: document.getElementById('streamBackupInputType').value,
     backup_file_loop: document.getElementById('streamBackupInputType').value === 'file' && document.getElementById('streamBackupFileLoop').checked,
     interface_address: document.getElementById('streamInterface').value,
+    input_interface_address: document.getElementById('streamInputInterface').value,
     input_mode: document.getElementById('streamInputMode').value,
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,

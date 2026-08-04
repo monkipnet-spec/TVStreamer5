@@ -355,11 +355,14 @@ Example with simultaneous UDP multicast, SRT listener, and HLS output:
 }
 ```
 
-The web UI lets you choose the output interface. For UDP multicast it is used as
-the multicast interface. For UDP unicast it is used as the bind address. For SRT
-it is used as the local listener address when supported by the GStreamer SRT
-plugin. RTSP and RTMP camera input and RTMP/YouTube output remux common
-H.264/H.265/AAC streams without transcoding where supported.
+The web UI lets you choose the UDP input interface separately from the output
+interface. For UDP multicast, `input_interface_address` is used as the multicast
+interface. For UDP unicast on `udp://@:port` or `rtp://@:port`, it is used as the
+bind address. If `input_interface_address` is empty, older configs can still fall
+back to `interface_address`. For SRT output, `interface_address` is used as the
+local listener address when supported by the GStreamer SRT plugin. RTSP and RTMP
+camera input and RTMP/YouTube output remux common H.264/H.265/AAC streams
+without transcoding where supported.
 
 Enable `auto_start` in a stream's settings to start that stream automatically
 after TVStreamer5 restarts. Streams with `auto_start` disabled stay stopped.
@@ -463,6 +466,7 @@ Minimal stream object:
   "backup_input_type": "url",
   "backup_file_loop": false,
   "input_mode": "auto",
+  "input_interface_address": "",
   "test_pattern": false,
   "output_type": "udp-cbr",
   "output_mode": "listener",

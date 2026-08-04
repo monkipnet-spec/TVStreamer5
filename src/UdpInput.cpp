@@ -72,8 +72,16 @@ GstElement* build(
         return nullptr;
     }
     std::string host = match[2].str();
-    if (host.empty() || host == "@") {
+    const bool bindAny = host.empty() || host == "@" || host == "0.0.0.0";
+    if (bindAny) {
         host = "0.0.0.0";
+    }
+    const std::string inputInterfaceAddress = config.inputInterfaceAddress.empty()
+        ? config.interfaceAddress
+        : config.inputInterfaceAddress;
+    const bool multicastInput = isMulticastHost(host);
+    if (!multicastInput && bindAny && !inputInterfaceAddress.empty()) {
+        host = inputInterfaceAddress;
     }
 
     g_object_set(src,
@@ -84,10 +92,10 @@ GstElement* build(
         "buffer-size", kSocketBufferSize,
         nullptr);
 
-    if (isMulticastHost(host)) {
+    if (multicastInput) {
         g_object_set(src, "auto-multicast", TRUE, nullptr);
-        if (!config.interfaceAddress.empty()) {
-            const std::string iface = interfaceNameOrAddress(config.interfaceAddress);
+        if (!inputInterfaceAddress.empty()) {
+            const std::string iface = interfaceNameOrAddress(inputInterfaceAddress);
             g_object_set(src, "multicast-iface", iface.c_str(), nullptr);
         }
     }
