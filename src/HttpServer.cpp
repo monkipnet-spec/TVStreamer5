@@ -1231,7 +1231,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:8px
 .system-menu summary::-webkit-details-marker{display:none}
 .system-menu summary:after{content:'';width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid currentColor;opacity:.8}
 .system-menu[open] summary{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
-.system-menu-list{position:absolute;right:0;top:calc(100% + 6px);z-index:30;min-width:178px;padding:6px;background:#121825;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 18px 42px rgba(0,0,0,.28)}
+.system-menu-list{position:absolute;right:0;top:calc(100% + 6px);z-index:100001;min-width:178px;padding:6px;background:#121825;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 18px 42px rgba(0,0,0,.28)}
 .system-menu-item{display:block;width:100%;padding:8px 10px;border:0;border-radius:7px;background:transparent;color:#e7edf8;text-align:left;font-size:.82rem;cursor:pointer}
 .system-menu-item:hover{background:rgba(255,255,255,.08)}
 .system-menu-item.restart-button{color:#ffe0a3;background:transparent;border:0}
