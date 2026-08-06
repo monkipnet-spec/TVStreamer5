@@ -589,3 +589,35 @@ same way as on a native installation.
 
 After changing installed plugins, restart TVStreamer5 so the capability state
 shown in the web interface is refreshed.
+
+### Isolated transcoder pipeline architecture
+
+The transcoder is implemented as an independent GStreamer `GstBin` with a single
+MPEG-TS sink pad and a single MPEG-TS source pad:
+
+```text
+existing input chain
+        |
+        v
++---------------------------+
+| TranscoderPipeline GstBin |
+| tsparse -> tsdemux        |
+|   video -> decode ->      |
+|     scale -> x264 ->      |
+|     h264parse             |
+|   audio -> decode ->      |
+|     AAC encode -> aacparse|
+|          \       /        |
+|           mpegtsmux       |
+|              -> tsparse   |
++---------------------------+
+        |
+        v
+existing output branches
+```
+
+The passthrough pipeline and the transcoder pipeline no longer share internal
+demuxers, decoders, parsers, or muxers. Unsupported, subtitle, data, and duplicate
+program pads are connected to a `fakesink`, preventing `GST_FLOW_NOT_LINKED` from
+stopping the complete stream. This is particularly important for multi-program
+MPEG-TS inputs and streams with multiple audio tracks.

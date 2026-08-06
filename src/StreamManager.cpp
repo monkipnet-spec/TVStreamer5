@@ -54,6 +54,30 @@ bool addElementOrFail(GstElement* pipeline, GstElement* element) {
     return element != nullptr && gst_bin_add(GST_BIN(pipeline), element);
 }
 
+void drainDynamicPad(GstElement* anchor, GstPad* pad) {
+    if (!anchor || !pad || gst_pad_is_linked(pad)) return;
+    GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(anchor));
+    if (!pipeline) return;
+    GstElement* queue = gst_element_factory_make("queue", nullptr);
+    GstElement* sink = gst_element_factory_make("fakesink", nullptr);
+    if (!queue || !sink || !gst_bin_add(GST_BIN(pipeline), queue) ||
+        !gst_bin_add(GST_BIN(pipeline), sink) || !gst_element_link(queue, sink)) {
+        if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+        if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+        gst_object_unref(pipeline);
+        return;
+    }
+    g_object_set(sink, "sync", FALSE, "async", FALSE, nullptr);
+    GstPad* queueSink = gst_element_get_static_pad(queue, "sink");
+    if (queueSink) {
+        gst_pad_link(pad, queueSink);
+        gst_object_unref(queueSink);
+    }
+    gst_element_sync_state_with_parent(queue);
+    gst_element_sync_state_with_parent(sink);
+    gst_object_unref(pipeline);
+}
+
 std::string socketAddressToString(GSocketAddress* address) {
     if (!address) {
         return {};
@@ -1757,13 +1781,15 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     state->outputContexts.clear();
     if (cfg.transcodeEnabled) {
         std::string transcodeError;
-        GstElement* transcodedTail = TranscoderModule::build(pipeline, sourceTail, cfg, transcodeError);
-        if (!transcodedTail) {
+        GstElement* transcoderBin = TranscoderModule::createBin(cfg, transcodeError);
+        if (!transcoderBin || !addElementOrFail(pipeline, transcoderBin) ||
+            !gst_element_link(sourceTail, transcoderBin)) {
             std::cerr << "Transcoder setup failed for " << cfg.id << ": " << transcodeError << std::endl;
+            if (transcoderBin && !GST_OBJECT_PARENT(transcoderBin)) gst_object_unref(transcoderBin);
             gst_object_unref(pipeline);
             return nullptr;
         }
-        sourceTail = transcodedTail;
+        sourceTail = transcoderBin;
     }
     if (!buildOutputBranches(state, pipeline, sourceTail)) {
         gst_object_unref(pipeline);
@@ -2459,9 +2485,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     if ((!isAudio && !isVideo) || isPrivateTs) {
+        drainDynamicPad(ctx->mux, pad);
         return;
     }
     if ((isVideo && ctx->videoLinked) || (isAudio && ctx->audioLinked)) {
+        drainDynamicPad(ctx->mux, pad);
         return;
     }
 
@@ -2475,6 +2503,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         if (queue) gst_object_unref(queue);
         if (parser) gst_object_unref(parser);
         if (capsfilter) gst_object_unref(capsfilter);
+        drainDynamicPad(ctx->mux, pad);
         return;
     }
 
@@ -2509,6 +2538,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         : gst_element_link(queue, parser);
     if (!parserLinked) {
         gst_object_unref(pipeline);
+        drainDynamicPad(ctx->mux, pad);
         return;
     }
 
@@ -2521,6 +2551,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (gst_pad_link(pad, queueSinkPad) != GST_PAD_LINK_OK) {
         gst_object_unref(queueSinkPad);
         gst_object_unref(pipeline);
+        drainDynamicPad(ctx->mux, pad);
         return;
     }
     gst_object_unref(queueSinkPad);
