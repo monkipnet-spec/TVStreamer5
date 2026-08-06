@@ -437,10 +437,10 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
     GstElement* queue = gst_element_factory_make("queue", "transcode_input_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "transcode_demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "transcode_mux");
-    GstElement* outputParse = gst_element_factory_make("tsparse", "transcode_output_tsparse");
-    if (!bin || !parse || !queue || !demux || !mux || !outputParse ||
+    GstElement* outputQueue = gst_element_factory_make("queue", "transcode_output_queue");
+    if (!bin || !parse || !queue || !demux || !mux || !outputQueue ||
         !add(bin, parse) || !add(bin, queue) || !add(bin, demux) || !add(bin, mux) ||
-        !add(bin, outputParse)) {
+        !add(bin, outputQueue)) {
         error = "failed to create transcoder bin elements";
         if (bin) gst_object_unref(bin);
         return nullptr;
@@ -456,16 +456,24 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         "pat-interval", 9000u,
         "pmt-interval", 9000u,
         nullptr);
-    g_object_set(outputParse, "set-timestamps", FALSE, nullptr);
+    // Do not parse or re-stamp the muxed transport stream inside the transcoder.
+    // The mpegtsmux output already contains the authoritative PCR/PTS/DTS timeline.
+    // A bounded queue only decouples the encoder/mux threads from output delivery.
+    g_object_set(outputQueue,
+        "max-size-buffers", 0u,
+        "max-size-bytes", 0u,
+        "max-size-time", static_cast<guint64>(2000000000ULL),
+        "leaky", 0,
+        nullptr);
     if (!gst_element_link_many(parse, queue, demux, nullptr) ||
-        !gst_element_link(mux, outputParse)) {
+        !gst_element_link(mux, outputQueue)) {
         error = "failed to link transcoder bin core";
         gst_object_unref(bin);
         return nullptr;
     }
 
     GstPad* parseSink = gst_element_get_static_pad(parse, "sink");
-    GstPad* outputSrc = gst_element_get_static_pad(outputParse, "src");
+    GstPad* outputSrc = gst_element_get_static_pad(outputQueue, "src");
     GstPad* ghostSink = parseSink ? gst_ghost_pad_new("sink", parseSink) : nullptr;
     GstPad* ghostSrc = outputSrc ? gst_ghost_pad_new("src", outputSrc) : nullptr;
     if (parseSink) gst_object_unref(parseSink);
