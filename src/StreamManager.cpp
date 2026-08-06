@@ -601,10 +601,16 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
     (void)cfg;
+    // multifdsink must follow the incoming buffer timestamps. With sync disabled
+    // it writes every available MPEG-TS buffer immediately, producing short
+    // network bursts followed by idle gaps. Timestamp-synchronised delivery
+    // smooths HTTP output without modifying the transport stream itself.
     g_object_set(sink,
-        "sync", FALSE,
+        "sync", TRUE,
         "async", FALSE,
+        "qos", FALSE,
         nullptr);
+    setInt64PropertyIfPresent(sink, "max-lateness", -1);
 }
 
 void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
