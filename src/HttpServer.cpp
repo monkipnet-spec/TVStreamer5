@@ -1385,12 +1385,12 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .controls .quality-button{background:rgba(57,189,248,.14);color:#bdefff;box-shadow:inset 0 0 0 1px rgba(57,189,248,.2)}
 .tile .controls .quality-button:hover{background:rgba(57,189,248,.24)}
 .modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(8,10,15,.78);display:none;align-items:center;justify-content:center;padding:12px;z-index:20;box-sizing:border-box}
-.modal.quality-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
+.modal.quality-open,.modal.stream-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
 .modal.active{display:flex}
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
 .modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
 .modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
-.modal-content.stream-modal{width:min(680px,100%)}
+.modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
@@ -1679,7 +1679,7 @@ function openModal(html) {
   subscribersModalOpen = false;
   document.getElementById('modalContent').innerHTML = modalCloseButton() + html;
   document.getElementById('modalContent').className = 'modal-content';
-  document.getElementById('modal').classList.remove('quality-open');
+  document.getElementById('modal').classList.remove('quality-open', 'stream-open');
   document.getElementById('modal').classList.add('active');
 }
 function closeModal() {
@@ -1687,7 +1687,7 @@ function closeModal() {
   stopQualityAutoRefresh();
   clearInterval(networkRefreshTimer);
   networkRefreshTimer = null;
-  document.getElementById('modal').classList.remove('active', 'quality-open');
+  document.getElementById('modal').classList.remove('active', 'quality-open', 'stream-open');
 }
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
@@ -2263,6 +2263,8 @@ function openStreamForm(stream) {
       </div>
     `);
     document.getElementById('modalContent').classList.add('stream-modal');
+    updateHeaderHeight();
+    document.getElementById('modal').classList.add('stream-open');
     document.getElementById('streamCbr').checked = outputType === 'udp-cbr' || (outputType !== 'udp-vbr' && stream.cbr);
     updateBackupInputMode();
     loadUploadedBackupFiles();
