@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
 
@@ -81,37 +80,6 @@ void sync(GstElement* element) {
     if (element) gst_element_sync_state_with_parent(element);
 }
 
-void setNumericPropertyIfPresent(GstElement* element, const char* propertyName, guint64 value) {
-    if (!element || !propertyName) return;
-    GParamSpec* pspec = g_object_class_find_property(G_OBJECT_GET_CLASS(element), propertyName);
-    if (!pspec) return;
-
-    if (G_IS_PARAM_SPEC_UINT64(pspec)) {
-        g_object_set(element, propertyName, static_cast<guint64>(value), nullptr);
-    } else if (G_IS_PARAM_SPEC_UINT(pspec)) {
-        g_object_set(element, propertyName, static_cast<guint>(std::min<guint64>(value, std::numeric_limits<guint>::max())), nullptr);
-    } else if (G_IS_PARAM_SPEC_INT(pspec)) {
-        g_object_set(element, propertyName, static_cast<gint>(std::min<guint64>(value, static_cast<guint64>(std::numeric_limits<gint>::max()))), nullptr);
-    }
-}
-
-void configureTranscodeMux(GstElement* mux, const StreamConfig& config, const std::string& audioCodec) {
-    if (!mux) return;
-    g_object_set(mux,
-        "alignment", 7,
-        "bitrate", static_cast<guint64>(config.transcodeVideoBitrate +
-            (audioCodec == "copy" ? 384000 : config.transcodeAudioBitrate) + 350000),
-        nullptr);
-
-    // Keep PSI/PCR frequent enough for receivers that join an already-running
-    // multicast stream. Without repeated PAT/PMT and PCR, ffprobe/VLC may see
-    // H.264 payload but never finish stream discovery.
-    setNumericPropertyIfPresent(mux, "pcr-interval", 1800);  // 20 ms in 90 kHz ticks
-    setNumericPropertyIfPresent(mux, "pat-interval", 9000);  // 100 ms
-    setNumericPropertyIfPresent(mux, "pmt-interval", 9000);  // 100 ms
-    setNumericPropertyIfPresent(mux, "si-interval", 9000);   // 100 ms
-}
-
 
 bool gstValueCanContainInt(const GValue* value, gint expected) {
     if (!value) return false;
@@ -140,7 +108,7 @@ bool structureFieldCanContainInt(const GstStructure* structure, const char* fiel
     return structure && gstValueCanContainInt(gst_structure_get_value(structure, field), expected);
 }
 
-bool structureFieldStringListContains(const GstStructure* structure, const char* field, const char* expected) {
+bool structureFieldStringCanContain(const GstStructure* structure, const char* field, const char* expected) {
     if (!structure || !field || !expected) return false;
     const GValue* value = gst_structure_get_value(structure, field);
     if (!value) return false;
@@ -162,19 +130,6 @@ bool structureFieldStringListContains(const GstStructure* structure, const char*
     }
     return false;
 }
-
-GstPad* requestMuxSinkPad(GstElement* mux, uint32_t requestedPid) {
-    GstPad* pad = nullptr;
-    if (mux && requestedPid > 0 && requestedPid < 0x1FFF) {
-        const std::string requestedName = "sink_" + std::to_string(requestedPid);
-        pad = gst_element_request_pad_simple(mux, requestedName.c_str());
-    }
-    if (!pad && mux) {
-        pad = gst_element_request_pad_simple(mux, "sink_%d");
-    }
-    return pad;
-}
-
 
 struct AudioEncoderSelection {
     GstElement* element = nullptr;
@@ -221,10 +176,10 @@ void configureAudioBitrate(GstElement* encoder, const std::string& factory, uint
     }
 }
 
-bool linkElementToMux(GstElement* source, GstElement* mux, uint32_t requestedPid = 0) {
+bool linkElementToMux(GstElement* source, GstElement* mux) {
     if (!source || !mux) return false;
     GstPad* srcPad = gst_element_get_static_pad(source, "src");
-    GstPad* sinkPad = requestMuxSinkPad(mux, requestedPid);
+    GstPad* sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
     if (!srcPad || !sinkPad) {
         if (srcPad) gst_object_unref(srcPad);
         if (sinkPad) gst_object_unref(sinkPad);
@@ -283,9 +238,8 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         GstElement* encoder = gst_element_factory_make("x264enc", nullptr);
         GstElement* parser = gst_element_factory_make("h264parse", nullptr);
-        GstElement* parsedFilter = gst_element_factory_make("capsfilter", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !deinterlace || !scale || !rate || !filter || !encoder || !parser || !parsedFilter || !outQueue) {
+        if (!queue || !convert || !deinterlace || !scale || !rate || !filter || !encoder || !parser || !outQueue) {
             std::cerr << "Transcoder: missing video elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -305,25 +259,21 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         g_object_set(encoder,
             "bitrate", bitrateKbps,
             "key-int-max", 50,
-            "bframes", 0,
+            "bframes", 2,
             "byte-stream", TRUE,
             "aud", TRUE,
             "vbv-buf-capacity", 1000u,
             nullptr);
         gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
         gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
-        g_object_set(encoder, "option-string", "nal-hrd=cbr:force-cfr=1:repeat-headers=1", nullptr);
-        g_object_set(parser, "config-interval", -1, nullptr);
-        GstCaps* parsedCaps = gst_caps_from_string(
-            "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au");
-        g_object_set(parsedFilter, "caps", parsedCaps, nullptr);
-        gst_caps_unref(parsedCaps);
+        g_object_set(encoder, "option-string", "nal-hrd=cbr:force-cfr=1", nullptr);
+        g_object_set(parser, "config-interval", 1, nullptr);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, deinterlace) ||
             !add(context->bin, scale) || !add(context->bin, rate) || !add(context->bin, filter) ||
-            !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, parsedFilter) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser, parsedFilter, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux, context->config.videoPid)) {
+            !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, outQueue) ||
+            !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue, nullptr) ||
+            !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build video branch" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -338,7 +288,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
                       << context->config.transcodeVideoBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
-        for (GstElement* e : {queue, convert, deinterlace, scale, rate, filter, encoder, parser, parsedFilter, outQueue}) sync(e);
+        for (GstElement* e : {queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue}) sync(e);
     } else if (media.rfind("audio/x-raw", 0) == 0 && !context->audioLinked) {
         const std::string codec = context->config.transcodeAudioCodec == "mp3" ? "mp3" : "aac";
         GstElement* queue = gst_element_factory_make("queue", nullptr);
@@ -422,7 +372,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             }
         }
 
-        if (!branchBuilt || !branchLinked || !linkElementToMux(outQueue, context->mux, context->config.audioPid)) {
+        if (!branchBuilt || !branchLinked || !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build " << codec << " audio branch with "
                       << encoderSelection.factory << std::endl;
             gst_caps_unref(caps);
@@ -459,23 +409,23 @@ bool buildAudioPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps
     std::string parserFactory;
 
     if (g_strcmp0(mediaType, "audio/mpeg") == 0) {
-        // parsebin/tsdemux may expose non-fixed caps such as:
+        // parsebin may expose non-fixed caps such as:
         // audio/mpeg, mpegversion=(int){ 2, 4 }, stream-format=(string){ raw, adts, adif, loas }
         // gst_structure_get_int() fails on lists/ranges, so inspect the GValue directly.
-        const bool looksLikeAac = structureFieldCanContainInt(structure, "mpegversion", 4) ||
-            structureFieldCanContainInt(structure, "mpegversion", 2) ||
-            structureFieldStringListContains(structure, "stream-format", "adts") ||
-            structureFieldStringListContains(structure, "stream-format", "raw") ||
-            structureFieldStringListContains(structure, "stream-format", "loas") ||
-            structureFieldStringListContains(structure, "stream-format", "adif");
-        const bool looksLikeMpegAudio = structureFieldCanContainInt(structure, "mpegversion", 1) ||
+        const bool canBeMpegAudio = structureFieldCanContainInt(structure, "mpegversion", 1) ||
             structureFieldCanContainInt(structure, "layer", 1) ||
             structureFieldCanContainInt(structure, "layer", 2) ||
             structureFieldCanContainInt(structure, "layer", 3);
+        const bool canBeAac = structureFieldCanContainInt(structure, "mpegversion", 4) ||
+            structureFieldCanContainInt(structure, "mpegversion", 2) ||
+            structureFieldStringCanContain(structure, "stream-format", "adts") ||
+            structureFieldStringCanContain(structure, "stream-format", "raw") ||
+            structureFieldStringCanContain(structure, "stream-format", "loas") ||
+            structureFieldStringCanContain(structure, "stream-format", "adif");
 
-        if (looksLikeMpegAudio && !looksLikeAac) parserFactory = "mpegaudioparse";
-        else if (looksLikeAac) parserFactory = "aacparse";
-        else parserFactory = "aacparse"; // safest default for ambiguous audio/mpeg caps from parsebin
+        if (canBeMpegAudio && !canBeAac) parserFactory = "mpegaudioparse";
+        else if (canBeAac) parserFactory = "aacparse";
+        else parserFactory = "aacparse";
     } else if (g_strcmp0(mediaType, "audio/x-ac3") == 0 ||
                g_strcmp0(mediaType, "audio/x-eac3") == 0) {
         parserFactory = "ac3parse";
@@ -495,7 +445,7 @@ bool buildAudioPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps
     if (!queue || !parser || !outQueue || !add(context->bin, queue) ||
         !add(context->bin, parser) || !add(context->bin, outQueue) ||
         !gst_element_link_many(queue, parser, outQueue, nullptr) ||
-        !linkElementToMux(outQueue, context->mux, context->config.audioPid)) {
+        !linkElementToMux(outQueue, context->mux)) {
         std::cerr << "Transcoder: failed to build audio passthrough branch using "
                   << parserFactory << std::endl;
         return false;
@@ -684,9 +634,12 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         return nullptr;
     }
 
-    configureTranscodeMux(mux, config, audioCodec);
+    g_object_set(mux,
+        "alignment", 7,
+        "bitrate", static_cast<guint64>(config.transcodeVideoBitrate +
+            (audioCodec == "copy" ? 384000 : config.transcodeAudioBitrate) + 350000),
+        nullptr);
     g_object_set(outputParse, "set-timestamps", TRUE, nullptr);
-    setNumericPropertyIfPresent(outputParse, "alignment", 7);
     if (!gst_element_link(inputQueue, parsebin) || !gst_element_link(mux, outputParse)) {
         error = "failed to link transcoder bin core";
         gst_object_unref(bin);

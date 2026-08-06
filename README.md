@@ -1,5 +1,14 @@
 # TVStreamer5
 
+### v37 - Safe transcoder rollback for UDP-CBR
+
+- Rolled back the experimental v34 H.264/PID-request changes that could stop UDP-CBR output.
+- Restored the last known packet-producing transcoder mux path from v33.
+- Kept the v35 fix that allows original audio passthrough to accept non-fixed `audio/mpeg` caps from `parsebin`, including `mpegversion={2,4}` and `stream-format={raw,adts,adif,loas}`.
+- Restored the previous UDP multicast sender implementation; multicast interface warnings are not fatal only in versions where the output socket is actually created by configuration.
+- Added a video-link log line so audio and video pad linkage can be checked in `journalctl`.
+
+
 TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS/UDP/RTP MPEG-TS
 streams, optionally remaps service/PID metadata, monitors input quality,
 switches to a backup source when the primary source disappears, and outputs
