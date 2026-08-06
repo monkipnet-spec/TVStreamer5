@@ -19,6 +19,7 @@ APT_GET=("${SUDO[@]}" apt-get)
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-good1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
+    gstreamer1.0-tools \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
@@ -39,4 +40,8 @@ APT_GET=("${SUDO[@]}" apt-get)
 
 "${APT_GET[@]}" clean
 
-echo "Dependencies installed. Build with: cmake -S . -B build && cmake --build build --parallel"
+echo "Dependencies installed."
+if [[ -x "$(dirname "$0")/scripts/check_transcoder_plugins.sh" ]]; then
+    "$(dirname "$0")/scripts/check_transcoder_plugins.sh" || true
+fi
+echo "Build with: cmake -S . -B build && cmake --build build --parallel"

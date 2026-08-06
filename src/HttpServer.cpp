@@ -1,6 +1,7 @@
 #include "HttpServer.h"
 
 #include "utils.h"
+#include "TranscoderModule.h"
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -736,6 +737,16 @@ std::string HttpServer::currentState() {
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
+    static const auto transcoderCapabilities = TranscoderModule::inspectCapabilities();
+    Json::Value transcoder;
+    transcoder["available"] = transcoderCapabilities.available;
+    transcoder["video_encoder"] = transcoderCapabilities.videoEncoder;
+    transcoder["audio_encoder"] = transcoderCapabilities.audioEncoder;
+    transcoder["message"] = transcoderCapabilities.message;
+    Json::Value missing(Json::arrayValue);
+    for (const auto& element : transcoderCapabilities.missingElements) missing.append(element);
+    transcoder["missing_elements"] = missing;
+    root["transcoder"] = transcoder;
     Json::Value subscribers(Json::arrayValue);
     for (const auto& subscriber : configManager.subscribers.subscribers) {
       Json::Value item = subscriber.toJson();
@@ -1466,14 +1477,6 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .form-row-inline small-field input{width:calc(100% - 8px)}
 .form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
 .form-row .checkbox-inline input{width:16px;height:16px}
-.transcode-panel{width:100%;box-sizing:border-box;padding:12px;background:rgba(31,139,255,.07);border:1px solid rgba(57,189,248,.18);border-radius:10px}
-.transcode-grid{display:grid;grid-template-columns:minmax(210px,1fr) minmax(190px,1fr);gap:10px;width:100%}
-.transcode-grid .form-row select,.transcode-grid .form-row input{max-width:none;box-sizing:border-box}
-.transcode-custom-bitrate{display:none;grid-template-columns:minmax(120px,1fr) auto;gap:8px;align-items:center;width:100%}
-.transcode-custom-bitrate.visible{display:grid}
-.transcode-summary{margin-top:10px;padding:8px 10px;border-radius:8px;background:rgba(0,0,0,.18);color:#cfd8ea;font-size:.78rem;line-height:1.45}
-.transcode-summary strong{color:#fff}
-@media (max-width:760px){.transcode-grid{grid-template-columns:1fr}}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
 .modal-actions button{min-width:100px;padding:8px 12px}
 .about-list{display:grid;gap:10px;margin:4px 0 0}
@@ -2247,12 +2250,12 @@ function openStreamForm(stream) {
     const outputs = outputConfigsForStream(stream);
     const outputType = normalizedOutputType(outputs[0] || stream);
     const links = Array.isArray(stream.vlc_links) ? stream.vlc_links : [];
-    const transcodeBitrateKbps = Math.round((stream.transcode_video_bitrate || 6000000) / 1000);
-    const transcodeBitratePresets = [2000, 3500, 6000, 8000, 12000, 18000, 25000, 35000];
-    const hasTranscodeBitratePreset = transcodeBitratePresets.includes(transcodeBitrateKbps);
-    const transcodeBitrateOptions = transcodeBitratePresets.map(value =>
-      `<option value="${value}" ${hasTranscodeBitratePreset && value===transcodeBitrateKbps?'selected':''}>${value} кбит/с</option>`
-    ).join('') + `<option value="custom" ${hasTranscodeBitratePreset?'':'selected'}>Другое значение…</option>`;
+    const transcoderInfo = state.transcoder || {};
+    const transcoderAvailable = transcoderInfo.available === true;
+    const transcoderMissing = Array.isArray(transcoderInfo.missing_elements) ? transcoderInfo.missing_elements.join(', ') : '';
+    const transcoderStatus = transcoderAvailable
+      ? `Доступно: H.264 ${transcoderInfo.video_encoder || 'encoder'}, AAC ${transcoderInfo.audio_encoder || 'encoder'}`
+      : `Недоступно: ${transcoderMissing || transcoderInfo.message || 'не установлены необходимые GStreamer-плагины'}`;
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
@@ -2267,8 +2270,8 @@ function openStreamForm(stream) {
         <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
         <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
-        <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${stream.transcode_enabled ? 'checked' : ''} onchange="updateTranscodeControls()" /><span>Транскодировать видео в H.264 CBR и аудио в AAC</span></div></div>
-        <div class="form-row full" id="streamTranscodeControls" style="display:${stream.transcode_enabled?'block':'none'}"><label>Параметры транскодирования</label><div class="transcode-panel"><div class="transcode-grid"><div class="form-row"><label>Выходное разрешение</label><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select></div><div class="form-row"><label>Видеобитрейт H.264 CBR</label><select id="streamTranscodeBitratePreset" onchange="updateTranscodeBitrateMode()">${transcodeBitrateOptions}</select><div id="streamTranscodeCustomBitrateRow" class="transcode-custom-bitrate ${hasTranscodeBitratePreset?'':'visible'}"><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${transcodeBitrateKbps}" placeholder="6000" oninput="updateTranscodeSummary()" /><span>кбит/с</span></div></div></div><div id="streamTranscodeSummary" class="transcode-summary"></div><small>H.264 High, 25 fps, GOP 2 секунды, AAC 192 кбит/с. Рекомендуется проверить загрузку CPU перед включением 2K/3K/4K.</small></div></div>
+        <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${(stream.transcode_enabled && transcoderAvailable) ? 'checked' : ''} ${transcoderAvailable ? '' : 'disabled'} onchange="updateTranscodeControls()" /><span>Транскодировать видео в H.264 CBR и аудио в AAC</span></div><small style="color:${transcoderAvailable ? '#7ee2a8' : '#ff9f9f'}">${transcoderStatus}</small></div>
+        <div class="form-row full" id="streamTranscodeControls" style="display:${(stream.transcode_enabled && transcoderAvailable)?'block':'none'}"><label>Параметры транскодирования</label><div class="row-inline compact-row"><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${Math.round((stream.transcode_video_bitrate||6000000)/1000)}" placeholder="6000" /><span>кбит/с CBR</span></div><small>По умолчанию: 4K — 25000, 3K — 18000, 2K — 12000, Full HD — 6000, HD — 3500, PAL SD — 2000 кбит/с.</small></div>
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
         <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
         <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div></div>
@@ -2297,43 +2300,19 @@ function openStreamForm(stream) {
 function updateTranscodeControls() {
   const enabled = document.getElementById('streamTranscodeEnabled');
   const controls = document.getElementById('streamTranscodeControls');
-  if (controls) controls.style.display = enabled && enabled.checked ? 'block' : 'none';
-  updateTranscodeBitrateMode();
-  updateTranscodeSummary();
-}
-function transcodeRecommendedBitrates() {
-  return {'3840x2160':25000,'3200x1800':18000,'2560x1440':12000,'1920x1080':6000,'1280x720':3500,'720x576':2000};
-}
-function selectedTranscodeBitrateKbps() {
-  const preset = document.getElementById('streamTranscodeBitratePreset');
-  const custom = document.getElementById('streamTranscodeBitrate');
-  if (!preset) return custom ? Number(custom.value || 6000) : 6000;
-  return preset.value === 'custom' ? Number(custom?.value || 6000) : Number(preset.value || 6000);
-}
-function updateTranscodeBitrateMode() {
-  const preset = document.getElementById('streamTranscodeBitratePreset');
-  const customRow = document.getElementById('streamTranscodeCustomBitrateRow');
-  if (customRow) customRow.classList.toggle('visible', !!preset && preset.value === 'custom');
-  updateTranscodeSummary();
-}
-function updateTranscodeSummary() {
-  const summary = document.getElementById('streamTranscodeSummary');
-  const resolution = document.getElementById('streamTranscodeResolution');
-  if (!summary || !resolution) return;
-  const videoKbps = Math.max(500, selectedTranscodeBitrateKbps());
-  const estimatedTotal = videoKbps + 192 + Math.max(150, Math.round(videoKbps * 0.04));
-  summary.innerHTML = `<strong>${resolution.options[resolution.selectedIndex]?.text || resolution.value}</strong> · видео ${videoKbps} кбит/с CBR · AAC 192 кбит/с · ориентировочный MPEG-TS ${estimatedTotal} кбит/с`;
+  const available = state.transcoder?.available === true;
+  if (enabled && !available) {
+    enabled.checked = false;
+    enabled.disabled = true;
+  }
+  if (controls) controls.style.display = available && enabled && enabled.checked ? 'block' : 'none';
 }
 function applyRecommendedTranscodeBitrate() {
   const resolution = document.getElementById('streamTranscodeResolution');
-  const preset = document.getElementById('streamTranscodeBitratePreset');
-  const custom = document.getElementById('streamTranscodeBitrate');
-  if (!resolution || !preset) return;
-  const value = transcodeRecommendedBitrates()[resolution.value] || 6000;
-  const option = [...preset.options].find(item => Number(item.value) === value);
-  preset.value = option ? String(value) : 'custom';
-  if (custom) custom.value = value;
-  updateTranscodeBitrateMode();
+  const bitrate = document.getElementById('streamTranscodeBitrate');
+  if (!resolution || !bitrate) return;
+  const defaults = {'3840x2160':25000,'3200x1800':18000,'2560x1440':12000,'1920x1080':6000,'1280x720':3500,'720x576':2000};
+  bitrate.value = defaults[resolution.value] || 6000;
 }
 function updateOutputHints() {
   const rows = [...document.querySelectorAll('.output-row')];
@@ -2458,9 +2437,9 @@ function saveStream(id) {
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
     cbr: selectedCbr,
     target_bitrate: Number(document.getElementById('streamBitrate').value) * 1000,
-    transcode_enabled: document.getElementById('streamTranscodeEnabled').checked,
+    transcode_enabled: state.transcoder?.available === true && document.getElementById('streamTranscodeEnabled').checked,
     transcode_resolution: document.getElementById('streamTranscodeResolution').value,
-    transcode_video_bitrate: Math.max(500, Math.min(100000, selectedTranscodeBitrateKbps())) * 1000,
+    transcode_video_bitrate: Number(document.getElementById('streamTranscodeBitrate').value) * 1000,
     audio_pid: Number(document.getElementById('streamAudioPid').value),
     video_pid: Number(document.getElementById('streamVideoPid').value),
     service_id: Number(document.getElementById('streamServiceId').value),

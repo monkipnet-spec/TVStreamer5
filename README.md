@@ -2,8 +2,7 @@
 
 TVStreamer5 receives RTSP camera streams and SRT/HTTP/HLS/UDP/RTP MPEG-TS
 streams, optionally remaps service/PID metadata, monitors input quality,
-optionally transcodes video to H.264 CBR with AAC audio, switches to a backup
-source when the primary source disappears, and outputs
+switches to a backup source when the primary source disappears, and outputs
 streams as UDP VBR, UDP CBR, SRT listener, HTTP TS, HLS, RTMP, or YouTube Live.
 
 UDP protocol handling is isolated in `src/UdpInput.cpp` and
@@ -503,9 +502,6 @@ Minimal stream object:
   "interface_address": "",
   "cbr": true,
   "target_bitrate": 7000000,
-  "transcode_enabled": false,
-  "transcode_resolution": "1920x1080",
-  "transcode_video_bitrate": 6000000,
   "remap_enabled": false,
   "video_pid": 0,
   "audio_pid": 0,
@@ -525,156 +521,71 @@ control Basic Authentication for the web UI and API. The UI can generate a VLC
 playlist containing all primary and additional output URLs; save it from the
 `VLC playlist` control as `tvstreamer5-playlist.m3u`.
 
+## Transcoding dependencies and automatic capability detection
 
-## Optional Transcoding Module
+Transcoding is optional. TVStreamer5 continues to run in passthrough mode when
+software encoding plugins are not installed.
 
-TVStreamer5 includes an independent transcoding module implemented in
-`src/TranscoderModule.cpp` and `src/TranscoderModule.h`. Transcoding is disabled
-by default and is configured separately for each stream.
+At startup/runtime the application checks the GStreamer element registry for:
 
-When disabled, the original MPEG-TS is forwarded through the normal passthrough
-pipeline. When enabled, the selected program is decoded, resized, encoded as
-H.264 CBR with AAC audio, remultiplexed to MPEG-TS, and then sent to every
-configured output branch.
+- `tsparse`, `tsdemux`, and `decodebin`
+- `videoconvert`, `videoscale`, and `videorate`
+- `x264enc` and `h264parse`
+- `audioconvert`, `audioresample`, and `aacparse`
+- `mpegtsmux`
+- at least one AAC encoder: `avenc_aac`, `fdkaacenc`, or `voaacenc`
 
-### Web interface
+The stream editor shows the detected H.264 and AAC encoders. When any required
+element is missing, the **Transcode** checkbox is disabled and the missing
+components are listed in the interface. Existing passthrough streams remain
+available.
 
-Open the stream editor and enable **Transcode video to H.264 CBR and audio to
-AAC**. The interface then displays two drop-down menus:
+### Ubuntu/Debian installation
 
-- output resolution;
-- H.264 CBR video bitrate.
+Install all build and runtime dependencies with:
 
-A custom bitrate can also be entered. The interface displays an estimated total
-MPEG-TS bitrate including AAC audio and transport-stream overhead. This value is
-useful when configuring a UDP-CBR target: the UDP-CBR target should be equal to
-or higher than the estimated transcoded MPEG-TS bitrate.
+```bash
+chmod +x install_deps.sh
+./install_deps.sh
+```
 
-### Resolution and bitrate defaults
+The script installs the GStreamer base, good, bad, ugly, and libav plugin sets.
+It then runs the transcoder capability check without preventing installation of
+the passthrough server when optional encoding support is unavailable.
 
-| Output format | Resolution | Default H.264 CBR bitrate |
-|---|---:|---:|
-| 4K UHD | 3840x2160 | 25000 kbps |
-| 3K | 3200x1800 | 18000 kbps |
-| 2K QHD | 2560x1440 | 12000 kbps |
-| Full HD | 1920x1080 | 6000 kbps |
-| HD | 1280x720 | 3500 kbps |
-| PAL SD | 720x576 | 2000 kbps |
+Run the capability check manually:
 
-Selecting a resolution automatically selects its recommended bitrate. The
-bitrate remains configurable from 500 kbps to 100000 kbps. Full HD uses
-6000 kbps by default.
+```bash
+./scripts/check_transcoder_plugins.sh
+```
 
-### Encoder settings
-
-The software transcoder currently uses:
-
-- H.264 High profile-compatible output through `x264enc`;
-- constant bitrate HRD signaling;
-- 25 fps constant output frame rate;
-- GOP length of 50 frames (2 seconds at 25 fps);
-- `veryfast` x264 preset;
-- AAC-LC stereo audio at 48 kHz and 192 kbps;
-- MPEG-TS output aligned to seven 188-byte TS packets.
-
-The resulting chain is:
+A successful result reports the selected encoders, for example:
 
 ```text
-MPEG-TS input
-    |
-  tsdemux
-    |
- decodebin
-   / \
-video audio
-  |     |
-scale resample
-  |     |
-x264   AAC
-   \   /
- mpegtsmux
-    |
-output tee
+Transcoding dependencies are available.
+  Video encoder: x264enc
+  Audio encoder: avenc_aac
 ```
 
-All configured outputs receive the same transcoded MPEG-TS, including UDP VBR,
-UDP CBR, SRT, HTTP TS, and HLS. RTMP/YouTube branches continue to use their
-protocol-specific output processing.
-
-### Configuration fields
-
-```json
-{
-  "transcode_enabled": true,
-  "transcode_resolution": "1920x1080",
-  "transcode_video_bitrate": 6000000
-}
-```
-
-Supported values for `transcode_resolution` are:
-
-```text
-3840x2160
-3200x1800
-2560x1440
-1920x1080
-1280x720
-720x576
-```
-
-Invalid resolutions fall back to `1920x1080`. The video bitrate is validated and
-limited to the supported range before the pipeline is built.
-
-### GStreamer requirements
-
-Install the standard GStreamer plugin sets:
+For a manual package installation on Ubuntu:
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  gstreamer1.0-plugins-base \
-  gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly \
+  build-essential cmake pkg-config \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev \
+  gstreamer1.0-tools \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
   gstreamer1.0-libav
 ```
 
-Verify the required elements:
+### Docker
 
-```bash
-gst-inspect-1.0 tsdemux
-gst-inspect-1.0 decodebin
-gst-inspect-1.0 videoscale
-gst-inspect-1.0 x264enc
-gst-inspect-1.0 h264parse
-gst-inspect-1.0 avenc_aac
-gst-inspect-1.0 aacparse
-gst-inspect-1.0 mpegtsmux
-```
+The runtime image includes the same GStreamer plugin groups and
+`gst-inspect-1.0`. Capability detection therefore works in the container in the
+same way as on a native installation.
 
-The audio branch tries `avenc_aac`, `fdkaacenc`, and `voaacenc` in that order,
-using the first available encoder.
-
-### Performance notes
-
-Software transcoding is CPU-intensive. Full HD at 6 Mbps generally requires
-substantially more CPU than passthrough. 2K, 3K, and 4K should be enabled only
-after verifying CPU load, real-time encoder performance, and cooling. If the
-encoder cannot operate in real time, the stream may stall or accumulate delay.
-
-For UDP-CBR output, configure `target_bitrate` above the complete transcoded
-MPEG-TS rate, not only above `transcode_video_bitrate`. For Full HD at 6000 kbps
-video plus AAC audio, a UDP-CBR target around 6500-7000 kbps is a practical
-starting point.
-
-### Troubleshooting
-
-If transcoding fails to start, inspect the service log:
-
-```bash
-sudo journalctl -u TVStreamer5 -n 200 --no-pager
-```
-
-Common causes are missing `x264enc` or AAC encoder plugins, unsupported input
-codecs, insufficient CPU performance, or a UDP-CBR target below the transcoded
-MPEG-TS bitrate.
+After changing installed plugins, restart TVStreamer5 so the capability state
+shown in the web interface is refreshed.

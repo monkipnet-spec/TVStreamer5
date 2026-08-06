@@ -6,31 +6,6 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
-#include <algorithm>
-#include <array>
-
-namespace {
-
-const std::array<const char*, 6> kTranscodeResolutions = {
-    "3840x2160", "3200x1800", "2560x1440",
-    "1920x1080", "1280x720", "720x576"
-};
-
-bool isSupportedTranscodeResolution(const std::string& value) {
-    return std::find(kTranscodeResolutions.begin(), kTranscodeResolutions.end(), value) != kTranscodeResolutions.end();
-}
-
-uint64_t recommendedTranscodeBitrate(const std::string& value) {
-    if (value == "3840x2160") return 25000000;
-    if (value == "3200x1800") return 18000000;
-    if (value == "2560x1440") return 12000000;
-    if (value == "1920x1080") return 6000000;
-    if (value == "1280x720") return 3500000;
-    if (value == "720x576") return 2000000;
-    return 6000000;
-}
-
-} // namespace
 
 StreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {
     StreamOutputConfig output;
@@ -82,13 +57,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();
     config.transcodeEnabled = root.get("transcode_enabled", false).asBool();
     config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();
-    if (!isSupportedTranscodeResolution(config.transcodeResolution)) {
-        config.transcodeResolution = "1920x1080";
-    }
-    config.transcodeVideoBitrate = root.get(
-        "transcode_video_bitrate",
-        Json::UInt64(recommendedTranscodeBitrate(config.transcodeResolution))).asUInt64();
-    config.transcodeVideoBitrate = std::clamp<uint64_t>(config.transcodeVideoBitrate, 500000, 100000000);
+    config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();
     config.audioPid = root.get("audio_pid", 0).asUInt();
     config.videoPid = root.get("video_pid", 0).asUInt();
     config.serviceId = root.get("service_id", 1).asUInt();

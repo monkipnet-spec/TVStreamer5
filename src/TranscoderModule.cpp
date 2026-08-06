@@ -157,6 +157,53 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 
 } // namespace
 
+
+TranscoderCapabilities TranscoderModule::inspectCapabilities() {
+    TranscoderCapabilities result;
+    const char* required[] = {
+        "tsparse", "tsdemux", "decodebin",
+        "videoconvert", "videoscale", "videorate",
+        "x264enc", "h264parse",
+        "audioconvert", "audioresample", "aacparse",
+        "mpegtsmux", nullptr
+    };
+
+    for (const char** name = required; *name; ++name) {
+        GstElementFactory* factory = gst_element_factory_find(*name);
+        if (!factory) {
+            result.missingElements.emplace_back(*name);
+        } else {
+            gst_object_unref(factory);
+        }
+    }
+
+    GstElementFactory* videoFactory = gst_element_factory_find("x264enc");
+    if (videoFactory) {
+        result.videoEncoder = "x264enc";
+        gst_object_unref(videoFactory);
+    }
+
+    for (const char* name : {"avenc_aac", "fdkaacenc", "voaacenc"}) {
+        GstElementFactory* factory = gst_element_factory_find(name);
+        if (factory) {
+            result.audioEncoder = name;
+            gst_object_unref(factory);
+            break;
+        }
+    }
+    if (result.audioEncoder.empty()) {
+        result.missingElements.emplace_back("AAC encoder (avenc_aac, fdkaacenc or voaacenc)");
+    }
+
+    result.available = result.missingElements.empty();
+    if (result.available) {
+        result.message = "Software transcoding is available";
+    } else {
+        result.message = "Transcoding is unavailable because required GStreamer elements are missing";
+    }
+    return result;
+}
+
 bool TranscoderModule::resolutionSize(const std::string& value, int& width, int& height) {
     if (value == "3840x2160") { width = 3840; height = 2160; return true; }
     if (value == "3200x1800") { width = 3200; height = 1800; return true; }
@@ -181,10 +228,17 @@ GstElement* TranscoderModule::build(GstElement* pipeline, GstElement* sourceTail
     if (!pipeline || !sourceTail) { error = "invalid transcoder pipeline"; return nullptr; }
     int width = 0, height = 0;
     if (!resolutionSize(config.transcodeResolution, width, height)) { error = "unsupported transcode resolution"; return nullptr; }
-    for (const char* factory : {"tsparse", "tsdemux", "decodebin", "videoconvert", "videoscale", "videorate", "x264enc", "h264parse", "mpegtsmux"}) {
-        GstElementFactory* found = gst_element_factory_find(factory);
-        if (!found) { error = std::string("missing GStreamer element: ") + factory; return nullptr; }
-        gst_object_unref(found);
+    const auto capabilities = inspectCapabilities();
+    if (!capabilities.available) {
+        error = capabilities.message;
+        if (!capabilities.missingElements.empty()) {
+            error += ": ";
+            for (size_t i = 0; i < capabilities.missingElements.size(); ++i) {
+                if (i > 0) error += ", ";
+                error += capabilities.missingElements[i];
+            }
+        }
+        return nullptr;
     }
 
     GstElement* parse = gst_element_factory_make("tsparse", "transcode_tsparse");
