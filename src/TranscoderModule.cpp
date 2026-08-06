@@ -112,15 +112,10 @@ void configureAudioBitrate(GstElement* encoder, const std::string& factory, uint
     }
 }
 
-bool linkElementToMux(GstElement* source, GstElement* mux, uint32_t requestedPid) {
+bool linkElementToMux(GstElement* source, GstElement* mux) {
     if (!source || !mux) return false;
     GstPad* srcPad = gst_element_get_static_pad(source, "src");
-    GstPad* sinkPad = nullptr;
-    if (requestedPid > 0 && requestedPid < 0x1fff) {
-        const std::string padName = "sink_" + std::to_string(requestedPid);
-        sinkPad = gst_element_request_pad_simple(mux, padName.c_str());
-    }
-    if (!sinkPad) sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
+    GstPad* sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
     if (!srcPad || !sinkPad) {
         if (srcPad) gst_object_unref(srcPad);
         if (sinkPad) gst_object_unref(sinkPad);
@@ -214,7 +209,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             !add(context->bin, scale) || !add(context->bin, rate) || !add(context->bin, filter) ||
             !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, outQueue) ||
             !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux, context->config.videoPid)) {
+            !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build video branch" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -246,7 +241,12 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             return;
         }
 
+        // Use the exact PCM format accepted by the selected encoder. In particular,
+        // avenc_aac only accepts interleaved F32LE. Letting caps negotiation choose an
+        // incompatible format can produce an AAC PID without valid channel config.
+        const char* rawAudioFormat = encoderSelection.factory == "avenc_aac" ? "F32LE" : "S16LE";
         GstCaps* audioCaps = gst_caps_new_simple("audio/x-raw",
+            "format", G_TYPE_STRING, rawAudioFormat,
             "rate", G_TYPE_INT, 48000,
             "channels", G_TYPE_INT, 2,
             "layout", G_TYPE_STRING, "interleaved",
@@ -269,8 +269,12 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
                 g_object_set(parser, "disable-passthrough", TRUE, nullptr);
             }
+            // MPEG-TS stream type 0x0f needs either valid AudioSpecificConfig for raw
+            // AAC or self-describing ADTS frames. Use ADTS here so every frame carries
+            // sample-rate/channel configuration and late-joining VLC/FFmpeg clients can
+            // decode immediately without relying on codec_data surviving the remux path.
             encodedCaps = gst_caps_from_string(
-                "audio/mpeg,mpegversion=(int)4,stream-format=(string)raw");
+                "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts,framed=(boolean)true,rate=(int)48000,channels=(int)2");
         }
         g_object_set(encodedFilter, "caps", encodedCaps, nullptr);
         gst_caps_unref(encodedCaps);
@@ -287,7 +291,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             !add(context->bin, rate) || !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||
             !add(context->bin, encodedFilter) || !add(context->bin, outQueue) ||
             !gst_element_link_many(queue, convert, resample, rate, filter, encoder, parser, encodedFilter, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux, context->config.audioPid)) {
+            !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build " << codec << " audio branch with "
                       << encoderSelection.factory << std::endl;
             gst_caps_unref(caps);
@@ -299,6 +303,8 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         if (sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
             context->audioLinked = true;
             std::cerr << "Transcoder: audio linked using " << encoderSelection.factory
+                      << " input=" << rawAudioFormat << "/48000/stereo"
+                      << " output=" << (codec == "aac" ? "AAC-ADTS" : "MP3")
                       << " at " << context->config.transcodeAudioBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
@@ -461,10 +467,10 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
     GstElement* queue = gst_element_factory_make("queue", "transcode_input_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "transcode_demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "transcode_mux");
-    GstElement* outputQueue = gst_element_factory_make("queue", "transcode_output_queue");
-    if (!bin || !parse || !queue || !demux || !mux || !outputQueue ||
+    GstElement* outputParse = gst_element_factory_make("tsparse", "transcode_output_tsparse");
+    if (!bin || !parse || !queue || !demux || !mux || !outputParse ||
         !add(bin, parse) || !add(bin, queue) || !add(bin, demux) || !add(bin, mux) ||
-        !add(bin, outputQueue)) {
+        !add(bin, outputParse)) {
         error = "failed to create transcoder bin elements";
         if (bin) gst_object_unref(bin);
         return nullptr;
@@ -475,21 +481,16 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         "alignment", 7,
         "bitrate", static_cast<guint64>(config.transcodeVideoBitrate + config.transcodeAudioBitrate + 350000),
         nullptr);
-    g_object_set(outputQueue,
-        "max-size-time", static_cast<guint64>(2 * GST_SECOND),
-        "max-size-buffers", 0u,
-        "max-size-bytes", 0u,
-        "leaky", 0,
-        nullptr);
+    g_object_set(outputParse, "set-timestamps", TRUE, nullptr);
     if (!gst_element_link_many(parse, queue, demux, nullptr) ||
-        !gst_element_link(mux, outputQueue)) {
+        !gst_element_link(mux, outputParse)) {
         error = "failed to link transcoder bin core";
         gst_object_unref(bin);
         return nullptr;
     }
 
     GstPad* parseSink = gst_element_get_static_pad(parse, "sink");
-    GstPad* outputSrc = gst_element_get_static_pad(outputQueue, "src");
+    GstPad* outputSrc = gst_element_get_static_pad(outputParse, "src");
     GstPad* ghostSink = parseSink ? gst_ghost_pad_new("sink", parseSink) : nullptr;
     GstPad* ghostSrc = outputSrc ? gst_ghost_pad_new("src", outputSrc) : nullptr;
     if (parseSink) gst_object_unref(parseSink);

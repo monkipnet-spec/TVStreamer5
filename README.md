@@ -697,3 +697,7 @@ The transcoder normalizes AAC and MP3 PTS/DTS after the audio parser and before 
 ### Transcoded audio stability
 
 The final MPEG-TS remux now keeps one stable program map containing both video and audio. AAC is explicitly converted to ADTS before the final `mpegtsmux`, which improves compatibility with IPTV receivers and prevents audio from appearing briefly and then disappearing after a stream restart.
+
+### AAC decoder configuration fix
+
+The AAC branch now uses the PCM format required by the selected encoder. `avenc_aac` receives interleaved `F32LE`, 48 kHz stereo audio, while compatible native encoders receive `S16LE`. AAC is converted by `aacparse` to framed ADTS before MPEG-TS multiplexing. Each ADTS frame therefore carries its sample-rate and channel configuration, preventing output streams that are detected as AAC but reported as `0 channels` and produce no sound.
