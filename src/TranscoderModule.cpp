@@ -103,11 +103,24 @@ AudioEncoderSelection makeAudioEncoder(const std::string& codec) {
 void configureAudioBitrate(GstElement* encoder, const std::string& factory, uint64_t bitrate) {
     if (!encoder) return;
     bitrate = std::clamp<uint64_t>(bitrate, 64000, 320000);
-    if (!g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "bitrate")) return;
-    // lamemp3enc uses kbit/s; libav and AAC encoders use bit/s.
+
     if (factory == "lamemp3enc") {
-        g_object_set(encoder, "bitrate", static_cast<gint>(bitrate / 1000), nullptr);
-    } else {
+        // lamemp3enc expects kbit/s and requires bitrate mode for the cbr flag
+        // and bitrate property to take effect.
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "target")) {
+            gst_util_set_object_arg(G_OBJECT(encoder), "target", "bitrate");
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "cbr")) {
+            g_object_set(encoder, "cbr", TRUE, nullptr);
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "bitrate")) {
+            g_object_set(encoder, "bitrate", static_cast<gint>(bitrate / 1000), nullptr);
+        }
+        return;
+    }
+
+    // libav AAC/MP3 and the native AAC encoders use bits/s.
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "bitrate")) {
         g_object_set(encoder, "bitrate", static_cast<gint>(bitrate), nullptr);
     }
 }
@@ -244,12 +257,21 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         // Use the exact PCM format accepted by the selected encoder. In particular,
         // avenc_aac only accepts interleaved F32LE. Letting caps negotiation choose an
         // incompatible format can produce an AAC PID without valid channel config.
-        const char* rawAudioFormat = encoderSelection.factory == "avenc_aac" ? "F32LE" : "S16LE";
+        const char* rawAudioFormat = "S16LE";
+        if (encoderSelection.factory == "avenc_aac") {
+            rawAudioFormat = "F32LE";
+        } else if (encoderSelection.factory == "avenc_mp3") {
+            // The libav MP3 encoder uses planar signed 16-bit PCM.
+            rawAudioFormat = "S16P";
+        }
+        const char* rawAudioLayout = encoderSelection.factory == "avenc_mp3"
+            ? "non-interleaved"
+            : "interleaved";
         GstCaps* audioCaps = gst_caps_new_simple("audio/x-raw",
             "format", G_TYPE_STRING, rawAudioFormat,
             "rate", G_TYPE_INT, 48000,
             "channels", G_TYPE_INT, 2,
-            "layout", G_TYPE_STRING, "interleaved",
+            "layout", G_TYPE_STRING, rawAudioLayout,
             nullptr);
         g_object_set(filter, "caps", audioCaps, nullptr);
         gst_caps_unref(audioCaps);
@@ -263,18 +285,23 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 
         GstCaps* encodedCaps = nullptr;
         if (codec == "mp3") {
+            if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
+                g_object_set(parser, "disable-passthrough", TRUE, nullptr);
+            }
+            // Keep MP3 completely separate from the AAC/ADTS path. The final mux
+            // receives parsed MPEG-1 Layer III frames with explicit stereo/rate caps.
             encodedCaps = gst_caps_from_string(
-                "audio/mpeg,mpegversion=(int)1,layer=(int)3");
+                "audio/mpeg,mpegversion=(int)1,layer=(int)3,parsed=(boolean)true,rate=(int)48000,channels=(int)2");
         } else {
             if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
                 g_object_set(parser, "disable-passthrough", TRUE, nullptr);
             }
-            // MPEG-TS stream type 0x0f needs either valid AudioSpecificConfig for raw
-            // AAC or self-describing ADTS frames. Use ADTS here so every frame carries
-            // sample-rate/channel configuration and late-joining VLC/FFmpeg clients can
-            // decode immediately without relying on codec_data surviving the remux path.
+            // Keep the AAC stream in the native raw format produced by aacparse.
+            // This preserves codec_data (AudioSpecificConfig) negotiated from the encoder.
+            // Declaring raw AAC buffers as ADTS with a capsfilter does not add ADTS headers
+            // and produces an AAC PID that players detect as zero-channel or silent audio.
             encodedCaps = gst_caps_from_string(
-                "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts,framed=(boolean)true,rate=(int)48000,channels=(int)2");
+                "audio/mpeg,mpegversion=(int)4,stream-format=(string)raw,framed=(boolean)true");
         }
         g_object_set(encodedFilter, "caps", encodedCaps, nullptr);
         gst_caps_unref(encodedCaps);
@@ -303,8 +330,8 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         if (sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
             context->audioLinked = true;
             std::cerr << "Transcoder: audio linked using " << encoderSelection.factory
-                      << " input=" << rawAudioFormat << "/48000/stereo"
-                      << " output=" << (codec == "aac" ? "AAC-ADTS" : "MP3")
+                      << " input=" << rawAudioFormat << "/" << rawAudioLayout << "/48000/stereo"
+                      << " output=" << (codec == "aac" ? "AAC-RAW+ASC" : "MP3")
                       << " at " << context->config.transcodeAudioBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);

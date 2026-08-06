@@ -696,8 +696,13 @@ The transcoder normalizes AAC and MP3 PTS/DTS after the audio parser and before 
 
 ### Transcoded audio stability
 
-The final MPEG-TS remux now keeps one stable program map containing both video and audio. AAC is explicitly converted to ADTS before the final `mpegtsmux`, which improves compatibility with IPTV receivers and prevents audio from appearing briefly and then disappearing after a stream restart.
+The final MPEG-TS remux keeps one stable program map containing both video and audio. AAC remains in the native raw format produced by `aacparse`, preserving the negotiated `codec_data`/AudioSpecificConfig required by MPEG-TS receivers.
 
 ### AAC decoder configuration fix
 
-The AAC branch now uses the PCM format required by the selected encoder. `avenc_aac` receives interleaved `F32LE`, 48 kHz stereo audio, while compatible native encoders receive `S16LE`. AAC is converted by `aacparse` to framed ADTS before MPEG-TS multiplexing. Each ADTS frame therefore carries its sample-rate and channel configuration, preventing output streams that are detected as AAC but reported as `0 channels` and produce no sound.
+The AAC branch uses the PCM format required by the selected encoder. `avenc_aac` receives interleaved `F32LE`, 48 kHz stereo audio, while compatible native encoders receive `S16LE`. After encoding, `aacparse` outputs framed raw AAC and preserves `codec_data` (AudioSpecificConfig). The code no longer declares raw AAC buffers as ADTS without actually adding ADTS headers, which previously produced tracks detected as AAC with `0 channels` and no sound.
+
+
+### MP3 encoder configuration fix
+
+The MP3 transcoding path is independent from AAC. `lamemp3enc` is configured in bitrate-target mode with CBR enabled and receives its bitrate in kbit/s. The libav `avenc_mp3` fallback receives non-interleaved planar `S16P` PCM, while `lamemp3enc` receives interleaved `S16LE`; both use 48 kHz stereo input. After `mpegaudioparse`, the mux receives parsed MPEG-1 Layer III caps with the sample rate and channel count preserved.
