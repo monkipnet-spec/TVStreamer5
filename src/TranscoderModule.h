@@ -9,6 +9,9 @@ struct TranscoderCapabilities {
     bool available = false;
     std::string videoEncoder;
     std::string audioEncoder;
+    std::string aacEncoder;
+    std::string mp3Encoder;
+    bool deinterlaceAvailable = false;
     std::vector<std::string> missingElements;
     std::string message;
 };

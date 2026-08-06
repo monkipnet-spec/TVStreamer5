@@ -621,3 +621,36 @@ demuxers, decoders, parsers, or muxers. Unsupported, subtitle, data, and duplica
 program pads are connected to a `fakesink`, preventing `GST_FLOW_NOT_LINKED` from
 stopping the complete stream. This is particularly important for multi-program
 MPEG-TS inputs and streams with multiple audio tracks.
+
+### AAC encoder format negotiation
+
+The transcoder does not force a fixed raw PCM sample format before the AAC encoder. `audioconvert` negotiates the format supported by the selected encoder (`avenc_aac`, `fdkaacenc`, or `voaacenc`). The encoded branch is normalized to raw AAC before `mpegtsmux`, ensuring that the output MPEG-TS contains a playable AAC audio track.
+
+
+### Audio codec selection and deinterlacing
+
+The optional transcoder supports selectable output audio encoding:
+
+- AAC-LC: 96, 128, 160, 192, 256, or 320 kbit/s
+- MP3: 96, 128, 160, 192, 256, or 320 kbit/s
+
+The selected settings are stored per stream as:
+
+```json
+{
+  "transcode_audio_codec": "aac",
+  "transcode_audio_bitrate": 192000
+}
+```
+
+Interlaced input video is passed through the GStreamer `deinterlace` element and
+encoded as progressive 25 fps video. This prevents combing artifacts when 1080i
+or 576i sources are transcoded for HTTP, HLS, SRT, or UDP delivery.
+
+Verify the additional elements:
+
+```bash
+gst-inspect-1.0 deinterlace
+gst-inspect-1.0 lamemp3enc || gst-inspect-1.0 avenc_mp3
+gst-inspect-1.0 mpegaudioparse
+```

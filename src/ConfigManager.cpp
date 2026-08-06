@@ -1,5 +1,6 @@
 #include "ConfigManager.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -58,6 +59,12 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.transcodeEnabled = root.get("transcode_enabled", false).asBool();
     config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();
     config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();
+    config.transcodeAudioCodec = root.get("transcode_audio_codec", "aac").asString();
+    if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3") {
+        config.transcodeAudioCodec = "aac";
+    }
+    config.transcodeAudioBitrate = root.get("transcode_audio_bitrate", Json::UInt64(192000)).asUInt64();
+    config.transcodeAudioBitrate = std::clamp<uint64_t>(config.transcodeAudioBitrate, 64000, 320000);
     config.audioPid = root.get("audio_pid", 0).asUInt();
     config.videoPid = root.get("video_pid", 0).asUInt();
     config.serviceId = root.get("service_id", 1).asUInt();
@@ -105,6 +112,8 @@ Json::Value StreamConfig::toJson() const {
     root["transcode_enabled"] = transcodeEnabled;
     root["transcode_resolution"] = transcodeResolution;
     root["transcode_video_bitrate"] = Json::UInt64(transcodeVideoBitrate);
+    root["transcode_audio_codec"] = transcodeAudioCodec;
+    root["transcode_audio_bitrate"] = Json::UInt64(transcodeAudioBitrate);
     root["audio_pid"] = audioPid;
     root["video_pid"] = videoPid;
     root["service_id"] = serviceId;

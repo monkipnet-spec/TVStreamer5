@@ -39,6 +39,8 @@ struct StreamConfig {
     bool transcodeEnabled = false;
     std::string transcodeResolution = "1920x1080";
     uint64_t transcodeVideoBitrate = 6000000;
+    std::string transcodeAudioCodec = "aac";
+    uint64_t transcodeAudioBitrate = 192000;
     uint32_t audioPid = 0;
     uint32_t videoPid = 0;
     uint32_t serviceId = 1;
