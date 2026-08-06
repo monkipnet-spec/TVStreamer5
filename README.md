@@ -682,3 +682,8 @@ an uninitialised PCR from blocking or delaying delivery to UDP, UDP-CBR, SRT, HT
 The transcoder output path uses the proven MPEG-TS parser/remux integration from v18.
 This restores UDP/UDP-CBR packet delivery while retaining AAC/MP3 selection,
 configurable audio bitrate, and progressive deinterlaced video output.
+
+
+### Audio timestamp and remux compatibility
+
+The transcoder audio branch uses `audiorate` before AAC or MP3 encoding to create a continuous, monotonic 48 kHz timeline. The output remuxer reads the `audio/mpeg` caps fields directly instead of relying on one textual caps representation, so both AAC (`mpegversion=4`) and MP3 (`mpegversion=1`, layer 3) are preserved in the final MPEG-TS program. H.264 SPS/PPS are repeated every second for reliable mid-stream client joins.

@@ -145,7 +145,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
         gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
         g_object_set(encoder, "option-string", "nal-hrd=cbr:force-cfr=1", nullptr);
-        g_object_set(parser, "config-interval", -1, nullptr);
+        g_object_set(parser, "config-interval", 1, nullptr);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, deinterlace) ||
             !add(context->bin, scale) || !add(context->bin, rate) || !add(context->bin, filter) ||
@@ -169,13 +169,14 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         GstElement* convert = gst_element_factory_make("audioconvert", nullptr);
         GstElement* resample = gst_element_factory_make("audioresample", nullptr);
+        GstElement* rate = gst_element_factory_make("audiorate", nullptr);
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         const auto encoderSelection = makeAudioEncoder(codec);
         GstElement* encoder = encoderSelection.element;
         GstElement* parser = gst_element_factory_make(codec == "mp3" ? "mpegaudioparse" : "aacparse", nullptr);
         GstElement* encodedFilter = gst_element_factory_make("capsfilter", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !resample || !filter || !encoder || !parser || !encodedFilter || !outQueue) {
+        if (!queue || !convert || !resample || !rate || !filter || !encoder || !parser || !encodedFilter || !outQueue) {
             std::cerr << "Transcoder: missing " << codec << " audio elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -190,6 +191,12 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         g_object_set(filter, "caps", audioCaps, nullptr);
         gst_caps_unref(audioCaps);
         configureAudioBitrate(encoder, encoderSelection.factory, context->config.transcodeAudioBitrate);
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "skip-to-first")) {
+            g_object_set(rate, "skip-to-first", TRUE, nullptr);
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "tolerance")) {
+            g_object_set(rate, "tolerance", static_cast<guint64>(20 * GST_MSECOND), nullptr);
+        }
 
         GstCaps* encodedCaps = nullptr;
         if (codec == "mp3") {
@@ -206,9 +213,9 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         gst_caps_unref(encodedCaps);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, resample) ||
-            !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||
+            !add(context->bin, rate) || !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||
             !add(context->bin, encodedFilter) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, resample, filter, encoder, parser, encodedFilter, outQueue, nullptr) ||
+            !gst_element_link_many(queue, convert, resample, rate, filter, encoder, parser, encodedFilter, outQueue, nullptr) ||
             !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build " << codec << " audio branch with "
                       << encoderSelection.factory << std::endl;
@@ -224,7 +231,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
                       << " at " << context->config.transcodeAudioBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
-        for (GstElement* e : {queue, convert, resample, filter, encoder, parser, encodedFilter, outQueue}) sync(e);
+        for (GstElement* e : {queue, convert, resample, rate, filter, encoder, parser, encodedFilter, outQueue}) sync(e);
     } else {
         // Multiple programs, subtitles, data PIDs, and duplicate audio/video tracks must
         // be consumed. Leaving a tsdemux pad unlinked can propagate GST_FLOW_NOT_LINKED

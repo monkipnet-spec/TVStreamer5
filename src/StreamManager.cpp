@@ -812,28 +812,41 @@ void updateMuxProgramMap(RemapContext* ctx) {
     gst_structure_free(programMap);
 }
 
-std::string parserForCaps(const std::string& capsString) {
-    if (capsString.find("video/x-h264") != std::string::npos) {
+std::string parserForCaps(GstCaps* caps, const std::string& capsString) {
+    const GstStructure* structure = (caps && gst_caps_get_size(caps) > 0)
+        ? gst_caps_get_structure(caps, 0)
+        : nullptr;
+    const char* mediaType = structure ? gst_structure_get_name(structure) : nullptr;
+
+    if (g_strcmp0(mediaType, "video/x-h264") == 0 || capsString.find("video/x-h264") != std::string::npos) {
         return "h264parse";
     }
-    if (capsString.find("video/x-h265") != std::string::npos) {
+    if (g_strcmp0(mediaType, "video/x-h265") == 0 || capsString.find("video/x-h265") != std::string::npos) {
         return "h265parse";
     }
-    if (capsString.find("video/mpeg") != std::string::npos) {
+    if (g_strcmp0(mediaType, "video/mpeg") == 0 || capsString.find("video/mpeg") != std::string::npos) {
         return "mpegvideoparse";
     }
-    if (capsString.find("audio/mpeg") != std::string::npos &&
-        capsString.find("mpegversion=(int)4") != std::string::npos) {
-        return "aacparse";
+    if (g_strcmp0(mediaType, "audio/mpeg") == 0 || capsString.find("audio/mpeg") != std::string::npos) {
+        gint mpegVersion = 0;
+        gint layer = 0;
+        if (structure) {
+            gst_structure_get_int(structure, "mpegversion", &mpegVersion);
+            gst_structure_get_int(structure, "layer", &layer);
+        }
+        if (mpegVersion == 4 || capsString.find("mpegversion=4") != std::string::npos ||
+            capsString.find("mpegversion=(int)4") != std::string::npos) {
+            return "aacparse";
+        }
+        if (mpegVersion == 1 || layer == 3 || capsString.find("mpegversion=1") != std::string::npos ||
+            capsString.find("mpegversion=(int)1") != std::string::npos) {
+            return "mpegaudioparse";
+        }
     }
-    if (capsString.find("audio/mpeg") != std::string::npos &&
-        capsString.find("mpegversion=(int)1") != std::string::npos) {
-        return "mpegaudioparse";
-    }
-    if (capsString.find("audio/x-ac3") != std::string::npos) {
+    if (g_strcmp0(mediaType, "audio/x-ac3") == 0 || capsString.find("audio/x-ac3") != std::string::npos) {
         return "ac3parse";
     }
-    if (capsString.find("audio/x-dts") != std::string::npos) {
+    if (g_strcmp0(mediaType, "audio/x-dts") == 0 || capsString.find("audio/x-dts") != std::string::npos) {
         return "dtsparse";
     }
     return "";
@@ -2480,20 +2493,23 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     bool isAudio = capsString.find("audio/") != std::string::npos;
     bool isVideo = capsString.find("video/") != std::string::npos;
     bool isPrivateTs = capsString.find("private") != std::string::npos || capsString.find("subpicture") != std::string::npos;
-    if (caps) {
-        gst_caps_unref(caps);
-    }
 
     if ((!isAudio && !isVideo) || isPrivateTs) {
+        if (caps) gst_caps_unref(caps);
         drainDynamicPad(ctx->mux, pad);
         return;
     }
     if ((isVideo && ctx->videoLinked) || (isAudio && ctx->audioLinked)) {
+        if (caps) gst_caps_unref(caps);
         drainDynamicPad(ctx->mux, pad);
         return;
     }
 
-    std::string parserFactory = parserForCaps(capsString);
+    std::string parserFactory = parserForCaps(caps, capsString);
+    if (caps) {
+        gst_caps_unref(caps);
+        caps = nullptr;
+    }
     GstElement* queue = gst_element_factory_make("queue", nullptr);
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString);
@@ -2574,6 +2590,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+        std::cerr << "remap linked " << (isAudio ? "audio" : "video")
+                  << " caps=" << capsString << " parser=" << parserFactory
+                  << " pid=" << requestedPid << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {
             ctx->videoLinked = true;
@@ -2699,6 +2718,8 @@ void StreamManager::onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_d
     }
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+        std::cerr << "RTSP remap linked " << (factories.isAudio ? "audio" : "video")
+                  << " pid=" << requestedPid << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (factories.isVideo) {
             ctx->videoLinked = true;
