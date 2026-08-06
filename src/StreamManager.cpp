@@ -796,20 +796,30 @@ uint32_t pidFromDemuxPadName(GstPad* pad) {
 }
 
 void updateMuxProgramMap(RemapContext* ctx) {
-    if (!ctx || !ctx->mux) {
+    if (!ctx || !ctx->mux || ctx->flvMux || ctx->programMapApplied) {
+        return;
+    }
+
+    // mpegtsmux does not reliably accept repeated live prog-map replacements while
+    // pads are still being added. Applying a video-only map first and replacing it
+    // when audio appears can leave the PMT without a stable audio entry. Wait until
+    // both elementary streams are linked, then publish one immutable program map.
+    if (ctx->videoPadName.empty() || ctx->audioPadName.empty()) {
         return;
     }
 
     GstStructure* programMap = gst_structure_new_empty("program_map");
-    int serviceId = static_cast<int>(ctx->config.serviceId ? ctx->config.serviceId : 1);
-    if (!ctx->videoPadName.empty()) {
-        gst_structure_set(programMap, ctx->videoPadName.c_str(), G_TYPE_INT, serviceId, nullptr);
-    }
-    if (!ctx->audioPadName.empty()) {
-        gst_structure_set(programMap, ctx->audioPadName.c_str(), G_TYPE_INT, serviceId, nullptr);
-    }
+    const int serviceId = static_cast<int>(ctx->config.serviceId ? ctx->config.serviceId : 1);
+    gst_structure_set(programMap,
+        ctx->videoPadName.c_str(), G_TYPE_INT, serviceId,
+        ctx->audioPadName.c_str(), G_TYPE_INT, serviceId,
+        nullptr);
     g_object_set(ctx->mux, "prog-map", programMap, nullptr);
     gst_structure_free(programMap);
+    ctx->programMapApplied = true;
+    std::cerr << "remap program map applied: service=" << serviceId
+              << " video=" << ctx->videoPadName
+              << " audio=" << ctx->audioPadName << std::endl;
 }
 
 std::string parserForCaps(GstCaps* caps, const std::string& capsString) {
@@ -852,15 +862,24 @@ std::string parserForCaps(GstCaps* caps, const std::string& capsString) {
     return "";
 }
 
-GstElement* capsFilterForMux(bool flvMux, bool isVideo, bool isAudio, const std::string& capsString) {
+GstElement* capsFilterForMux(
+    bool flvMux,
+    bool isVideo,
+    bool isAudio,
+    const std::string& capsString,
+    const std::string& parserFactory) {
     std::string capsDescription;
     if (flvMux && isVideo && capsString.find("video/x-h264") != std::string::npos) {
         capsDescription = "video/x-h264,stream-format=(string)avc";
-    } else if (flvMux && isAudio && capsString.find("audio/mpeg") != std::string::npos &&
-               capsString.find("mpegversion=(int)4") != std::string::npos) {
+    } else if (flvMux && isAudio && parserFactory == "aacparse") {
         capsDescription = "audio/mpeg,mpegversion=(int)4,stream-format=(string)raw";
     } else if (!flvMux && isVideo && capsString.find("video/x-h264") != std::string::npos) {
-        capsDescription = "video/x-h264,stream-format=(string)byte-stream";
+        capsDescription = "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au";
+    } else if (!flvMux && isAudio && parserFactory == "aacparse") {
+        // MPEG-TS receivers are most interoperable with ADTS-framed AAC. Forcing
+        // ADTS also makes codec configuration self-contained in every audio frame,
+        // avoiding the brief-audio-then-silence failure after PMT/decoder refreshes.
+        capsDescription = "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts";
     }
 
     if (capsDescription.empty()) {
@@ -2254,11 +2273,7 @@ bool StreamManager::buildOutputBranch(
         return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
 
-    // The transcoder already produces a complete MPEG-TS with the configured
-    // elementary-stream PIDs. Remuxing it again corrupts H.264 access units and
-    // can make the audio PID disappear after startup. Keep remapping only for
-    // passthrough inputs.
-    const bool needsRemux = outputConfig.remapEnabled && !state->config.transcodeEnabled;
+    const bool needsRemux = outputConfig.remapEnabled;
     if (needsRemux) {
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
@@ -2516,7 +2531,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     GstElement* queue = gst_element_factory_make("queue", nullptr);
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
-    GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString);
+    GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
     if (!queue || !parser) {
         std::cerr << "remap skipped unsupported elementary stream caps: " << capsString << std::endl;

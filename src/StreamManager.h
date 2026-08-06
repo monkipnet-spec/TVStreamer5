@@ -24,6 +24,7 @@ struct RemapContext {
     bool videoLinked = false;
     bool audioLinked = false;
     bool flvMux = false;
+    bool programMapApplied = false;
     std::string videoPadName;
     std::string audioPadName;
 };
