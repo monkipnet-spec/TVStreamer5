@@ -112,6 +112,57 @@ void configureTranscodeMux(GstElement* mux, const StreamConfig& config, const st
     setNumericPropertyIfPresent(mux, "si-interval", 9000);   // 100 ms
 }
 
+
+bool gstValueCanContainInt(const GValue* value, gint expected) {
+    if (!value) return false;
+    if (G_VALUE_HOLDS_INT(value)) {
+        return g_value_get_int(value) == expected;
+    }
+    if (GST_VALUE_HOLDS_INT_RANGE(value)) {
+        return expected >= gst_value_get_int_range_min(value) &&
+               expected <= gst_value_get_int_range_max(value);
+    }
+    if (GST_VALUE_HOLDS_LIST(value) || GST_VALUE_HOLDS_ARRAY(value)) {
+        const guint count = GST_VALUE_HOLDS_LIST(value)
+            ? gst_value_list_get_size(value)
+            : gst_value_array_get_size(value);
+        for (guint i = 0; i < count; ++i) {
+            const GValue* item = GST_VALUE_HOLDS_LIST(value)
+                ? gst_value_list_get_value(value, i)
+                : gst_value_array_get_value(value, i);
+            if (gstValueCanContainInt(item, expected)) return true;
+        }
+    }
+    return false;
+}
+
+bool structureFieldCanContainInt(const GstStructure* structure, const char* field, gint expected) {
+    return structure && gstValueCanContainInt(gst_structure_get_value(structure, field), expected);
+}
+
+bool structureFieldStringListContains(const GstStructure* structure, const char* field, const char* expected) {
+    if (!structure || !field || !expected) return false;
+    const GValue* value = gst_structure_get_value(structure, field);
+    if (!value) return false;
+    if (G_VALUE_HOLDS_STRING(value)) {
+        return g_strcmp0(g_value_get_string(value), expected) == 0;
+    }
+    if (GST_VALUE_HOLDS_LIST(value) || GST_VALUE_HOLDS_ARRAY(value)) {
+        const guint count = GST_VALUE_HOLDS_LIST(value)
+            ? gst_value_list_get_size(value)
+            : gst_value_array_get_size(value);
+        for (guint i = 0; i < count; ++i) {
+            const GValue* item = GST_VALUE_HOLDS_LIST(value)
+                ? gst_value_list_get_value(value, i)
+                : gst_value_array_get_value(value, i);
+            if (G_VALUE_HOLDS_STRING(item) && g_strcmp0(g_value_get_string(item), expected) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 GstPad* requestMuxSinkPad(GstElement* mux, uint32_t requestedPid) {
     GstPad* pad = nullptr;
     if (mux && requestedPid > 0 && requestedPid < 0x1FFF) {
@@ -282,6 +333,9 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstPad* sinkPad = gst_element_get_static_pad(queue, "sink");
         if (sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
             context->videoLinked = true;
+            std::cerr << "Transcoder: video linked using x264enc "
+                      << width << "x" << height << " @ "
+                      << context->config.transcodeVideoBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
         for (GstElement* e : {queue, convert, deinterlace, scale, rate, filter, encoder, parser, parsedFilter, outQueue}) sync(e);
@@ -405,12 +459,23 @@ bool buildAudioPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps
     std::string parserFactory;
 
     if (g_strcmp0(mediaType, "audio/mpeg") == 0) {
-        gint mpegVersion = 0;
-        gint layer = 0;
-        gst_structure_get_int(structure, "mpegversion", &mpegVersion);
-        gst_structure_get_int(structure, "layer", &layer);
-        if (mpegVersion == 4) parserFactory = "aacparse";
-        else if (mpegVersion == 1 && (layer == 1 || layer == 2 || layer == 3 || layer == 0)) parserFactory = "mpegaudioparse";
+        // parsebin/tsdemux may expose non-fixed caps such as:
+        // audio/mpeg, mpegversion=(int){ 2, 4 }, stream-format=(string){ raw, adts, adif, loas }
+        // gst_structure_get_int() fails on lists/ranges, so inspect the GValue directly.
+        const bool looksLikeAac = structureFieldCanContainInt(structure, "mpegversion", 4) ||
+            structureFieldCanContainInt(structure, "mpegversion", 2) ||
+            structureFieldStringListContains(structure, "stream-format", "adts") ||
+            structureFieldStringListContains(structure, "stream-format", "raw") ||
+            structureFieldStringListContains(structure, "stream-format", "loas") ||
+            structureFieldStringListContains(structure, "stream-format", "adif");
+        const bool looksLikeMpegAudio = structureFieldCanContainInt(structure, "mpegversion", 1) ||
+            structureFieldCanContainInt(structure, "layer", 1) ||
+            structureFieldCanContainInt(structure, "layer", 2) ||
+            structureFieldCanContainInt(structure, "layer", 3);
+
+        if (looksLikeMpegAudio && !looksLikeAac) parserFactory = "mpegaudioparse";
+        else if (looksLikeAac) parserFactory = "aacparse";
+        else parserFactory = "aacparse"; // safest default for ambiguous audio/mpeg caps from parsebin
     } else if (g_strcmp0(mediaType, "audio/x-ac3") == 0 ||
                g_strcmp0(mediaType, "audio/x-eac3") == 0) {
         parserFactory = "ac3parse";

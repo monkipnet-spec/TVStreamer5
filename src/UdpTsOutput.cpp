@@ -58,6 +58,15 @@ std::string interfaceAddressFor(const std::string& address) {
     return address;
 }
 
+std::string interfaceNameFor(const std::string& address) {
+    for (const auto& iface : enumerateNetworkInterfaces()) {
+        if (iface.name == address || iface.address == address) {
+            return iface.name;
+        }
+    }
+    return address;
+}
+
 bool hasProperty(GstElement* element, const char* propertyName) {
     return element && g_object_class_find_property(G_OBJECT_GET_CLASS(element), propertyName) != nullptr;
 }
@@ -126,10 +135,38 @@ public:
             }
 
             if (multicastOutput) {
-                if (::setsockopt(socketFd, IPPROTO_IP, IP_MULTICAST_IF, &localAddress, sizeof(localAddress)) != 0) {
-                    error = std::string("failed to set multicast interface: ") + std::strerror(errno);
-                    closeSocket();
-                    return;
+                // For multicast, prefer binding the socket to the selected source address,
+                // then select the outgoing interface. Some Linux/container combinations reject
+                // IP_MULTICAST_IF with only in_addr even when the address exists; retry with
+                // ip_mreqn/ifindex and, if that still fails, keep streaming on the kernel route
+                // instead of killing the whole output.
+                sockaddr_in bindAddress {};
+                bindAddress.sin_family = AF_INET;
+                bindAddress.sin_port = 0;
+                bindAddress.sin_addr = localAddress;
+                if (::bind(socketFd, reinterpret_cast<sockaddr*>(&bindAddress), sizeof(bindAddress)) != 0) {
+                    std::cerr << "UDP output: warning: failed to bind multicast source "
+                              << ifaceAddress << ": " << std::strerror(errno) << std::endl;
+                }
+
+                bool multicastInterfaceSelected =
+                    ::setsockopt(socketFd, IPPROTO_IP, IP_MULTICAST_IF, &localAddress, sizeof(localAddress)) == 0;
+#ifdef __linux__
+                if (!multicastInterfaceSelected) {
+                    const std::string ifaceName = interfaceNameFor(cfg.interfaceAddress);
+                    ip_mreqn mreqn {};
+                    mreqn.imr_address = localAddress;
+                    mreqn.imr_ifindex = static_cast<int>(::if_nametoindex(ifaceName.c_str()));
+                    if (mreqn.imr_ifindex > 0) {
+                        multicastInterfaceSelected =
+                            ::setsockopt(socketFd, IPPROTO_IP, IP_MULTICAST_IF, &mreqn, sizeof(mreqn)) == 0;
+                    }
+                }
+#endif
+                if (!multicastInterfaceSelected) {
+                    std::cerr << "UDP output: warning: failed to set multicast interface "
+                              << cfg.interfaceAddress << " (" << ifaceAddress << "): "
+                              << std::strerror(errno) << "; using kernel multicast route" << std::endl;
                 }
             } else {
                 sockaddr_in bindAddress {};

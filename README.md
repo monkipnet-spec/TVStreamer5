@@ -760,3 +760,18 @@ seeing H.264 slices before SPS/PPS.
 The transcoder mux also publishes PAT, PMT, SDT/SI and PCR at short intervals and requests
 the configured video/audio PIDs on its own mux sink pads. This keeps the generated MPEG-TS
 self-describing for UDP-CBR, UDP, SRT, HTTP TS, HLS and RTMP/YouTube remux outputs.
+
+### v35: audio-copy caps and multicast-interface resilience
+
+The original-audio passthrough path now accepts non-fixed `audio/mpeg` caps from
+`parsebin`, including lists and ranges such as `mpegversion={2,4}` and
+`stream-format={raw,adts,adif,loas}`. The previous strict integer-only check could
+reject a valid AAC input pad before it reached `aacparse`, which removed the audio
+branch from the transcoder output. v35 inspects GStreamer `GValue` lists/ranges and
+selects `aacparse` or `mpegaudioparse` accordingly.
+
+UDP/UDP-CBR multicast output is also more tolerant when selecting the outgoing
+interface. TVStreamer5 now binds the multicast sender socket to the configured source
+address, retries `IP_MULTICAST_IF` using the interface index on Linux, and falls back
+to the kernel multicast route with a warning instead of stopping the output if the
+interface-specific socket option is rejected.
