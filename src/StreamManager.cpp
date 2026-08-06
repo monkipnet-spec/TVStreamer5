@@ -1,4 +1,5 @@
 #include "StreamManager.h"
+#include "TranscoderModule.h"
 #include "UdpCbrOutput.h"
 #include "UdpInput.h"
 #include "UdpVbrOutput.h"
@@ -1157,6 +1158,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " input_iface=" << (inputInterface.empty() ? "auto" : inputInterface)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
+         << " transcode=" << (cfg.transcodeEnabled ? cfg.transcodeResolution + "@" + std::to_string(cfg.transcodeVideoBitrate) : "off")
          << " outputs=";
     const auto outputs = outputConfigs(cfg);
     for (size_t i = 0; i < outputs.size(); ++i) {
@@ -1753,6 +1755,16 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
     }
 
     state->outputContexts.clear();
+    if (cfg.transcodeEnabled) {
+        std::string transcodeError;
+        GstElement* transcodedTail = TranscoderModule::build(pipeline, sourceTail, cfg, transcodeError);
+        if (!transcodedTail) {
+            std::cerr << "Transcoder setup failed for " << cfg.id << ": " << transcodeError << std::endl;
+            gst_object_unref(pipeline);
+            return nullptr;
+        }
+        sourceTail = transcodedTail;
+    }
     if (!buildOutputBranches(state, pipeline, sourceTail)) {
         gst_object_unref(pipeline);
         return nullptr;

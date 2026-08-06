@@ -36,6 +36,9 @@ struct StreamConfig {
     bool remapEnabled = false;
     bool cbr = true;
     uint64_t targetBitrate = 2000000;
+    bool transcodeEnabled = false;
+    std::string transcodeResolution = "1920x1080";
+    uint64_t transcodeVideoBitrate = 6000000;
     uint32_t audioPid = 0;
     uint32_t videoPid = 0;
     uint32_t serviceId = 1;

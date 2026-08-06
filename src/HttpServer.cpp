@@ -1466,6 +1466,14 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .form-row-inline small-field input{width:calc(100% - 8px)}
 .form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
 .form-row .checkbox-inline input{width:16px;height:16px}
+.transcode-panel{width:100%;box-sizing:border-box;padding:12px;background:rgba(31,139,255,.07);border:1px solid rgba(57,189,248,.18);border-radius:10px}
+.transcode-grid{display:grid;grid-template-columns:minmax(210px,1fr) minmax(190px,1fr);gap:10px;width:100%}
+.transcode-grid .form-row select,.transcode-grid .form-row input{max-width:none;box-sizing:border-box}
+.transcode-custom-bitrate{display:none;grid-template-columns:minmax(120px,1fr) auto;gap:8px;align-items:center;width:100%}
+.transcode-custom-bitrate.visible{display:grid}
+.transcode-summary{margin-top:10px;padding:8px 10px;border-radius:8px;background:rgba(0,0,0,.18);color:#cfd8ea;font-size:.78rem;line-height:1.45}
+.transcode-summary strong{color:#fff}
+@media (max-width:760px){.transcode-grid{grid-template-columns:1fr}}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
 .modal-actions button{min-width:100px;padding:8px 12px}
 .about-list{display:grid;gap:10px;margin:4px 0 0}
@@ -2037,7 +2045,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -2239,6 +2247,12 @@ function openStreamForm(stream) {
     const outputs = outputConfigsForStream(stream);
     const outputType = normalizedOutputType(outputs[0] || stream);
     const links = Array.isArray(stream.vlc_links) ? stream.vlc_links : [];
+    const transcodeBitrateKbps = Math.round((stream.transcode_video_bitrate || 6000000) / 1000);
+    const transcodeBitratePresets = [2000, 3500, 6000, 8000, 12000, 18000, 25000, 35000];
+    const hasTranscodeBitratePreset = transcodeBitratePresets.includes(transcodeBitrateKbps);
+    const transcodeBitrateOptions = transcodeBitratePresets.map(value =>
+      `<option value="${value}" ${hasTranscodeBitratePreset && value===transcodeBitrateKbps?'selected':''}>${value} кбит/с</option>`
+    ).join('') + `<option value="custom" ${hasTranscodeBitratePreset?'':'selected'}>Другое значение…</option>`;
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
@@ -2253,6 +2267,8 @@ function openStreamForm(stream) {
         <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
         <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
+        <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${stream.transcode_enabled ? 'checked' : ''} onchange="updateTranscodeControls()" /><span>Транскодировать видео в H.264 CBR и аудио в AAC</span></div></div>
+        <div class="form-row full" id="streamTranscodeControls" style="display:${stream.transcode_enabled?'block':'none'}"><label>Параметры транскодирования</label><div class="transcode-panel"><div class="transcode-grid"><div class="form-row"><label>Выходное разрешение</label><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select></div><div class="form-row"><label>Видеобитрейт H.264 CBR</label><select id="streamTranscodeBitratePreset" onchange="updateTranscodeBitrateMode()">${transcodeBitrateOptions}</select><div id="streamTranscodeCustomBitrateRow" class="transcode-custom-bitrate ${hasTranscodeBitratePreset?'':'visible'}"><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${transcodeBitrateKbps}" placeholder="6000" oninput="updateTranscodeSummary()" /><span>кбит/с</span></div></div></div><div id="streamTranscodeSummary" class="transcode-summary"></div><small>H.264 High, 25 fps, GOP 2 секунды, AAC 192 кбит/с. Рекомендуется проверить загрузку CPU перед включением 2K/3K/4K.</small></div></div>
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
         <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
         <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div></div>
@@ -2267,6 +2283,7 @@ function openStreamForm(stream) {
     document.getElementById('modal').classList.add('stream-open');
     document.getElementById('streamCbr').checked = outputType === 'udp-cbr' || (outputType !== 'udp-vbr' && stream.cbr);
     updateBackupInputMode();
+    updateTranscodeControls();
     loadUploadedBackupFiles();
     updateOutputHints();
   };
@@ -2276,6 +2293,47 @@ function openStreamForm(stream) {
   } else {
     renderStreamForm();
   }
+}
+function updateTranscodeControls() {
+  const enabled = document.getElementById('streamTranscodeEnabled');
+  const controls = document.getElementById('streamTranscodeControls');
+  if (controls) controls.style.display = enabled && enabled.checked ? 'block' : 'none';
+  updateTranscodeBitrateMode();
+  updateTranscodeSummary();
+}
+function transcodeRecommendedBitrates() {
+  return {'3840x2160':25000,'3200x1800':18000,'2560x1440':12000,'1920x1080':6000,'1280x720':3500,'720x576':2000};
+}
+function selectedTranscodeBitrateKbps() {
+  const preset = document.getElementById('streamTranscodeBitratePreset');
+  const custom = document.getElementById('streamTranscodeBitrate');
+  if (!preset) return custom ? Number(custom.value || 6000) : 6000;
+  return preset.value === 'custom' ? Number(custom?.value || 6000) : Number(preset.value || 6000);
+}
+function updateTranscodeBitrateMode() {
+  const preset = document.getElementById('streamTranscodeBitratePreset');
+  const customRow = document.getElementById('streamTranscodeCustomBitrateRow');
+  if (customRow) customRow.classList.toggle('visible', !!preset && preset.value === 'custom');
+  updateTranscodeSummary();
+}
+function updateTranscodeSummary() {
+  const summary = document.getElementById('streamTranscodeSummary');
+  const resolution = document.getElementById('streamTranscodeResolution');
+  if (!summary || !resolution) return;
+  const videoKbps = Math.max(500, selectedTranscodeBitrateKbps());
+  const estimatedTotal = videoKbps + 192 + Math.max(150, Math.round(videoKbps * 0.04));
+  summary.innerHTML = `<strong>${resolution.options[resolution.selectedIndex]?.text || resolution.value}</strong> · видео ${videoKbps} кбит/с CBR · AAC 192 кбит/с · ориентировочный MPEG-TS ${estimatedTotal} кбит/с`;
+}
+function applyRecommendedTranscodeBitrate() {
+  const resolution = document.getElementById('streamTranscodeResolution');
+  const preset = document.getElementById('streamTranscodeBitratePreset');
+  const custom = document.getElementById('streamTranscodeBitrate');
+  if (!resolution || !preset) return;
+  const value = transcodeRecommendedBitrates()[resolution.value] || 6000;
+  const option = [...preset.options].find(item => Number(item.value) === value);
+  preset.value = option ? String(value) : 'custom';
+  if (custom) custom.value = value;
+  updateTranscodeBitrateMode();
 }
 function updateOutputHints() {
   const rows = [...document.querySelectorAll('.output-row')];
@@ -2400,6 +2458,9 @@ function saveStream(id) {
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
     cbr: selectedCbr,
     target_bitrate: Number(document.getElementById('streamBitrate').value) * 1000,
+    transcode_enabled: document.getElementById('streamTranscodeEnabled').checked,
+    transcode_resolution: document.getElementById('streamTranscodeResolution').value,
+    transcode_video_bitrate: Math.max(500, Math.min(100000, selectedTranscodeBitrateKbps())) * 1000,
     audio_pid: Number(document.getElementById('streamAudioPid').value),
     video_pid: Number(document.getElementById('streamVideoPid').value),
     service_id: Number(document.getElementById('streamServiceId').value),
