@@ -404,6 +404,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/system-metrics") {
               res.set(http::field::content_type, "application/json");
               res.body() = systemMetrics();
+            } else if (target == "/api/backup-files") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = listBackupFiles();
             } else if (target == "/api/state") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = currentState();
@@ -445,6 +448,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target.rfind("/api/upload-backup-file", 0) == 0) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleUploadBackupFile(target, req.body());
+            } else if (target == "/api/delete-backup-file") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleDeleteBackupFile(req.body());
             } else if (target == "/api/reset-subscriber") {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
@@ -1040,6 +1046,57 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     }
 }
 
+std::string HttpServer::listBackupFiles() {
+    Json::Value root;
+    Json::Value files(Json::arrayValue);
+    const auto directory = std::filesystem::current_path() / "backup-files";
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec) {
+        root["error"] = "failed to create backup-files directory";
+    } else {
+        struct BackupFileEntry {
+            std::filesystem::path path;
+            std::filesystem::file_time_type modified;
+            uintmax_t size = 0;
+        };
+        std::vector<BackupFileEntry> entries;
+        for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec) || ec) {
+                ec.clear();
+                continue;
+            }
+            BackupFileEntry item;
+            item.path = entry.path();
+            item.modified = entry.last_write_time(ec);
+            if (ec) {
+                ec.clear();
+                item.modified = std::filesystem::file_time_type::min();
+            }
+            item.size = entry.file_size(ec);
+            if (ec) {
+                ec.clear();
+                item.size = 0;
+            }
+            entries.push_back(std::move(item));
+        }
+        std::sort(entries.begin(), entries.end(), [](const BackupFileEntry& left, const BackupFileEntry& right) {
+            return left.modified > right.modified;
+        });
+        for (const auto& entry : entries) {
+            Json::Value item;
+            item["name"] = entry.path.filename().string();
+            item["path"] = entry.path.string();
+            item["size"] = Json::UInt64(entry.size);
+            files.append(item);
+        }
+    }
+    root["files"] = files;
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, root);
+}
+
 std::string HttpServer::handleUploadBackupFile(const std::string& target, const std::string& body) {
     Json::Value root;
     if (body.empty()) {
@@ -1071,6 +1128,38 @@ std::string HttpServer::handleUploadBackupFile(const std::string& target, const 
 
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, root);
+}
+
+std::string HttpServer::handleDeleteBackupFile(const std::string& body) {
+    Json::Value response;
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value request;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["error"] = "invalid request";
+    } else {
+        const std::string requestedName = request.get("name", "").asString();
+        const std::string safeName = cleanFileName(requestedName);
+        if (requestedName.empty() || safeName != requestedName) {
+            response["error"] = "invalid filename";
+        } else {
+            const auto directory = std::filesystem::current_path() / "backup-files";
+            const auto filePath = directory / safeName;
+            std::error_code ec;
+            if (!std::filesystem::exists(filePath, ec) || ec || !std::filesystem::is_regular_file(filePath, ec)) {
+                response["error"] = "file not found";
+            } else if (!std::filesystem::remove(filePath, ec) || ec) {
+                response["error"] = "failed to delete file";
+            } else {
+                response["result"] = "ok";
+                response["name"] = safeName;
+                response["path"] = filePath.string();
+            }
+        }
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
 void HttpServer::handleStartStream(const std::string& body) {
@@ -1346,6 +1435,16 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .backup-file-row{grid-column:1/-1;display:flex;align-items:center;gap:10px;min-height:32px}
 .backup-file-row input{padding:0;background:transparent;border:0;color:#cfd8ea}
 .backup-file-row span{color:#7dd1ff;font-size:.78rem;overflow-wrap:anywhere}
+.backup-library{grid-column:1/-1;position:relative;width:100%}
+.backup-library-button{width:100%;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:#121825;color:#e7edf8;text-align:left;cursor:pointer}
+.backup-library-menu{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:10020;max-height:230px;overflow:auto;padding:5px;background:#121825;border:1px solid rgba(255,255,255,.14);border-radius:9px;box-shadow:0 16px 34px rgba(0,0,0,.4)}
+.backup-library.open .backup-library-menu{display:block}
+.backup-library-item{display:grid;grid-template-columns:minmax(0,1fr) 26px;gap:6px;align-items:center;padding:3px}
+.backup-library-select{min-width:0;padding:7px 8px;border:0;border-radius:6px;background:transparent;color:#e7edf8;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.backup-library-select:hover{background:rgba(255,255,255,.08)}
+.backup-library-delete{width:26px;height:26px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:15px;line-height:26px;cursor:pointer}
+.backup-library-delete:hover{background:#f0444d}
+.backup-library-empty{padding:9px;color:#9aa3b1;font-size:.78rem}
 @media (max-width:760px){.input-main-row{grid-template-columns:1fr}.backup-source{grid-template-columns:1fr}.backup-file-row{flex-direction:column;align-items:flex-start}}
 .form-row-inline small-field input{width:calc(100% - 8px)}
 .form-row .checkbox-inline{display:flex;align-items:center;gap:10px;margin-top:8px}
@@ -1982,10 +2081,94 @@ function collectOutputRows() {
     };
   });
 }
+function formatBackupFileSize(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+function toggleBackupFileLibrary() {
+  document.getElementById('streamBackupLibrary')?.classList.toggle('open');
+}
+function selectUploadedBackupFile(path, name) {
+  const backupInput = document.getElementById('streamBackupInput');
+  const typeSelect = document.getElementById('streamBackupInputType');
+  const status = document.getElementById('streamBackupUploadStatus');
+  if (typeSelect) typeSelect.value = 'file';
+  if (backupInput) backupInput.value = path || '';
+  if (status) status.textContent = name ? `Выбран файл: ${name}` : '';
+  document.getElementById('streamBackupLibrary')?.classList.remove('open');
+  updateBackupInputMode();
+}
+function loadUploadedBackupFiles() {
+  const menu = document.getElementById('streamBackupLibraryMenu');
+  const button = document.getElementById('streamBackupLibraryButton');
+  if (!menu) return;
+  menu.textContent = '';
+  const loading = document.createElement('div');
+  loading.className = 'backup-library-empty';
+  loading.textContent = 'Загрузка списка...';
+  menu.appendChild(loading);
+  fetch('/api/backup-files').then(r=>r.json()).then(result=>{
+    menu.textContent = '';
+    const files = Array.isArray(result.files) ? result.files : [];
+    if (!files.length) {
+      const empty = document.createElement('div');
+      empty.className = 'backup-library-empty';
+      empty.textContent = result.error || 'Загруженных файлов нет';
+      menu.appendChild(empty);
+      if (button) button.textContent = 'Выбрать ранее загруженный файл';
+      return;
+    }
+    files.forEach(file=>{
+      const row = document.createElement('div');
+      row.className = 'backup-library-item';
+      const select = document.createElement('button');
+      select.type = 'button';
+      select.className = 'backup-library-select';
+      select.textContent = `${file.name} (${formatBackupFileSize(file.size)})`;
+      select.title = file.path || file.name;
+      select.onclick = ()=>selectUploadedBackupFile(file.path, file.name);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'backup-library-delete';
+      remove.textContent = '×';
+      remove.title = `Удалить ${file.name}`;
+      remove.onclick = event=>{event.stopPropagation(); deleteUploadedBackupFile(file);};
+      row.append(select, remove);
+      menu.appendChild(row);
+    });
+  }).catch(()=>{
+    menu.textContent = '';
+    const error = document.createElement('div');
+    error.className = 'backup-library-empty';
+    error.textContent = 'Не удалось загрузить список файлов';
+    menu.appendChild(error);
+  });
+}
+function deleteUploadedBackupFile(file) {
+  if (!file?.name || !confirm(`Удалить файл «${file.name}»?`)) return;
+  fetch('/api/delete-backup-file', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:file.name})
+  }).then(r=>r.json()).then(result=>{
+    if (result.result !== 'ok') throw new Error(result.error || 'Не удалось удалить файл');
+    const backupInput = document.getElementById('streamBackupInput');
+    const status = document.getElementById('streamBackupUploadStatus');
+    if (backupInput && (backupInput.value === file.path || backupInput.value.endsWith('/' + file.name) || backupInput.value.endsWith('\\\\' + file.name))) {
+      backupInput.value = '';
+      if (status) status.textContent = 'Выбранный файл удалён';
+    }
+    loadUploadedBackupFiles();
+  }).catch(error=>alert(error.message || 'Ошибка удаления файла'));
+}
 function updateBackupInputMode() {
   const type = document.getElementById('streamBackupInputType')?.value || 'url';
   const pathInput = document.getElementById('streamBackupInput');
   const fileRow = document.getElementById('streamBackupFileRow');
+  const library = document.getElementById('streamBackupLibrary');
   const loopRow = document.getElementById('streamBackupFileLoopRow');
   if (pathInput) {
     pathInput.placeholder = type === 'file'
@@ -1993,6 +2176,7 @@ function updateBackupInputMode() {
       : 'http://192.168.1.2/...';
   }
   if (fileRow) fileRow.style.display = type === 'file' ? '' : 'none';
+  if (library) library.style.display = type === 'file' ? '' : 'none';
   if (loopRow) loopRow.style.display = type === 'file' ? '' : 'none';
 }
 function uploadBackupReplacementFile(streamId, input) {
@@ -2012,6 +2196,7 @@ function uploadBackupReplacementFile(streamId, input) {
     if (result.path) {
       backupInput.value = result.path;
       if (status) status.textContent = `Файл загружен: ${result.filename || file.name}`;
+      loadUploadedBackupFiles();
     } else {
       if (status) status.textContent = result.error || 'Не удалось загрузить файл';
     }
@@ -2034,7 +2219,7 @@ function openStreamForm(stream) {
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
-        <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
+        <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${outputOptions}</select></div>
@@ -2055,6 +2240,7 @@ function openStreamForm(stream) {
     document.getElementById('modalContent').classList.add('stream-modal');
     document.getElementById('streamCbr').checked = outputType === 'udp-cbr' || (outputType !== 'udp-vbr' && stream.cbr);
     updateBackupInputMode();
+    loadUploadedBackupFiles();
     updateOutputHints();
   };
 

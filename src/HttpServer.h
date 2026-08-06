@@ -56,7 +56,9 @@ private:
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
     bool serveHlsFile(const tcp::socket& socket, const std::string& target, http::response<http::string_body>& res);
     void handleSaveConfig(const std::string& body);
+    std::string listBackupFiles();
     std::string handleUploadBackupFile(const std::string& target, const std::string& body);
+    std::string handleDeleteBackupFile(const std::string& body);
     void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
     void handleRestartProgram();
