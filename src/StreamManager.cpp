@@ -383,8 +383,13 @@ std::size_t findTsAlignment(const guint8* data, std::size_t size) {
     return std::string::npos;
 }
 
-uint64_t countContinuityErrors(StreamState* state, const guint8* data, std::size_t size) {
-    if (!state || !data || size < kTsPacketSize) {
+uint64_t countContinuityErrors(
+    const guint8* data,
+    std::size_t size,
+    std::array<uint8_t, 8192>& continuity,
+    std::array<bool, 8192>& continuityValid,
+    std::mutex& continuityMutex) {
+    if (!data || size < kTsPacketSize) {
         return 0;
     }
 
@@ -394,7 +399,7 @@ uint64_t countContinuityErrors(StreamState* state, const guint8* data, std::size
     }
 
     uint64_t errors = 0;
-    std::lock_guard<std::mutex> lock(state->inputContinuityMutex);
+    std::lock_guard<std::mutex> lock(continuityMutex);
     for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
         const guint8* packet = data + offset;
         if (packet[0] != 0x47) {
@@ -420,43 +425,50 @@ uint64_t countContinuityErrors(StreamState* state, const guint8* data, std::size
             continue;
         }
 
-        const guint8 continuity = static_cast<guint8>(packet[3] & 0x0f);
-        if (state->inputContinuityValid[pid]) {
-            const guint8 expected = static_cast<guint8>((state->inputContinuity[pid] + 1) & 0x0f);
-            if (continuity != expected) {
+        const guint8 continuityCounter = static_cast<guint8>(packet[3] & 0x0f);
+        if (continuityValid[pid]) {
+            const guint8 expected = static_cast<guint8>((continuity[pid] + 1) & 0x0f);
+            if (continuityCounter != expected) {
                 ++errors;
             }
         }
-        state->inputContinuity[pid] = continuity;
-        state->inputContinuityValid[pid] = true;
+        continuity[pid] = continuityCounter;
+        continuityValid[pid] = true;
     }
     return errors;
 }
 
-void updateContinuityErrors(StreamState* state, GstBuffer* buffer) {
-    if (!state || !buffer) {
-        return;
-    }
-
+void updateInputContinuityErrors(StreamState* state, GstBuffer* buffer) {
+    if (!state || !buffer) return;
     GstMapInfo map {};
-    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-        return;
-    }
-    const uint64_t errors = countContinuityErrors(state, map.data, map.size);
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
+    const uint64_t errors = countContinuityErrors(
+        map.data, map.size, state->inputContinuity, state->inputContinuityValid, state->inputContinuityMutex);
     gst_buffer_unmap(buffer, &map);
-    if (errors > 0) {
-        state->ccErrors.fetch_add(errors, std::memory_order_relaxed);
+    if (errors > 0) state->inputCcErrors.fetch_add(errors, std::memory_order_relaxed);
+}
+
+void updateOutputContinuityErrors(StreamState* state, GstBuffer* buffer) {
+    if (!state || !buffer) return;
+    GstMapInfo map {};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
+    const uint64_t errors = countContinuityErrors(
+        map.data, map.size, state->outputContinuity, state->outputContinuityValid, state->outputContinuityMutex);
+    gst_buffer_unmap(buffer, &map);
+    if (errors > 0) state->outputCcErrors.fetch_add(errors, std::memory_order_relaxed);
+}
+
+void updateInputContinuityErrors(StreamState* state, GstBufferList* list) {
+    if (!state || !list) return;
+    for (guint i = 0; i < gst_buffer_list_length(list); ++i) {
+        updateInputContinuityErrors(state, gst_buffer_list_get(list, i));
     }
 }
 
-void updateContinuityErrors(StreamState* state, GstBufferList* list) {
-    if (!state || !list) {
-        return;
-    }
-
-    const guint length = gst_buffer_list_length(list);
-    for (guint i = 0; i < length; ++i) {
-        updateContinuityErrors(state, gst_buffer_list_get(list, i));
+void updateOutputContinuityErrors(StreamState* state, GstBufferList* list) {
+    if (!state || !list) return;
+    for (guint i = 0; i < gst_buffer_list_length(list); ++i) {
+        updateOutputContinuityErrors(state, gst_buffer_list_get(list, i));
     }
 }
 
@@ -1627,17 +1639,24 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
     state->inputBytes = 0;
     state->outputBytes = 0;
-    state->ccErrors = 0;
-    state->ccErrorsDelta = 0;
+    state->inputCcErrors = 0;
+    state->inputCcErrorsDelta = 0;
+    state->outputCcErrors = 0;
+    state->outputCcErrorsDelta = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
-    state->lastCcErrorsSample = 0;
+    state->lastInputCcErrorsSample = 0;
+    state->lastOutputCcErrorsSample = 0;
     state->lastInputBytesSeen = 0;
     {
         std::lock_guard<std::mutex> lock(state->inputContinuityMutex);
         state->inputContinuityValid.fill(false);
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->outputContinuityMutex);
+        state->outputContinuityValid.fill(false);
     }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
@@ -2715,19 +2734,23 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
 
     uint64_t currentInputBytes = state->inputBytes.load();
     uint64_t currentOutputBytes = state->outputBytes.load();
-    uint64_t currentCcErrors = state->ccErrors.load();
+    uint64_t currentInputCcErrors = state->inputCcErrors.load();
+    uint64_t currentOutputCcErrors = state->outputCcErrors.load();
     uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
     uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
-    uint64_t ccDelta = currentCcErrors - state->lastCcErrorsSample;
+    uint64_t inputCcDelta = currentInputCcErrors - state->lastInputCcErrorsSample;
+    uint64_t outputCcDelta = currentOutputCcErrors - state->lastOutputCcErrorsSample;
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
     state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
-    state->ccErrorsDelta = ccDelta;
+    state->inputCcErrorsDelta = inputCcDelta;
+    state->outputCcErrorsDelta = outputCcDelta;
 
     state->lastInputBytesSample = currentInputBytes;
     state->lastOutputBytesSample = currentOutputBytes;
-    state->lastCcErrorsSample = currentCcErrors;
+    state->lastInputCcErrorsSample = currentInputCcErrors;
+    state->lastOutputCcErrorsSample = currentOutputCcErrors;
     state->lastBitrateSample = now;
 }
 GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
@@ -2741,12 +2764,12 @@ GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* inf
         GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
         if (buffer) {
             state->inputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
-            updateContinuityErrors(state, buffer);
+            updateInputContinuityErrors(state, buffer);
         }
     } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
         GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
         state->inputBytes.fetch_add(bufferListSize(list), std::memory_order_relaxed);
-        updateContinuityErrors(state, list);
+        updateInputContinuityErrors(state, list);
     }
 
     return GST_PAD_PROBE_OK;
@@ -2763,11 +2786,12 @@ GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* in
         GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
         if (buffer) {
             state->outputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
+            updateOutputContinuityErrors(state, buffer);
         }
     } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
-        state->outputBytes.fetch_add(
-            bufferListSize(gst_pad_probe_info_get_buffer_list(info)),
-            std::memory_order_relaxed);
+        GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
+        state->outputBytes.fetch_add(bufferListSize(list), std::memory_order_relaxed);
+        updateOutputContinuityErrors(state, list);
     }
 
     return GST_PAD_PROBE_OK;
@@ -2911,33 +2935,27 @@ void StreamManager::monitorBus(const std::string& id) {
                     state->config.backupFileLoop &&
                     isBackupFileInput(state->config, state->activeInputUri) &&
                     state->pipeline) {
-                    // Move the complete pipeline out of EOS before seeking. This is more
-                    // reliable for demuxed MP4 files than seeking while still in PLAYING/EOS.
-                    gst_element_set_state(state->pipeline, GST_STATE_PAUSED);
-                    const gboolean looped = gst_element_seek(
-                        state->pipeline,
-                        1.0,
-                        GST_FORMAT_TIME,
-                        static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-                        GST_SEEK_TYPE_SET,
-                        0,
-                        GST_SEEK_TYPE_NONE,
-                        GST_CLOCK_TIME_NONE);
-                    if (looped && gst_element_set_state(state->pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE) {
+                    // Recreate the file pipeline after EOS instead of seeking the completed
+                    // pipeline. Demuxers such as qtdemux may accept a seek after EOS but stay
+                    // drained, which leaves the output running with a black frame.
+                    const std::string loopFile = state->activeInputUri;
+                    gst_message_unref(msg);
+                    if (restartPipelineWithInput(state, loopFile, true)) {
+                        bus = state->bus;
                         state->statusMessage = "running on backup file loop";
                         state->active = true;
-                        state->inputBytes = 0;
-                        state->outputBytes = 0;
-                        state->lastInputBytesSample = 0;
-                        state->lastOutputBytesSample = 0;
-                        state->lastInputBytesSeen = 0;
-                        state->lastInputActivity = std::chrono::steady_clock::now();
-                        state->lastBitrateSample = state->lastInputActivity;
-                        gst_message_unref(msg);
                         continue;
                     }
-                    std::cerr << "Failed to loop backup file for stream: " << id << std::endl;
-                    gst_element_set_state(state->pipeline, GST_STATE_PLAYING);
+                    std::cerr << "Failed to restart backup file loop for stream: " << id << std::endl;
+                    state->statusMessage = "error: backup file loop restart failed";
+                    state->active = false;
+                    notifyStreamState(
+                        state->config,
+                        "🔴",
+                        telegramText(configManager, "Ошибка повтора файла подмены", "Replacement file loop failed"),
+                        telegramText(configManager, "Не удалось запустить файл подмены с начала", "Failed to restart the replacement file from the beginning") +
+                            "\nFile: " + loopFile);
+                    return;
                 }
                 state->statusMessage = "ended";
                 state->active = false;
