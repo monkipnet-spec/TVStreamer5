@@ -1510,6 +1510,83 @@ void StreamManager::notifyStreamState(
     telegramNotifier.sendMessage(message.str());
 }
 
+bool StreamManager::probeInputAvailable(
+    const StreamConfig& baseConfig,
+    const std::string& inputUri,
+    std::chrono::milliseconds timeout) {
+    if (inputUri.empty()) {
+        return false;
+    }
+
+    StreamState probeState;
+    probeState.config = baseConfig;
+    probeState.config.inputUri = inputUri;
+    probeState.config.testPattern = false;
+    probeState.sourceContext = std::make_unique<RemapContext>();
+    probeState.sourceContext->config = probeState.config;
+
+    GstElement* pipeline = gst_pipeline_new(nullptr);
+    if (!pipeline) {
+        return false;
+    }
+
+    GstElement* sourceTail = nullptr;
+    GstElement* source = createSourceChain(&probeState, pipeline, sourceTail);
+    GstElement* sink = gst_element_factory_make("fakesink", nullptr);
+    if (!source || !sourceTail || !sink ||
+        !addElementOrFail(pipeline, sink) ||
+        !gst_element_link(sourceTail, sink)) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        return false;
+    }
+
+    g_object_set(sink, "sync", FALSE, "async", FALSE, nullptr);
+    std::atomic<bool> receivedData{false};
+    GstPad* probePad = gst_element_get_static_pad(sourceTail, "src");
+    if (probePad) {
+        gst_pad_add_probe(
+            probePad,
+            static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+            [](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
+                static_cast<std::atomic<bool>*>(userData)->store(true, std::memory_order_relaxed);
+                return GST_PAD_PROBE_OK;
+            },
+            &receivedData,
+            nullptr);
+        gst_object_unref(probePad);
+    }
+
+    GstBus* bus = gst_element_get_bus(pipeline);
+    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    bool available = stateResult != GST_STATE_CHANGE_FAILURE;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (available && !receivedData.load(std::memory_order_relaxed) &&
+           std::chrono::steady_clock::now() < deadline) {
+        GstMessage* message = gst_bus_timed_pop_filtered(
+            bus,
+            100 * GST_MSECOND,
+            static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+        if (!message) {
+            continue;
+        }
+        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR ||
+            GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS) {
+            available = false;
+        }
+        gst_message_unref(message);
+    }
+
+    available = available && receivedData.load(std::memory_order_relaxed);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    if (bus) {
+        gst_object_unref(bus);
+    }
+    gst_object_unref(pipeline);
+    return available;
+}
+
 bool StreamManager::restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup) {
     if (!state || inputUri.empty()) {
         return false;
@@ -2760,17 +2837,23 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
             } else if (state->usingBackup && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
                 const std::string primaryUri = state->primaryInputUri;
+                state->lastPrimaryRetry = now;
 
                 if (!primaryUri.empty()) {
-                    notifyStreamState(
-                        state->config,
-                        "🔵",
-                        telegramText(configManager, "Проверяю основной источник", "Checking primary source"),
-                        telegramText(configManager, "Временно возвращаюсь на основной URL", "Temporarily switching back to the primary URL") +
-                            "\nURL: " + primaryUri);
-                    if (restartPipelineWithInput(state, primaryUri, false)) {
-                        bus = state->bus;
-                        state->inputLossNotified = false;
+                    // Probe the primary input with an independent temporary pipeline.
+                    // The active backup-file pipeline keeps playing uninterrupted while
+                    // availability is checked. Switch only after real media data arrives.
+                    if (probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
+                        notifyStreamState(
+                            state->config,
+                            "🟢",
+                            telegramText(configManager, "Основной поток снова доступен", "Primary stream is available again"),
+                            telegramText(configManager, "Переключаюсь с файла подмены на основной источник", "Switching from the replacement file to the primary source") +
+                                "\nURL: " + primaryUri);
+                        if (restartPipelineWithInput(state, primaryUri, false)) {
+                            bus = state->bus;
+                            state->inputLossNotified = false;
+                        }
                     }
                 }
             } else if (inputTimedOut && !state->usingBackup && state->primaryRetryPending && !state->config.backupInputUri.empty()) {

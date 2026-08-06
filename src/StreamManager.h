@@ -97,6 +97,7 @@ private:
     bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
+    bool probeInputAvailable(const StreamConfig& baseConfig, const std::string& inputUri, std::chrono::milliseconds timeout);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
