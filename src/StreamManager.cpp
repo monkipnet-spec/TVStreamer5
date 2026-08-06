@@ -808,18 +808,13 @@ void updateMuxProgramMap(RemapContext* ctx) {
         return;
     }
 
-    GstStructure* programMap = gst_structure_new_empty("program_map");
-    const int serviceId = static_cast<int>(ctx->config.serviceId ? ctx->config.serviceId : 1);
-    gst_structure_set(programMap,
-        ctx->videoPadName.c_str(), G_TYPE_INT, serviceId,
-        ctx->audioPadName.c_str(), G_TYPE_INT, serviceId,
-        nullptr);
-    g_object_set(ctx->mux, "prog-map", programMap, nullptr);
-    gst_structure_free(programMap);
+    // Do not install a live prog-map here. Applying it after request pads have
+    // started receiving data can split video and audio into separate MPEG-TS
+    // programs. The default mpegtsmux mapping places all requested elementary
+    // streams in the same program, which is the desired behaviour for one channel.
     ctx->programMapApplied = true;
-    std::cerr << "remap program map applied: service=" << serviceId
-              << " video=" << ctx->videoPadName
-              << " audio=" << ctx->audioPadName << std::endl;
+    std::cerr << "remap using default single-program mapping: video="
+              << ctx->videoPadName << " audio=" << ctx->audioPadName << std::endl;
 }
 
 std::string parserForCaps(GstCaps* caps, const std::string& capsString) {
@@ -876,10 +871,10 @@ GstElement* capsFilterForMux(
     } else if (!flvMux && isVideo && capsString.find("video/x-h264") != std::string::npos) {
         capsDescription = "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au";
     } else if (!flvMux && isAudio && parserFactory == "aacparse") {
-        // MPEG-TS receivers are most interoperable with ADTS-framed AAC. Forcing
-        // ADTS also makes codec configuration self-contained in every audio frame,
-        // avoiding the brief-audio-then-silence failure after PMT/decoder refreshes.
-        capsDescription = "audio/mpeg,mpegversion=(int)4,stream-format=(string)adts";
+        // Do not force raw AAC to ADTS by changing caps. A capsfilter does not add
+        // ADTS headers and can produce an AAC PID that is detected but undecodable.
+        // Let aacparse negotiate its real output format directly with mpegtsmux.
+        capsDescription.clear();
     }
 
     if (capsDescription.empty()) {
