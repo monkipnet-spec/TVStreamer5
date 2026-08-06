@@ -60,7 +60,8 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();
     config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();
     config.transcodeAudioCodec = root.get("transcode_audio_codec", "aac").asString();
-    if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3") {
+    if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3" &&
+        config.transcodeAudioCodec != "copy") {
         config.transcodeAudioCodec = "aac";
     }
     config.transcodeAudioBitrate = root.get("transcode_audio_bitrate", Json::UInt64(192000)).asUInt64();

@@ -345,6 +345,67 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
     gst_caps_unref(caps);
 }
 
+
+bool buildAudioPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps* caps) {
+    if (!context || !context->bin || !context->mux || !pad || !caps || context->audioLinked) return false;
+
+    const GstStructure* structure = gst_caps_get_structure(caps, 0);
+    if (!structure) return false;
+    const char* mediaType = gst_structure_get_name(structure);
+    std::string parserFactory;
+
+    if (g_strcmp0(mediaType, "audio/mpeg") == 0) {
+        gint mpegVersion = 0;
+        gint layer = 0;
+        gst_structure_get_int(structure, "mpegversion", &mpegVersion);
+        gst_structure_get_int(structure, "layer", &layer);
+        if (mpegVersion == 4) parserFactory = "aacparse";
+        else if (mpegVersion == 1 && (layer == 1 || layer == 2 || layer == 3 || layer == 0)) parserFactory = "mpegaudioparse";
+    } else if (g_strcmp0(mediaType, "audio/x-ac3") == 0 ||
+               g_strcmp0(mediaType, "audio/x-eac3") == 0) {
+        parserFactory = "ac3parse";
+    }
+
+    if (parserFactory.empty()) {
+        gchar* capsText = gst_caps_to_string(caps);
+        std::cerr << "Transcoder: audio passthrough does not support caps="
+                  << (capsText ? capsText : "unknown") << std::endl;
+        g_free(capsText);
+        return false;
+    }
+
+    GstElement* queue = gst_element_factory_make("queue", nullptr);
+    GstElement* parser = gst_element_factory_make(parserFactory.c_str(), nullptr);
+    GstElement* outQueue = gst_element_factory_make("queue", nullptr);
+    if (!queue || !parser || !outQueue || !add(context->bin, queue) ||
+        !add(context->bin, parser) || !add(context->bin, outQueue) ||
+        !gst_element_link_many(queue, parser, outQueue, nullptr) ||
+        !linkElementToMux(outQueue, context->mux)) {
+        std::cerr << "Transcoder: failed to build audio passthrough branch using "
+                  << parserFactory << std::endl;
+        return false;
+    }
+
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
+        g_object_set(parser, "disable-passthrough", FALSE, nullptr);
+    }
+
+    GstPad* sinkPad = gst_element_get_static_pad(queue, "sink");
+    const bool linked = sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK;
+    if (sinkPad) gst_object_unref(sinkPad);
+    if (!linked) return false;
+
+    context->audioLinked = true;
+    gchar* capsText = gst_caps_to_string(caps);
+    std::cerr << "Transcoder: original audio passthrough linked using " << parserFactory
+              << " caps=" << (capsText ? capsText : "unknown") << std::endl;
+    g_free(capsText);
+    sync(queue);
+    sync(parser);
+    sync(outQueue);
+    return true;
+}
+
 void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
     auto* context = static_cast<TranscodeContext*>(userData);
     if (!context || !context->bin) return;
@@ -357,6 +418,16 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
                           capsText.find("audio/") != std::string::npos;
     if (!mediaPad) {
         drainPad(context->bin, pad);
+        return;
+    }
+
+    if (context->config.transcodeAudioCodec == "copy" &&
+        capsText.find("audio/") != std::string::npos) {
+        GstCaps* audioCaps = gst_pad_get_current_caps(pad);
+        if (!audioCaps) audioCaps = gst_pad_query_caps(pad, nullptr);
+        const bool linked = audioCaps && buildAudioPassthroughBranch(context, pad, audioCaps);
+        if (audioCaps) gst_caps_unref(audioCaps);
+        if (!linked) drainPad(context->bin, pad);
         return;
     }
 
@@ -432,10 +503,6 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
         result.deinterlaceAvailable = true;
         gst_object_unref(factory);
     }
-    if (result.aacEncoder.empty() && result.mp3Encoder.empty()) {
-        result.missingElements.emplace_back("audio encoder (AAC or MP3)");
-    }
-
     result.available = result.missingElements.empty();
     result.message = result.available
         ? "Software transcoding is available"
@@ -482,7 +549,8 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         return nullptr;
     }
 
-    const std::string audioCodec = config.transcodeAudioCodec == "mp3" ? "mp3" : "aac";
+    const std::string audioCodec = config.transcodeAudioCodec == "copy" ? "copy" :
+        (config.transcodeAudioCodec == "mp3" ? "mp3" : "aac");
     if ((audioCodec == "aac" && capabilities.aacEncoder.empty()) ||
         (audioCodec == "mp3" && capabilities.mp3Encoder.empty())) {
         error = audioCodec + " encoder is not available";
@@ -506,7 +574,8 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
     g_object_set(parse, "set-timestamps", TRUE, nullptr);
     g_object_set(mux,
         "alignment", 7,
-        "bitrate", static_cast<guint64>(config.transcodeVideoBitrate + config.transcodeAudioBitrate + 350000),
+        "bitrate", static_cast<guint64>(config.transcodeVideoBitrate +
+            (audioCodec == "copy" ? 384000 : config.transcodeAudioBitrate) + 350000),
         nullptr);
     g_object_set(outputParse, "set-timestamps", TRUE, nullptr);
     if (!gst_element_link_many(parse, queue, demux, nullptr) ||

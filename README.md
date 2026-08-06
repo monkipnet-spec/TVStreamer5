@@ -720,3 +720,8 @@ AAC encoder preference is now:
 3. `avenc_aac` (fallback)
 
 The MP3 path remains separate and keeps its parsed MPEG-1 Layer III caps.
+
+
+### Original audio passthrough
+
+The transcoder audio codec selector includes **Original audio passthrough** (`transcode_audio_codec: "copy"`). In this mode only the video is decoded, deinterlaced, scaled, and encoded. The first supported original audio track is remuxed without decoding or re-encoding. AAC, MPEG Layer I/II/III, AC-3, and E-AC-3 inputs are parsed and passed to the transcoder MPEG-TS mux. The audio bitrate selector is disabled because the source audio bitrate is preserved. Unsupported audio formats are logged and safely ignored rather than stopping the video pipeline.
