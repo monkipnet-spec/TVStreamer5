@@ -112,10 +112,15 @@ void configureAudioBitrate(GstElement* encoder, const std::string& factory, uint
     }
 }
 
-bool linkElementToMux(GstElement* source, GstElement* mux) {
+bool linkElementToMux(GstElement* source, GstElement* mux, uint32_t requestedPid) {
     if (!source || !mux) return false;
     GstPad* srcPad = gst_element_get_static_pad(source, "src");
-    GstPad* sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
+    GstPad* sinkPad = nullptr;
+    if (requestedPid > 0 && requestedPid < 0x1fff) {
+        const std::string padName = "sink_" + std::to_string(requestedPid);
+        sinkPad = gst_element_request_pad_simple(mux, padName.c_str());
+    }
+    if (!sinkPad) sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
     if (!srcPad || !sinkPad) {
         if (srcPad) gst_object_unref(srcPad);
         if (sinkPad) gst_object_unref(sinkPad);
@@ -209,7 +214,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             !add(context->bin, scale) || !add(context->bin, rate) || !add(context->bin, filter) ||
             !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, outQueue) ||
             !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux)) {
+            !linkElementToMux(outQueue, context->mux, context->config.videoPid)) {
             std::cerr << "Transcoder: failed to build video branch" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -282,7 +287,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             !add(context->bin, rate) || !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||
             !add(context->bin, encodedFilter) || !add(context->bin, outQueue) ||
             !gst_element_link_many(queue, convert, resample, rate, filter, encoder, parser, encodedFilter, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux)) {
+            !linkElementToMux(outQueue, context->mux, context->config.audioPid)) {
             std::cerr << "Transcoder: failed to build " << codec << " audio branch with "
                       << encoderSelection.factory << std::endl;
             gst_caps_unref(caps);
@@ -456,10 +461,10 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
     GstElement* queue = gst_element_factory_make("queue", "transcode_input_queue");
     GstElement* demux = gst_element_factory_make("tsdemux", "transcode_demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "transcode_mux");
-    GstElement* outputParse = gst_element_factory_make("tsparse", "transcode_output_tsparse");
-    if (!bin || !parse || !queue || !demux || !mux || !outputParse ||
+    GstElement* outputQueue = gst_element_factory_make("queue", "transcode_output_queue");
+    if (!bin || !parse || !queue || !demux || !mux || !outputQueue ||
         !add(bin, parse) || !add(bin, queue) || !add(bin, demux) || !add(bin, mux) ||
-        !add(bin, outputParse)) {
+        !add(bin, outputQueue)) {
         error = "failed to create transcoder bin elements";
         if (bin) gst_object_unref(bin);
         return nullptr;
@@ -470,16 +475,21 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         "alignment", 7,
         "bitrate", static_cast<guint64>(config.transcodeVideoBitrate + config.transcodeAudioBitrate + 350000),
         nullptr);
-    g_object_set(outputParse, "set-timestamps", TRUE, nullptr);
+    g_object_set(outputQueue,
+        "max-size-time", static_cast<guint64>(2 * GST_SECOND),
+        "max-size-buffers", 0u,
+        "max-size-bytes", 0u,
+        "leaky", 0,
+        nullptr);
     if (!gst_element_link_many(parse, queue, demux, nullptr) ||
-        !gst_element_link(mux, outputParse)) {
+        !gst_element_link(mux, outputQueue)) {
         error = "failed to link transcoder bin core";
         gst_object_unref(bin);
         return nullptr;
     }
 
     GstPad* parseSink = gst_element_get_static_pad(parse, "sink");
-    GstPad* outputSrc = gst_element_get_static_pad(outputParse, "src");
+    GstPad* outputSrc = gst_element_get_static_pad(outputQueue, "src");
     GstPad* ghostSink = parseSink ? gst_ghost_pad_new("sink", parseSink) : nullptr;
     GstPad* ghostSrc = outputSrc ? gst_ghost_pad_new("src", outputSrc) : nullptr;
     if (parseSink) gst_object_unref(parseSink);

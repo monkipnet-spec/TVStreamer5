@@ -692,3 +692,14 @@ The transcoder audio branch uses `audiorate` before AAC or MP3 encoding to creat
 ### Encoded audio timestamp normalization
 
 The transcoder normalizes AAC and MP3 PTS/DTS after the audio parser and before MPEG-TS muxing. This prevents encoder delay or discontinuous source timestamps from making DTS move backwards, which could otherwise cause audio to be heard briefly after restart and then disappear.
+
+
+### Single-mux transcoding output
+
+Transcoded streams use one MPEG-TS mux only. The H.264 and selected AAC/MP3
+branches are connected directly to `transcode_mux`, with the configured video
+and audio PIDs assigned on its request pads. Output remapping is bypassed for
+transcoded streams, so the generated MPEG-TS is delivered to UDP, UDP-CBR, SRT,
+HTTP, or HLS without a second `tsdemux -> mpegtsmux` pass. This prevents damaged
+H.264 NAL units, missing SPS/PPS, and audio tracks that appear briefly and then
+disappear.

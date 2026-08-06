@@ -2254,7 +2254,11 @@ bool StreamManager::buildOutputBranch(
         return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
 
-    const bool needsRemux = outputConfig.remapEnabled;
+    // The transcoder already produces a complete MPEG-TS with the configured
+    // elementary-stream PIDs. Remuxing it again corrupts H.264 access units and
+    // can make the audio PID disappear after startup. Keep remapping only for
+    // passthrough inputs.
+    const bool needsRemux = outputConfig.remapEnabled && !state->config.transcodeEnabled;
     if (needsRemux) {
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
