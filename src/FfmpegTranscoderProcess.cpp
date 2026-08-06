@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -115,6 +116,42 @@ void appendQuery(std::string& url, const std::string& option) {
     if (option.empty()) return;
     url += hasQuery(url) ? "&" : "?";
     url += option;
+}
+
+
+std::string shellQuote(const std::string& value) {
+    if (value.empty()) {
+        return "''";
+    }
+    bool safe = true;
+    for (unsigned char ch : value) {
+        if (!(std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.' || ch == '/' || ch == ':' || ch == '=' || ch == ',' || ch == '+' || ch == '?' || ch == '&' || ch == '@' || ch == '%')) {
+            safe = false;
+            break;
+        }
+    }
+    if (safe) {
+        return value;
+    }
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string commandLineForLog(const std::vector<std::string>& args) {
+    std::ostringstream ss;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i > 0) ss << ' ';
+        ss << shellQuote(args[i]);
+    }
+    return ss.str();
 }
 
 std::string inputUriForFfmpeg(const StreamConfig& cfg) {
@@ -244,8 +281,16 @@ void addEncodeArgs(std::vector<std::string>& args, const StreamConfig& cfg, bool
         "-keyint_min", "50",
         "-sc_threshold", "0",
         "-bf", "0",
+        "-profile:v", "high",
+        "-level:v", "4.0",
+        "-flags:v", "-global_header",
         "-pix_fmt", "yuv420p",
         "-x264-params", "nal-hrd=cbr:force-cfr=1:repeat-headers=1:aud=1:keyint=50:min-keyint=50:scenecut=0:bframes=0",
+        // Force SPS/PPS codec extradata to be present in the elementary
+        // stream at every key frame before it enters the MPEG-TS muxer.
+        // Some receivers and ffprobe joins were seeing H.264 slices before
+        // PPS/SPS even though x264 repeat-headers was enabled.
+        "-bsf:v", "dump_extra=freq=keyframe",
         "-vsync", "cfr"
     });
 
@@ -281,13 +326,17 @@ void addMpegTsMuxArgs(std::vector<std::string>& args, const StreamConfig& cfg, b
     args.insert(args.end(), {
         "-f", "mpegts",
         "-mpegts_service_id", std::to_string(serviceId),
-        "-mpegts_flags", "+resend_headers",
+        "-mpegts_flags", "+resend_headers+initial_discontinuity",
         "-pcr_period", "20",
         "-pat_period", "0.1",
         "-sdt_period", "0.5",
-        "-muxdelay", "0.7",
-        "-muxpreload", "0.7",
-        "-max_interleave_delta", "1000000"
+        "-flush_packets", "1",
+        // Keep the live TS muxer from buffering a PCR window ahead of DTS.
+        // v41 improved input probing but could still emit streams where
+        // receivers reported only H.264 PPS errors after a multicast join.
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+        "-max_interleave_delta", "0"
     });
     if (cfg.videoPid > 0) {
         args.insert(args.end(), {"-streamid", "0:" + std::to_string(cfg.videoPid)});
@@ -461,6 +510,7 @@ bool FfmpegTranscoderProcess::start(const StreamConfig& config, std::string& err
             }
             return false;
         }
+        std::cerr << "FFmpeg transcoder command: " << commandLineForLog(args) << std::endl;
         std::cerr << "FFmpeg transcoder started pid=" << child.pid
                   << " output=" << description << std::endl;
         started.push_back(child);

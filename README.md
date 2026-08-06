@@ -809,3 +809,8 @@ interface. TVStreamer5 now binds the multicast sender socket to the configured s
 address, retries `IP_MULTICAST_IF` using the interface index on Linux, and falls back
 to the kernel multicast route with a warning instead of stopping the output if the
 interface-specific socket option is rejected.
+
+
+### v42 — FFmpeg H.264 Annex-B output hardening
+
+The FFmpeg transcoder now prints the complete generated ffmpeg command to the service log before starting each child process. MPEG-TS outputs force H.264 codec extradata to be dumped at every key frame with `dump_extra=freq=keyframe`, keep x264 headers repeated, disable global-header-only output, and use zero mux delay/preload with immediate packet flushing. This is intended to make multicast joins self-describing when `ffprobe` or VLC join an already running UDP-CBR stream.
