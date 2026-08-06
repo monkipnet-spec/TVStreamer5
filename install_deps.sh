@@ -36,7 +36,8 @@ APT_GET=("${SUDO[@]}" apt-get)
     libssl-dev \
     git \
     wget \
-    ca-certificates
+    ca-certificates \
+    ffmpeg
 
 "${APT_GET[@]}" clean
 

@@ -2,11 +2,32 @@
 
 #include <algorithm>
 #include <iostream>
+#include <filesystem>
+#include <cstdlib>
+#include <sstream>
+#include <unistd.h>
 #include <memory>
 #include <mutex>
 
 namespace {
 
+
+
+bool executableInPath(const std::string& name, std::string* path = nullptr) {
+    const char* envPath = std::getenv("PATH");
+    std::string paths = envPath ? envPath : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    std::stringstream ss(paths);
+    std::string dir;
+    while (std::getline(ss, dir, ':')) {
+        if (dir.empty()) continue;
+        std::filesystem::path candidate = std::filesystem::path(dir) / name;
+        if (::access(candidate.c_str(), X_OK) == 0) {
+            if (path) *path = candidate.string();
+            return true;
+        }
+    }
+    return false;
+}
 
 struct TimestampNormalizer {
     std::mutex mutex;
@@ -520,6 +541,17 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 
 TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     TranscoderCapabilities result;
+    std::string ffmpegPath;
+    if (executableInPath("ffmpeg", &ffmpegPath)) {
+        result.available = true;
+        result.videoEncoder = "ffmpeg/libx264";
+        result.aacEncoder = "ffmpeg/aac";
+        result.mp3Encoder = "ffmpeg/libmp3lame";
+        result.audioEncoder = result.aacEncoder;
+        result.deinterlaceAvailable = true;
+        result.message = "FFmpeg transcoder is available: " + ffmpegPath;
+        return result;
+    }
     const char* required[] = {
         "parsebin", "decodebin", "queue", "fakesink",
         "videoconvert", "deinterlace", "videoscale", "videorate", "capsfilter",

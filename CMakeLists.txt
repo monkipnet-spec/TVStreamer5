@@ -39,6 +39,7 @@ add_executable(TVStreamer
     src/UdpOutput.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
+    src/FfmpegTranscoderProcess.cpp
     src/HttpServer.cpp
 )
 
