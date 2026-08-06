@@ -30,7 +30,10 @@ namespace {
 constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kTsPacketsPerDatagram = 7;
 constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
-constexpr std::size_t kMaxQueuedBytes = 64 * 1024 * 1024;
+constexpr std::size_t kMaxQueuedBytes = 8 * 1024 * 1024;
+constexpr std::size_t kMinStrictPendingBytes = 256 * 1024;
+constexpr std::size_t kMaxStrictPendingBytes = 2 * 1024 * 1024;
+constexpr uint64_t kStrictPendingMilliseconds = 1500ULL;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -245,6 +248,7 @@ private:
 
         while (!stopping) {
             std::vector<std::vector<guint8>> chunks;
+            const std::size_t pendingTarget = strictPendingTargetBytes();
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
                 if (!transmissionStarted) {
@@ -252,8 +256,11 @@ private:
                         return stopping || !queuedChunks.empty();
                     });
                 } else {
+                    // Wait for the next pacing deadline even when the producer queue
+                    // already contains data. Waking immediately on a non-empty queue
+                    // causes a busy loop and lets file sources run ahead of real time.
                     queueReady.wait_until(lock, nextSend, [&]() {
-                        return stopping || !queuedChunks.empty();
+                        return stopping.load(std::memory_order_relaxed);
                     });
                 }
 
@@ -261,7 +268,11 @@ private:
                     break;
                 }
 
-                while (!queuedChunks.empty()) {
+                // Move only a bounded amount into the sender-side buffer. Keeping
+                // the remaining data in queuedChunks provides backpressure to
+                // appsink, so a replacement file is read at approximately playback
+                // speed instead of reaching EOS immediately.
+                while (!queuedChunks.empty() && pending.size() < pendingTarget) {
                     queuedBytes -= queuedChunks.front().size();
                     chunks.push_back(std::move(queuedChunks.front()));
                     queuedChunks.pop_front();
@@ -285,7 +296,8 @@ private:
 
             auto now = std::chrono::steady_clock::now();
             if (now < nextSend) {
-                continue;
+                std::this_thread::sleep_until(nextSend);
+                now = std::chrono::steady_clock::now();
             }
 
             const auto nominalInterval = datagramInterval(configuredBitrate);
@@ -302,6 +314,16 @@ private:
             sendDatagramNow(datagram.data(), datagram.size());
             advanceStrictCbrSchedule(configuredBitrate);
         }
+    }
+
+    std::size_t strictPendingTargetBytes() const {
+        const uint64_t bytesForWindow = configuredBitrate > 0
+            ? configuredBitrate * kStrictPendingMilliseconds / 8000ULL
+            : kMinStrictPendingBytes;
+        return static_cast<std::size_t>(std::clamp<uint64_t>(
+            bytesForWindow,
+            kMinStrictPendingBytes,
+            kMaxStrictPendingBytes));
     }
 
     void appendPending(const guint8* data, std::size_t size) {
