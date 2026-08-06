@@ -1981,6 +1981,10 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             std::cerr << missingElementStatus("hlsdemux") << std::endl;
             return nullptr;
         }
+        if (!hasElementFactory("mpegtsmux")) {
+            std::cerr << missingElementStatus("mpegtsmux") << std::endl;
+            return nullptr;
+        }
 
         std::string location = input;
         if (inputLower.rfind("hls://", 0) == 0) {
@@ -1990,10 +1994,12 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         const std::string inputInterface = configuredInputInterfaceAddress(cfg);
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
         GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
+        GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
         GstElement* queue = addQueue("input_queue", 5000000000ULL);
-        if (!src || !demux || !queue ||
+        if (!src || !demux || !mux || !queue ||
             !addElementOrFail(pipeline, src) ||
-            !addElementOrFail(pipeline, demux)) {
+            !addElementOrFail(pipeline, demux) ||
+            !addElementOrFail(pipeline, mux)) {
             return nullptr;
         }
 
@@ -2005,12 +2011,19 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
                       << std::endl;
         }
         setIntPropertyIfPresent(demux, "connection-speed", static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1)));
+        configureTsMux(mux, cfg);
 
-        if (!gst_element_link(src, demux)) {
+        if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
             return nullptr;
         }
 
-        g_signal_connect(demux, "pad-added", G_CALLBACK(linkDemuxPadToQueue), queue);
+        if (!state->sourceContext) {
+            state->sourceContext = std::make_unique<RemapContext>();
+        }
+        state->sourceContext->mux = mux;
+        state->sourceContext->config = cfg;
+        state->sourceContext->flvMux = false;
+        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->sourceContext.get());
         terminalElement = queue;
         return src;
     }
@@ -2268,7 +2281,13 @@ bool StreamManager::buildOutputBranch(
         return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
 
-    const bool needsRemux = outputConfig.remapEnabled;
+    // A transcoded stream is already a finished single-program MPEG-TS produced by
+    // TranscoderModule. Re-demuxing and remuxing it separately for UDP/SRT/HTTP/HLS
+    // can drop the copied audio PID or split audio/video into different programs.
+    // Feed the same transcoded TS to every TS-capable protocol and only apply remap
+    // to non-transcoded passthrough streams.
+    const bool transcodedInput = state && state->config.transcodeEnabled;
+    const bool needsRemux = outputConfig.remapEnabled && !transcodedInput;
     if (needsRemux) {
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }

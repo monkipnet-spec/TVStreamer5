@@ -528,7 +528,7 @@ software encoding plugins are not installed.
 
 At startup/runtime the application checks the GStreamer element registry for:
 
-- `tsparse`, `tsdemux`, and `decodebin`
+- `parsebin`, `tsparse`, and `decodebin`
 - `videoconvert`, `videoscale`, and `videorate`
 - `x264enc` and `h264parse`
 - `audioconvert`, `audioresample`, and `aacparse`
@@ -601,12 +601,12 @@ existing input chain
         v
 +---------------------------+
 | TranscoderPipeline GstBin |
-| tsparse -> tsdemux        |
+| parsebin                  |
 |   video -> decode ->      |
 |     scale -> x264 ->      |
 |     h264parse             |
-|   audio -> decode ->      |
-|     AAC encode -> aacparse|
+|   audio -> copy parser or |
+|     decode -> AAC/MP3     |
 |          \       /        |
 |           mpegtsmux       |
 |              -> tsparse   |
@@ -730,3 +730,21 @@ The transcoder audio codec selector includes **Original audio passthrough** (`tr
 ### v32: final remux audio/program fix
 
 The final MPEG-TS remux no longer forces AAC to ADTS by caps declaration. `aacparse` now negotiates its actual output directly with `mpegtsmux`, so encoded or copied AAC frames are not mislabeled. The remux also uses the default single-program mapping from `mpegtsmux` instead of applying a live `prog-map` after pads are active. This keeps video and audio in the same MPEG-TS program and fixes players seeing a video program and a separate silent audio program.
+
+
+### v33: universal transcoder input/output routing
+
+The transcoder now uses `parsebin` at its input instead of a fixed `tsparse -> tsdemux`
+front end. This lets the same transcoder bin accept MPEG-TS produced from UDP, SRT,
+HTTP TS, HLS, RTSP, RTMP, and file inputs after the normal source chain. Encoded video
+pads are decoded for scaling and H.264 re-encoding, while the **Original audio passthrough**
+mode keeps the first supported encoded audio pad and only parses/remuxes it.
+
+When transcoding is enabled, UDP, UDP-CBR, SRT, HTTP TS, and HLS outputs all receive the
+same transcoded MPEG-TS program through the normal passthrough output branch. The legacy
+PID-remap demux/remux branch is skipped for transcoded TS outputs because it can remove the
+copied audio PID or split audio and video into separate programs. RTMP/YouTube outputs still
+use their required TS-to-FLV remux branch.
+
+HLS input is also normalized through `mpegtsmux` before it reaches the transcoder, so HLS
+video and audio pads are kept together instead of linking only the first demuxed pad.
