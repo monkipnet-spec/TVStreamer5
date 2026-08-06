@@ -2697,27 +2697,56 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
         gst_object_unref(inputQueue);
     }
 
-    GstIterator* outputIterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
-    GValue outputItem = G_VALUE_INIT;
-    while (gst_iterator_next(outputIterator, &outputItem) == GST_ITERATOR_OK) {
-        GstElement* element = GST_ELEMENT(g_value_get_object(&outputItem));
-        const gchar* name = GST_ELEMENT_NAME(element);
-        if (name && g_str_has_prefix(name, "output_queue")) {
-            GstPad* srcPad = gst_element_get_static_pad(element, "src");
-            if (srcPad) {
-                gst_pad_add_probe(
-                    srcPad,
-                    static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
-                    outputPadProbe,
-                    state,
-                    nullptr);
-                gst_object_unref(srcPad);
-                outputAttached = TRUE;
+    // For streams with multiple outputs, measure and validate the common
+    // MPEG-TS only once before output_tee. Attaching the same continuity
+    // tracker to every output_queue makes each packet appear repeatedly and
+    // produces false output CC errors and an aggregate bitrate multiplied by
+    // the number of branches.
+    GstElement* outputTee = gst_bin_get_by_name(GST_BIN(state->pipeline), "output_tee");
+    if (outputTee) {
+        GstPad* sinkPad = gst_element_get_static_pad(outputTee, "sink");
+        if (sinkPad) {
+            gst_pad_add_probe(
+                sinkPad,
+                static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                outputPadProbe,
+                state,
+                nullptr);
+            gst_object_unref(sinkPad);
+            outputAttached = TRUE;
+        }
+        gst_object_unref(outputTee);
+    }
+
+    // A single-output pipeline has no output_tee, so retain the existing
+    // output_queue probe in that case. Stop after the first queue to guarantee
+    // that one logical TS stream is counted exactly once.
+    if (!outputAttached) {
+        GstIterator* outputIterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
+        GValue outputItem = G_VALUE_INIT;
+        while (gst_iterator_next(outputIterator, &outputItem) == GST_ITERATOR_OK) {
+            GstElement* element = GST_ELEMENT(g_value_get_object(&outputItem));
+            const gchar* name = GST_ELEMENT_NAME(element);
+            if (name && g_str_has_prefix(name, "output_queue")) {
+                GstPad* srcPad = gst_element_get_static_pad(element, "src");
+                if (srcPad) {
+                    gst_pad_add_probe(
+                        srcPad,
+                        static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+                        outputPadProbe,
+                        state,
+                        nullptr);
+                    gst_object_unref(srcPad);
+                    outputAttached = TRUE;
+                }
+            }
+            g_value_unset(&outputItem);
+            if (outputAttached) {
+                break;
             }
         }
-        g_value_unset(&outputItem);
+        gst_iterator_free(outputIterator);
     }
-    gst_iterator_free(outputIterator);
 
     GstIterator* iterator = gst_bin_iterate_elements(GST_BIN(state->pipeline));
     GValue item = G_VALUE_INIT;
