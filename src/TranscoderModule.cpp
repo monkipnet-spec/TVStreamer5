@@ -12,6 +12,8 @@ struct TranscodeContext {
     StreamConfig config;
     bool videoLinked = false;
     bool audioLinked = false;
+    std::string videoMuxPadName;
+    std::string audioMuxPadName;
 };
 
 bool add(GstElement* bin, GstElement* element) {
@@ -54,16 +56,45 @@ void configureAudioBitrate(GstElement* encoder, const std::string& factory, uint
     }
 }
 
-bool linkElementToMux(GstElement* source, GstElement* mux) {
-    if (!source || !mux) return false;
+GstPad* requestMuxPad(GstElement* mux, uint32_t requestedPid) {
+    GstPad* pad = nullptr;
+    if (mux && requestedPid > 0 && requestedPid <= 0x1FFF) {
+        const std::string name = "sink_" + std::to_string(requestedPid);
+        pad = gst_element_request_pad_simple(mux, name.c_str());
+    }
+    if (!pad && mux) pad = gst_element_request_pad_simple(mux, "sink_%d");
+    return pad;
+}
+
+void updateProgramMap(TranscodeContext* context) {
+    if (!context || !context->mux) return;
+    GstStructure* map = gst_structure_new_empty("program_map");
+    const gint serviceId = static_cast<gint>(context->config.serviceId ? context->config.serviceId : 1);
+    if (!context->videoMuxPadName.empty())
+        gst_structure_set(map, context->videoMuxPadName.c_str(), G_TYPE_INT, serviceId, nullptr);
+    if (!context->audioMuxPadName.empty())
+        gst_structure_set(map, context->audioMuxPadName.c_str(), G_TYPE_INT, serviceId, nullptr);
+    g_object_set(context->mux, "prog-map", map, nullptr);
+    gst_structure_free(map);
+}
+
+bool linkElementToMux(GstElement* source, TranscodeContext* context, bool video) {
+    if (!source || !context || !context->mux) return false;
     GstPad* srcPad = gst_element_get_static_pad(source, "src");
-    GstPad* sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
+    const uint32_t pid = video ? context->config.videoPid : context->config.audioPid;
+    GstPad* sinkPad = requestMuxPad(context->mux, pid);
     if (!srcPad || !sinkPad) {
         if (srcPad) gst_object_unref(srcPad);
         if (sinkPad) gst_object_unref(sinkPad);
         return false;
     }
     const bool ok = gst_pad_link(srcPad, sinkPad) == GST_PAD_LINK_OK;
+    if (ok) {
+        const gchar* name = GST_PAD_NAME(sinkPad);
+        if (video) context->videoMuxPadName = name ? name : "";
+        else context->audioMuxPadName = name ? name : "";
+        updateProgramMap(context);
+    }
     gst_object_unref(srcPad);
     gst_object_unref(sinkPad);
     return ok;
@@ -116,8 +147,11 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         GstElement* encoder = gst_element_factory_make("x264enc", nullptr);
         GstElement* parser = gst_element_factory_make("h264parse", nullptr);
+        GstElement* encodedFilter = gst_element_factory_make("capsfilter", nullptr);
+        GstElement* timestampNormalizer = gst_element_factory_make("identity", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !deinterlace || !scale || !rate || !filter || !encoder || !parser || !outQueue) {
+        if (!queue || !convert || !deinterlace || !scale || !rate || !filter || !encoder || !parser ||
+            !encodedFilter || !timestampNormalizer || !outQueue) {
             std::cerr << "Transcoder: missing video elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -145,13 +179,22 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
         gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
         g_object_set(encoder, "option-string", "nal-hrd=cbr:force-cfr=1", nullptr);
-        g_object_set(parser, "config-interval", -1, nullptr);
+        g_object_set(parser, "config-interval", 1, nullptr);
+        GstCaps* h264Caps = gst_caps_from_string(
+            "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au");
+        g_object_set(encodedFilter, "caps", h264Caps, nullptr);
+        gst_caps_unref(h264Caps);
+        g_object_set(timestampNormalizer, "single-segment", TRUE, "sync", FALSE, nullptr);
+        g_object_set(queue, "max-size-time", static_cast<guint64>(2 * GST_SECOND),
+            "max-size-buffers", 0u, "max-size-bytes", 0u, nullptr);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, deinterlace) ||
             !add(context->bin, scale) || !add(context->bin, rate) || !add(context->bin, filter) ||
-            !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux)) {
+            !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, encodedFilter) ||
+            !add(context->bin, timestampNormalizer) || !add(context->bin, outQueue) ||
+            !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser,
+                encodedFilter, timestampNormalizer, outQueue, nullptr) ||
+            !linkElementToMux(outQueue, context, true)) {
             std::cerr << "Transcoder: failed to build video branch" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -163,19 +206,23 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             context->videoLinked = true;
         }
         if (sinkPad) gst_object_unref(sinkPad);
-        for (GstElement* e : {queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue}) sync(e);
+        for (GstElement* e : {queue, convert, deinterlace, scale, rate, filter, encoder, parser,
+                encodedFilter, timestampNormalizer, outQueue}) sync(e);
     } else if (media.rfind("audio/x-raw", 0) == 0 && !context->audioLinked) {
         const std::string codec = context->config.transcodeAudioCodec == "mp3" ? "mp3" : "aac";
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         GstElement* convert = gst_element_factory_make("audioconvert", nullptr);
         GstElement* resample = gst_element_factory_make("audioresample", nullptr);
+        GstElement* audioRate = gst_element_factory_make("audiorate", nullptr);
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         const auto encoderSelection = makeAudioEncoder(codec);
         GstElement* encoder = encoderSelection.element;
         GstElement* parser = gst_element_factory_make(codec == "mp3" ? "mpegaudioparse" : "aacparse", nullptr);
         GstElement* encodedFilter = gst_element_factory_make("capsfilter", nullptr);
+        GstElement* timestampNormalizer = gst_element_factory_make("identity", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !resample || !filter || !encoder || !parser || !encodedFilter || !outQueue) {
+        if (!queue || !convert || !resample || !audioRate || !filter || !encoder || !parser ||
+            !encodedFilter || !timestampNormalizer || !outQueue) {
             std::cerr << "Transcoder: missing " << codec << " audio elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -204,12 +251,18 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         }
         g_object_set(encodedFilter, "caps", encodedCaps, nullptr);
         gst_caps_unref(encodedCaps);
+        g_object_set(timestampNormalizer, "single-segment", TRUE, "sync", FALSE, nullptr);
+        g_object_set(audioRate, "tolerance", static_cast<guint64>(20 * GST_MSECOND), nullptr);
+        g_object_set(queue, "max-size-time", static_cast<guint64>(2 * GST_SECOND),
+            "max-size-buffers", 0u, "max-size-bytes", 0u, nullptr);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, resample) ||
-            !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||
-            !add(context->bin, encodedFilter) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, resample, filter, encoder, parser, encodedFilter, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux)) {
+            !add(context->bin, audioRate) || !add(context->bin, filter) || !add(context->bin, encoder) ||
+            !add(context->bin, parser) || !add(context->bin, encodedFilter) ||
+            !add(context->bin, timestampNormalizer) || !add(context->bin, outQueue) ||
+            !gst_element_link_many(queue, convert, resample, audioRate, filter, encoder, parser,
+                encodedFilter, timestampNormalizer, outQueue, nullptr) ||
+            !linkElementToMux(outQueue, context, false)) {
             std::cerr << "Transcoder: failed to build " << codec << " audio branch with "
                       << encoderSelection.factory << std::endl;
             gst_caps_unref(caps);
@@ -224,7 +277,8 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
                       << " at " << context->config.transcodeAudioBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
-        for (GstElement* e : {queue, convert, resample, filter, encoder, parser, encodedFilter, outQueue}) sync(e);
+        for (GstElement* e : {queue, convert, resample, audioRate, filter, encoder, parser,
+                encodedFilter, timestampNormalizer, outQueue}) sync(e);
     } else {
         // Multiple programs, subtitles, data PIDs, and duplicate audio/video tracks must
         // be consumed. Leaving a tsdemux pad unlinked can propagate GST_FLOW_NOT_LINKED
@@ -277,7 +331,7 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
         "tsparse", "tsdemux", "decodebin", "queue", "fakesink",
         "videoconvert", "deinterlace", "videoscale", "videorate", "capsfilter",
         "x264enc", "h264parse",
-        "audioconvert", "audioresample",
+        "audioconvert", "audioresample", "audiorate", "identity",
         "mpegtsmux", nullptr
     };
 
@@ -392,12 +446,17 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         return nullptr;
     }
 
-    g_object_set(parse, "set-timestamps", TRUE, nullptr);
+    // Keep decoded timestamps as the reference. Re-stamping TS before demux and after mux
+    // creates a second timeline and was the source of backward DTS and disappearing audio.
+    g_object_set(parse, "set-timestamps", FALSE, nullptr);
     g_object_set(mux,
         "alignment", 7,
         "bitrate", static_cast<guint64>(config.transcodeVideoBitrate + config.transcodeAudioBitrate + 350000),
+        "pcr-interval", 3600u,
+        "pat-interval", 9000u,
+        "pmt-interval", 9000u,
         nullptr);
-    g_object_set(outputParse, "set-timestamps", TRUE, nullptr);
+    g_object_set(outputParse, "set-timestamps", FALSE, nullptr);
     if (!gst_element_link_many(parse, queue, demux, nullptr) ||
         !gst_element_link(mux, outputParse)) {
         error = "failed to link transcoder bin core";

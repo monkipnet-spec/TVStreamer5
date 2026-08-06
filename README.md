@@ -654,3 +654,17 @@ gst-inspect-1.0 deinterlace
 gst-inspect-1.0 lamemp3enc || gst-inspect-1.0 avenc_mp3
 gst-inspect-1.0 mpegaudioparse
 ```
+
+
+### Transcoder timeline and output remuxing
+
+The transcoder produces the final MPEG-TS program itself. When transcoding is enabled,
+TVStreamer5 does not pass that transport stream through the legacy PID-remap demux/mux
+branch a second time. The transcoder mux requests the configured video and audio PIDs and
+assigns both elementary streams to the configured service ID. This avoids duplicate H.264
+parsing, backward DTS warnings, dropped NAL units, and audio tracks disappearing during a
+second remux.
+
+The encoded H.264 stream is normalized to Annex-B byte-stream access units and SPS/PPS are
+repeated every second. Video uses `videorate` and audio uses `audiorate`; both branches use
+a single running-time segment before entering `mpegtsmux`.

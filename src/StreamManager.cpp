@@ -2241,7 +2241,7 @@ bool StreamManager::buildOutputBranch(
         return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
 
-    const bool needsRemux = outputConfig.remapEnabled;
+    const bool needsRemux = outputConfig.remapEnabled && !state->config.transcodeEnabled;
     if (needsRemux) {
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
