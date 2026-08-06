@@ -1,5 +1,17 @@
 # TVStreamer5
 
+
+### v41 FFmpeg timing стабилизация
+
+Версия v41 сохраняет FFmpeg-транскодер v40, но меняет параметры запуска FFmpeg для live MPEG-TS входов:
+
+- убран низколатентный `+nobuffer`, из-за которого FFmpeg мог стартовать до получения SPS/PPS;
+- добавлены `analyzeduration` и `probesize`, чтобы входной H.264/AAC успевал определиться перед стартом кодирования;
+- включён `+discardcorrupt` и `ignore_err` для устойчивости к битым H.264 кадрам во входном live-потоке;
+- добавлен `-re`, чтобы HTTP/file inputs не заливали muxer рывками;
+- H.264 кодируется без B-frames и с AUD/repeat headers;
+- MPEG-TS mux получает `muxdelay`, `muxpreload` и ограничение interleave delta для устранения предупреждений вида `dts < pcr`.
+
 ### v40 - FFmpeg transcoder engine without GStreamer transcoding
 
 - Added `FfmpegTranscoderProcess`, a new process-based transcoder engine that runs `ffmpeg` directly instead of building the transcoding path from GStreamer `parsebin`, `decodebin`, `x264enc`, `aacparse`, and `mpegtsmux` elements.

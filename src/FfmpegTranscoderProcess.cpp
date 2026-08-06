@@ -195,9 +195,18 @@ void addCommonInputArgs(std::vector<std::string>& args, const StreamConfig& cfg)
         });
     }
     args.insert(args.end(), {
-        "-fflags", "+genpts+nobuffer",
-        "-flags", "low_delay",
-        "-thread_queue_size", "2048",
+        // Read live sources at their native cadence. This prevents ffmpeg from
+        // bursting HTTP/file replacement inputs into the MPEG-TS muxer and keeps
+        // PCR/DTS generation stable for UDP-CBR receivers.
+        "-re",
+        // Give ffmpeg enough data to see SPS/PPS and audio configuration before
+        // starting the encoder. The previous low-latency/nobuffer input setup
+        // could start from incomplete H.264 state and produce dts < pcr output.
+        "-analyzeduration", "20000000",
+        "-probesize", "20000000",
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-thread_queue_size", "4096",
         "-i", input
     });
 }
@@ -234,8 +243,9 @@ void addEncodeArgs(std::vector<std::string>& args, const StreamConfig& cfg, bool
         "-g", "50",
         "-keyint_min", "50",
         "-sc_threshold", "0",
+        "-bf", "0",
         "-pix_fmt", "yuv420p",
-        "-x264-params", "nal-hrd=cbr:force-cfr=1:repeat-headers=1",
+        "-x264-params", "nal-hrd=cbr:force-cfr=1:repeat-headers=1:aud=1:keyint=50:min-keyint=50:scenecut=0:bframes=0",
         "-vsync", "cfr"
     });
 
@@ -274,7 +284,10 @@ void addMpegTsMuxArgs(std::vector<std::string>& args, const StreamConfig& cfg, b
         "-mpegts_flags", "+resend_headers",
         "-pcr_period", "20",
         "-pat_period", "0.1",
-        "-sdt_period", "0.5"
+        "-sdt_period", "0.5",
+        "-muxdelay", "0.7",
+        "-muxpreload", "0.7",
+        "-max_interleave_delta", "1000000"
     });
     if (cfg.videoPid > 0) {
         args.insert(args.end(), {"-streamid", "0:" + std::to_string(cfg.videoPid)});
