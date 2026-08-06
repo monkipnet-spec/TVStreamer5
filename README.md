@@ -706,3 +706,17 @@ The AAC branch uses the PCM format required by the selected encoder. `avenc_aac`
 ### MP3 encoder configuration fix
 
 The MP3 transcoding path is independent from AAC. `lamemp3enc` is configured in bitrate-target mode with CBR enabled and receives its bitrate in kbit/s. The libav `avenc_mp3` fallback receives non-interleaved planar `S16P` PCM, while `lamemp3enc` receives interleaved `S16LE`; both use 48 kHz stereo input. After `mpegaudioparse`, the mux receives parsed MPEG-1 Layer III caps with the sample rate and channel count preserved.
+
+### AAC encoder negotiation fix (v30)
+
+AAC transcoding no longer forces encoded caps after `aacparse`. The parser now
+negotiates directly with `mpegtsmux`, preserving `codec_data` / AudioSpecificConfig
+instead of exposing an AAC PID with unknown sample rate or zero channels.
+
+AAC encoder preference is now:
+
+1. `fdkaacenc`
+2. `voaacenc`
+3. `avenc_aac` (fallback)
+
+The MP3 path remains separate and keeps its parsed MPEG-1 Layer III caps.

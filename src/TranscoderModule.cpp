@@ -87,7 +87,7 @@ struct AudioEncoderSelection {
 
 AudioEncoderSelection makeAudioEncoder(const std::string& codec) {
     const char* const* factories = nullptr;
-    static const char* aacFactories[] = {"avenc_aac", "fdkaacenc", "voaacenc", nullptr};
+    static const char* aacFactories[] = {"fdkaacenc", "voaacenc", "avenc_aac", nullptr};
     static const char* mp3Factories[] = {"lamemp3enc", "avenc_mp3", nullptr};
     factories = codec == "mp3" ? mp3Factories : aacFactories;
     for (const char* const* name = factories; *name; ++name) {
@@ -245,23 +245,23 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         const auto encoderSelection = makeAudioEncoder(codec);
         GstElement* encoder = encoderSelection.element;
         GstElement* parser = gst_element_factory_make(codec == "mp3" ? "mpegaudioparse" : "aacparse", nullptr);
-        GstElement* encodedFilter = gst_element_factory_make("capsfilter", nullptr);
+        // MP3 keeps an explicit caps filter. AAC must negotiate directly from aacparse
+        // to mpegtsmux so codec_data (AudioSpecificConfig) is preserved unchanged.
+        GstElement* encodedFilter = codec == "mp3" ? gst_element_factory_make("capsfilter", nullptr) : nullptr;
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !resample || !rate || !filter || !encoder || !parser || !encodedFilter || !outQueue) {
+        if (!queue || !convert || !resample || !rate || !filter || !encoder || !parser ||
+            (codec == "mp3" && !encodedFilter) || !outQueue) {
             std::cerr << "Transcoder: missing " << codec << " audio elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
             return;
         }
 
-        // Use the exact PCM format accepted by the selected encoder. In particular,
-        // avenc_aac only accepts interleaved F32LE. Letting caps negotiation choose an
-        // incompatible format can produce an AAC PID without valid channel config.
+        // Use the exact PCM format accepted by the selected encoder.
         const char* rawAudioFormat = "S16LE";
         if (encoderSelection.factory == "avenc_aac") {
             rawAudioFormat = "F32LE";
         } else if (encoderSelection.factory == "avenc_mp3") {
-            // The libav MP3 encoder uses planar signed 16-bit PCM.
             rawAudioFormat = "S16P";
         }
         const char* rawAudioLayout = encoderSelection.factory == "avenc_mp3"
@@ -282,43 +282,43 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "tolerance")) {
             g_object_set(rate, "tolerance", static_cast<guint64>(20 * GST_MSECOND), nullptr);
         }
-
-        GstCaps* encodedCaps = nullptr;
-        if (codec == "mp3") {
-            if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
-                g_object_set(parser, "disable-passthrough", TRUE, nullptr);
-            }
-            // Keep MP3 completely separate from the AAC/ADTS path. The final mux
-            // receives parsed MPEG-1 Layer III frames with explicit stereo/rate caps.
-            encodedCaps = gst_caps_from_string(
-                "audio/mpeg,mpegversion=(int)1,layer=(int)3,parsed=(boolean)true,rate=(int)48000,channels=(int)2");
-        } else {
-            if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
-                g_object_set(parser, "disable-passthrough", TRUE, nullptr);
-            }
-            // Keep the AAC stream in the native raw format produced by aacparse.
-            // This preserves codec_data (AudioSpecificConfig) negotiated from the encoder.
-            // Declaring raw AAC buffers as ADTS with a capsfilter does not add ADTS headers
-            // and produces an AAC PID that players detect as zero-channel or silent audio.
-            encodedCaps = gst_caps_from_string(
-                "audio/mpeg,mpegversion=(int)4,stream-format=(string)raw,framed=(boolean)true");
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
+            g_object_set(parser, "disable-passthrough", TRUE, nullptr);
         }
-        g_object_set(encodedFilter, "caps", encodedCaps, nullptr);
-        gst_caps_unref(encodedCaps);
 
-        // Encoder delay and discontinuous source timestamps can make AAC/MP3 DTS move
-        // backwards. mpegtsmux then accepts only the first audio frames and silently
-        // drops the rest. Normalize encoded timestamps immediately before muxing.
+        if (codec == "mp3") {
+            GstCaps* encodedCaps = gst_caps_from_string(
+                "audio/mpeg,mpegversion=(int)1,layer=(int)3,parsed=(boolean)true,rate=(int)48000,channels=(int)2");
+            g_object_set(encodedFilter, "caps", encodedCaps, nullptr);
+            gst_caps_unref(encodedCaps);
+        }
+
+        // Normalize timestamps on the last encoded element before the mux. For AAC this
+        // is aacparse itself, deliberately with no downstream capsfilter that could strip
+        // codec_data. For MP3 it remains the explicit encoded caps filter.
         const GstClockTime audioFrameDuration = codec == "mp3"
             ? gst_util_uint64_scale_int(GST_SECOND, 1152, 48000)
             : gst_util_uint64_scale_int(GST_SECOND, 1024, 48000);
-        attachTimestampNormalizer(encodedFilter, audioFrameDuration);
+        attachTimestampNormalizer(codec == "mp3" ? encodedFilter : parser, audioFrameDuration);
 
-        if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, resample) ||
-            !add(context->bin, rate) || !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||
-            !add(context->bin, encodedFilter) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, resample, rate, filter, encoder, parser, encodedFilter, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux)) {
+        bool branchBuilt = add(context->bin, queue) && add(context->bin, convert) &&
+            add(context->bin, resample) && add(context->bin, rate) && add(context->bin, filter) &&
+            add(context->bin, encoder) && add(context->bin, parser);
+        if (branchBuilt && encodedFilter) branchBuilt = add(context->bin, encodedFilter);
+        branchBuilt = branchBuilt && add(context->bin, outQueue);
+
+        bool branchLinked = false;
+        if (branchBuilt) {
+            if (encodedFilter) {
+                branchLinked = gst_element_link_many(queue, convert, resample, rate, filter,
+                    encoder, parser, encodedFilter, outQueue, nullptr);
+            } else {
+                branchLinked = gst_element_link_many(queue, convert, resample, rate, filter,
+                    encoder, parser, outQueue, nullptr);
+            }
+        }
+
+        if (!branchBuilt || !branchLinked || !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build " << codec << " audio branch with "
                       << encoderSelection.factory << std::endl;
             gst_caps_unref(caps);
@@ -331,7 +331,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             context->audioLinked = true;
             std::cerr << "Transcoder: audio linked using " << encoderSelection.factory
                       << " input=" << rawAudioFormat << "/" << rawAudioLayout << "/48000/stereo"
-                      << " output=" << (codec == "aac" ? "AAC-RAW+ASC" : "MP3")
+                      << " output=" << (codec == "aac" ? "AAC negotiated by aacparse" : "MP3")
                       << " at " << context->config.transcodeAudioBitrate << " bit/s" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
@@ -406,7 +406,7 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     GstElementFactory* aacParser = gst_element_factory_find("aacparse");
     if (aacParser) {
         gst_object_unref(aacParser);
-        for (const char* name : {"avenc_aac", "fdkaacenc", "voaacenc"}) {
+        for (const char* name : {"fdkaacenc", "voaacenc", "avenc_aac"}) {
             GstElementFactory* factory = gst_element_factory_find(name);
             if (factory) {
                 result.aacEncoder = name;
