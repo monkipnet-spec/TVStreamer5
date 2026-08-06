@@ -308,6 +308,12 @@ std::string fileLocationFromInput(const std::string& input) {
     return result;
 }
 
+bool isMpegTsFile(const std::string& input) {
+    const std::filesystem::path path(fileLocationFromInput(input));
+    const std::string extension = toLower(path.extension().string());
+    return extension == ".ts" || extension == ".mts" || extension == ".m2ts" || extension == ".mpegts";
+}
+
 std::string hlsDirectory(const StreamConfig& cfg) {
     return "/tmp/tvstreamer5-hls/" + cfg.id;
 }
@@ -1827,19 +1833,54 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
         return src;
     }
-    GstElement* src = gst_element_factory_make("filesrc", "input_src");
-    GstElement* queue = addQueue("input_queue");
-    if (!src || !queue || !addElementOrFail(pipeline, src)) {
-        return nullptr;
-    }
-
     const std::string location = fileLocationFromInput(input);
+    GstElement* src = gst_element_factory_make("filesrc", "input_src");
+    if (!src || !addElementOrFail(pipeline, src)) {
+        return nullptr;
+    }
     g_object_set(src, "location", location.c_str(), nullptr);
-    if (!gst_element_link(src, queue)) {
+
+    // MPEG-TS replacement files can be passed directly to the existing TS output chain.
+    if (isMpegTsFile(input)) {
+        GstElement* queue = addQueue("input_queue");
+        if (!queue || !gst_element_link(src, queue)) {
+            return nullptr;
+        }
+        terminalElement = queue;
+        return src;
+    }
+
+    // Container files such as MP4/MOV must be demuxed and remuxed to MPEG-TS first.
+    if (!hasElementFactory("qtdemux") || !hasElementFactory("mpegtsmux")) {
+        std::cerr << "missing MP4 replacement file elements: qtdemux or mpegtsmux" << std::endl;
         return nullptr;
     }
 
-    terminalElement = queue;
+    GstElement* demux = gst_element_factory_make("qtdemux", "input_file_demux");
+    GstElement* mux = gst_element_factory_make("mpegtsmux", "input_file_ts_mux");
+    GstElement* outputQueue = gst_element_factory_make("queue", "input_queue");
+    if (!demux || !mux || !outputQueue ||
+        !addElementOrFail(pipeline, demux) ||
+        !addElementOrFail(pipeline, mux) ||
+        !addElementOrFail(pipeline, outputQueue)) {
+        return nullptr;
+    }
+
+    configureQueue(outputQueue, 5000000000ULL);
+    configureTsMux(mux, cfg);
+    if (!gst_element_link(src, demux) || !gst_element_link(mux, outputQueue)) {
+        return nullptr;
+    }
+
+    if (!state->sourceContext) {
+        state->sourceContext = std::make_unique<RemapContext>();
+    }
+    state->sourceContext->mux = mux;
+    state->sourceContext->config = cfg;
+    state->sourceContext->flvMux = false;
+    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->sourceContext.get());
+
+    terminalElement = outputQueue;
     return src;
 }
 
@@ -2787,18 +2828,33 @@ void StreamManager::monitorBus(const std::string& id) {
                     state->config.backupFileLoop &&
                     isBackupFileInput(state->config, state->activeInputUri) &&
                     state->pipeline) {
-                    const gboolean looped = gst_element_seek_simple(
+                    // Move the complete pipeline out of EOS before seeking. This is more
+                    // reliable for demuxed MP4 files than seeking while still in PLAYING/EOS.
+                    gst_element_set_state(state->pipeline, GST_STATE_PAUSED);
+                    const gboolean looped = gst_element_seek(
                         state->pipeline,
+                        1.0,
                         GST_FORMAT_TIME,
                         static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-                        0);
-                    if (looped) {
+                        GST_SEEK_TYPE_SET,
+                        0,
+                        GST_SEEK_TYPE_NONE,
+                        GST_CLOCK_TIME_NONE);
+                    if (looped && gst_element_set_state(state->pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE) {
                         state->statusMessage = "running on backup file loop";
+                        state->active = true;
+                        state->inputBytes = 0;
+                        state->outputBytes = 0;
+                        state->lastInputBytesSample = 0;
+                        state->lastOutputBytesSample = 0;
+                        state->lastInputBytesSeen = 0;
                         state->lastInputActivity = std::chrono::steady_clock::now();
+                        state->lastBitrateSample = state->lastInputActivity;
                         gst_message_unref(msg);
                         continue;
                     }
                     std::cerr << "Failed to loop backup file for stream: " << id << std::endl;
+                    gst_element_set_state(state->pipeline, GST_STATE_PLAYING);
                 }
                 state->statusMessage = "ended";
                 state->active = false;
