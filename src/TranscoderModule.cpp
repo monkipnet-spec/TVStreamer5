@@ -3,8 +3,66 @@
 #include <algorithm>
 #include <iostream>
 #include <memory>
+#include <mutex>
 
 namespace {
+
+
+struct TimestampNormalizer {
+    std::mutex mutex;
+    GstClockTime lastPts = GST_CLOCK_TIME_NONE;
+    GstClockTime lastDts = GST_CLOCK_TIME_NONE;
+    GstClockTime fallbackDuration = 20 * GST_MSECOND;
+};
+
+GstPadProbeReturn normalizeEncodedTimestamps(GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+    auto* state = static_cast<TimestampNormalizer*>(userData);
+    GstBuffer* input = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!state || !input) return GST_PAD_PROBE_OK;
+
+    GstBuffer* buffer = gst_buffer_make_writable(input);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    GST_PAD_PROBE_INFO_DATA(info) = buffer;
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+    GstClockTime duration = GST_BUFFER_DURATION(buffer);
+    if (!GST_CLOCK_TIME_IS_VALID(duration) || duration == 0) duration = state->fallbackDuration;
+
+    GstClockTime pts = GST_BUFFER_PTS(buffer);
+    GstClockTime dts = GST_BUFFER_DTS(buffer);
+
+    if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+        pts = GST_CLOCK_TIME_IS_VALID(state->lastPts) ? state->lastPts + duration : 0;
+    } else if (GST_CLOCK_TIME_IS_VALID(state->lastPts) && pts <= state->lastPts) {
+        pts = state->lastPts + duration;
+    }
+
+    if (!GST_CLOCK_TIME_IS_VALID(dts)) {
+        dts = GST_CLOCK_TIME_IS_VALID(state->lastDts) ? state->lastDts + duration : pts;
+    } else if (GST_CLOCK_TIME_IS_VALID(state->lastDts) && dts <= state->lastDts) {
+        dts = state->lastDts + duration;
+    }
+
+    if (dts > pts) pts = dts;
+    GST_BUFFER_PTS(buffer) = pts;
+    GST_BUFFER_DTS(buffer) = dts;
+    GST_BUFFER_DURATION(buffer) = duration;
+    state->lastPts = pts;
+    state->lastDts = dts;
+    return GST_PAD_PROBE_OK;
+}
+
+void attachTimestampNormalizer(GstElement* element, GstClockTime fallbackDuration) {
+    if (!element) return;
+    GstPad* srcPad = gst_element_get_static_pad(element, "src");
+    if (!srcPad) return;
+    auto* state = new TimestampNormalizer();
+    state->fallbackDuration = fallbackDuration;
+    gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER, normalizeEncodedTimestamps, state,
+        [](gpointer data) { delete static_cast<TimestampNormalizer*>(data); });
+    gst_object_unref(srcPad);
+}
 
 struct TranscodeContext {
     GstElement* bin = nullptr;
@@ -211,6 +269,14 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         }
         g_object_set(encodedFilter, "caps", encodedCaps, nullptr);
         gst_caps_unref(encodedCaps);
+
+        // Encoder delay and discontinuous source timestamps can make AAC/MP3 DTS move
+        // backwards. mpegtsmux then accepts only the first audio frames and silently
+        // drops the rest. Normalize encoded timestamps immediately before muxing.
+        const GstClockTime audioFrameDuration = codec == "mp3"
+            ? gst_util_uint64_scale_int(GST_SECOND, 1152, 48000)
+            : gst_util_uint64_scale_int(GST_SECOND, 1024, 48000);
+        attachTimestampNormalizer(encodedFilter, audioFrameDuration);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, resample) ||
             !add(context->bin, rate) || !add(context->bin, filter) || !add(context->bin, encoder) || !add(context->bin, parser) ||

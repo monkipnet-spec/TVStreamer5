@@ -687,3 +687,8 @@ configurable audio bitrate, and progressive deinterlaced video output.
 ### Audio timestamp and remux compatibility
 
 The transcoder audio branch uses `audiorate` before AAC or MP3 encoding to create a continuous, monotonic 48 kHz timeline. The output remuxer reads the `audio/mpeg` caps fields directly instead of relying on one textual caps representation, so both AAC (`mpegversion=4`) and MP3 (`mpegversion=1`, layer 3) are preserved in the final MPEG-TS program. H.264 SPS/PPS are repeated every second for reliable mid-stream client joins.
+
+
+### Encoded audio timestamp normalization
+
+The transcoder normalizes AAC and MP3 PTS/DTS after the audio parser and before MPEG-TS muxing. This prevents encoder delay or discontinuous source timestamps from making DTS move backwards, which could otherwise cause audio to be heard briefly after restart and then disappear.
