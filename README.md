@@ -748,3 +748,15 @@ use their required TS-to-FLV remux branch.
 
 HLS input is also normalized through `mpegtsmux` before it reaches the transcoder, so HLS
 video and audio pads are kept together instead of linking only the first demuxed pad.
+
+### v34: H.264/TS stabilisation for transcoder output
+
+The transcoder now forces the encoded H.264 output to `stream-format=byte-stream` and
+`alignment=au` before it reaches `mpegtsmux`. `x264enc` is configured for live output with
+B-frames disabled and repeated headers enabled, while `h264parse` inserts SPS/PPS on every
+IDR frame. This fixes multicast receivers joining an already running transcoded stream and
+seeing H.264 slices before SPS/PPS.
+
+The transcoder mux also publishes PAT, PMT, SDT/SI and PCR at short intervals and requests
+the configured video/audio PIDs on its own mux sink pads. This keeps the generated MPEG-TS
+self-describing for UDP-CBR, UDP, SRT, HTTP TS, HLS and RTMP/YouTube remux outputs.
