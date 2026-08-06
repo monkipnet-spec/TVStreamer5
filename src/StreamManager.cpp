@@ -2801,7 +2801,10 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
-    state->outputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
+    const uint64_t measuredOutputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
+    state->outputBitrate = udpCbrOutputEnabled(state->config) && state->config.targetBitrate > 0
+        ? state->config.targetBitrate
+        : measuredOutputBitrate;
     state->inputCcErrorsDelta = inputCcDelta;
     state->outputCcErrorsDelta = outputCcDelta;
 

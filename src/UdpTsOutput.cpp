@@ -3,6 +3,7 @@
 #include <gst/app/gstappsink.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -204,7 +205,20 @@ private:
         return true;
     }
 
+    bool strictCbrEnabled() const {
+        return pacingConfig.enabled &&
+            pacingConfig.holdConfiguredRateWhenSafe &&
+            configuredBitrate > 0 &&
+            !pacingConfig.updateFromPcr &&
+            !pacingConfig.updateFromArrivalRate;
+    }
+
     void sendLoop() {
+        if (strictCbrEnabled()) {
+            sendStrictCbrLoop();
+            return;
+        }
+
         while (!stopping) {
             std::vector<guint8> chunk;
             {
@@ -225,13 +239,81 @@ private:
         }
     }
 
-    void appendAndSend(const guint8* data, std::size_t size) {
+    void sendStrictCbrLoop() {
+        bool transmissionStarted = false;
+        nextSend = std::chrono::steady_clock::now();
+
+        while (!stopping) {
+            std::vector<std::vector<guint8>> chunks;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                if (!transmissionStarted) {
+                    queueReady.wait(lock, [&]() {
+                        return stopping || !queuedChunks.empty();
+                    });
+                } else {
+                    queueReady.wait_until(lock, nextSend, [&]() {
+                        return stopping || !queuedChunks.empty();
+                    });
+                }
+
+                if (stopping) {
+                    break;
+                }
+
+                while (!queuedChunks.empty()) {
+                    queuedBytes -= queuedChunks.front().size();
+                    chunks.push_back(std::move(queuedChunks.front()));
+                    queuedChunks.pop_front();
+                }
+            }
+            if (!chunks.empty()) {
+                queueSpace.notify_all();
+                for (const auto& chunk : chunks) {
+                    appendPending(chunk.data(), chunk.size());
+                }
+            }
+
+            if (!transmissionStarted) {
+                if (!hasAlignedDatagram()) {
+                    continue;
+                }
+                transmissionStarted = true;
+                nextSend = std::chrono::steady_clock::now();
+                pacingRemainder = 0;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            if (now < nextSend) {
+                continue;
+            }
+
+            const auto nominalInterval = datagramInterval(configuredBitrate);
+            if (now - nextSend > nominalInterval * 2) {
+                // Do not compensate scheduler delays with a burst of packets.
+                nextSend = now;
+                pacingRemainder = 0;
+            }
+
+            std::array<guint8, kUdpPayloadSize> datagram {};
+            if (!takeAlignedDatagram(datagram.data())) {
+                makeNullDatagram(datagram.data());
+            }
+            sendDatagramNow(datagram.data(), datagram.size());
+            advanceStrictCbrSchedule(configuredBitrate);
+        }
+    }
+
+    void appendPending(const guint8* data, std::size_t size) {
         if (!data || size == 0) {
             return;
         }
-
         pending.insert(pending.end(), data, data + size);
         resyncPending();
+    }
+
+    void appendAndSend(const guint8* data, std::size_t size) {
+        appendPending(data, size);
 
         while (!stopping && pending.size() >= kUdpPayloadSize) {
             if (!isAlignedDatagram(pending.data())) {
@@ -246,6 +328,50 @@ private:
             sendDatagram(pending.data(), kUdpPayloadSize);
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(kUdpPayloadSize));
         }
+    }
+
+    bool hasAlignedDatagram() {
+        resyncPending();
+        return pending.size() >= kUdpPayloadSize && isAlignedDatagram(pending.data());
+    }
+
+    bool takeAlignedDatagram(guint8* destination) {
+        if (!destination || !hasAlignedDatagram()) {
+            return false;
+        }
+        std::copy_n(pending.data(), kUdpPayloadSize, destination);
+        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(kUdpPayloadSize));
+        return true;
+    }
+
+    void makeNullDatagram(guint8* destination) {
+        for (std::size_t packetIndex = 0; packetIndex < kTsPacketsPerDatagram; ++packetIndex) {
+            guint8* packet = destination + packetIndex * kTsPacketSize;
+            packet[0] = 0x47;
+            packet[1] = 0x1F;
+            packet[2] = 0xFF;
+            packet[3] = static_cast<guint8>(0x10 | (nullContinuityCounter & 0x0F));
+            std::fill(packet + 4, packet + kTsPacketSize, 0xFF);
+            nullContinuityCounter = static_cast<guint8>((nullContinuityCounter + 1) & 0x0F);
+        }
+    }
+
+    static std::chrono::nanoseconds datagramInterval(uint64_t bitrate) {
+        const uint64_t safeBitrate = std::max<uint64_t>(bitrate, 1);
+        const uint64_t numerator = kUdpPayloadSize * 8ULL * 1000000000ULL;
+        return std::chrono::nanoseconds(numerator / safeBitrate);
+    }
+
+    void advanceStrictCbrSchedule(uint64_t bitrate) {
+        const uint64_t safeBitrate = std::max<uint64_t>(bitrate, 1);
+        const uint64_t numerator = kUdpPayloadSize * 8ULL * 1000000000ULL;
+        uint64_t nanos = numerator / safeBitrate;
+        pacingRemainder += numerator % safeBitrate;
+        if (pacingRemainder >= safeBitrate) {
+            nanos += pacingRemainder / safeBitrate;
+            pacingRemainder %= safeBitrate;
+        }
+        nextSend += std::chrono::nanoseconds(nanos);
     }
 
     void resyncPending() {
@@ -379,6 +505,15 @@ private:
         arrivalWindowStart = now;
     }
 
+    void sendDatagramNow(const guint8* data, std::size_t size) {
+        const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
+        const socklen_t destinationSize = sizeof(destinationAddress);
+        ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
+        if (sent < 0) {
+            std::cerr << "UDP output send failed: " << std::strerror(errno) << std::endl;
+        }
+    }
+
     void sendDatagram(const guint8* data, std::size_t size) {
         pace(size);
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
@@ -437,6 +572,8 @@ private:
     sockaddr_in destinationAddress {};
     std::vector<guint8> pending;
     std::chrono::steady_clock::time_point nextSend;
+    uint64_t pacingRemainder = 0;
+    guint8 nullContinuityCounter = 0;
     std::atomic<bool> stopping{false};
     std::thread senderThread;
     std::mutex queueMutex;

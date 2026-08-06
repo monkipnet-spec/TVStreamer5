@@ -21,6 +21,8 @@ GstElement* createSink(
     }
 
     UdpTsOutput::PacingConfig pacing;
+    pacing.updateFromPcr = false;
+    pacing.updateFromArrivalRate = false;
     pacing.initialBitrate = config.targetBitrate;
     pacing.configuredBitrate = config.targetBitrate;
     pacing.headroomPercent = kCbrSafetyHeadroomPercent;
