@@ -60,9 +60,11 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::array<uint8_t, 8192> inputContinuity {};
     std::array<bool, 8192> inputContinuityValid {};
+    std::vector<uint8_t> inputTsRemainder;
     std::mutex inputContinuityMutex;
     std::array<uint8_t, 8192> outputContinuity {};
     std::array<bool, 8192> outputContinuityValid {};
+    std::vector<uint8_t> outputTsRemainder;
     std::mutex outputContinuityMutex;
     std::unique_ptr<RemapContext> sourceContext;
     std::vector<std::unique_ptr<RemapContext>> outputContexts;

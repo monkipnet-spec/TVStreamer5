@@ -367,16 +367,30 @@ uint64_t bufferListSize(GstBufferList* list) {
 }
 
 std::size_t findTsAlignment(const guint8* data, std::size_t size) {
-    if (!data || size < kTsPacketSize) {
+    if (!data || size < kTsPacketSize * 2) {
         return std::string::npos;
     }
 
-    const std::size_t maxOffset = std::min<std::size_t>(kTsPacketSize, size - kTsPacketSize + 1);
+    const std::size_t maxOffset = std::min<std::size_t>(kTsPacketSize, size);
     for (std::size_t offset = 0; offset < maxOffset; ++offset) {
         if (data[offset] != 0x47) {
             continue;
         }
-        if (offset + kTsPacketSize >= size || data[offset + kTsPacketSize] == 0x47) {
+
+        std::size_t confirmed = 1;
+        for (std::size_t next = offset + kTsPacketSize;
+             next < size && confirmed < 4;
+             next += kTsPacketSize) {
+            if (data[next] != 0x47) {
+                confirmed = 0;
+                break;
+            }
+            ++confirmed;
+        }
+
+        // Require at least two consecutive sync bytes. Three or four are
+        // automatically checked when enough data is available.
+        if (confirmed >= 2) {
             return offset;
         }
     }
@@ -388,26 +402,43 @@ uint64_t countContinuityErrors(
     std::size_t size,
     std::array<uint8_t, 8192>& continuity,
     std::array<bool, 8192>& continuityValid,
+    std::vector<uint8_t>& remainder,
     std::mutex& continuityMutex) {
-    if (!data || size < kTsPacketSize) {
+    if (!data || size == 0) {
         return 0;
     }
 
-    const std::size_t start = findTsAlignment(data, size);
+    std::lock_guard<std::mutex> lock(continuityMutex);
+
+    // HTTP and HLS buffers are not guaranteed to begin or end on a 188-byte
+    // MPEG-TS boundary. Preserve the incomplete tail and prepend it to the
+    // next buffer instead of treating skipped fragments as packet loss.
+    std::vector<uint8_t> bytes;
+    bytes.reserve(remainder.size() + size);
+    bytes.insert(bytes.end(), remainder.begin(), remainder.end());
+    bytes.insert(bytes.end(), data, data + size);
+    remainder.clear();
+
+    const std::size_t start = findTsAlignment(bytes.data(), bytes.size());
     if (start == std::string::npos) {
+        // Retain only enough bytes to detect a sync sequence in the next call.
+        const std::size_t keep = std::min<std::size_t>(bytes.size(), kTsPacketSize * 4 - 1);
+        remainder.assign(bytes.end() - keep, bytes.end());
         return 0;
     }
 
     uint64_t errors = 0;
-    std::lock_guard<std::mutex> lock(continuityMutex);
-    for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
-        const guint8* packet = data + offset;
+    std::size_t offset = start;
+    for (; offset + kTsPacketSize <= bytes.size(); offset += kTsPacketSize) {
+        const guint8* packet = bytes.data() + offset;
         if (packet[0] != 0x47) {
-            continue;
+            // Lost alignment. Keep the remaining bytes and re-synchronize on
+            // the next invocation without reporting synthetic CC errors.
+            break;
         }
 
         if ((packet[1] & 0x80) != 0) {
-            ++errors;
+            ++errors; // transport_error_indicator
         }
 
         const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1f) << 8) | packet[2]);
@@ -416,11 +447,21 @@ uint64_t countContinuityErrors(
         }
 
         const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
-        const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
         if (adaptationControl == 0) {
             ++errors;
+            continuityValid[pid] = false;
             continue;
         }
+
+        bool discontinuity = false;
+        if ((adaptationControl == 2 || adaptationControl == 3) && packet[4] > 0 && packet[4] <= 183) {
+            discontinuity = (packet[5] & 0x80) != 0;
+        }
+        if (discontinuity) {
+            continuityValid[pid] = false;
+        }
+
+        const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
         if (!hasPayload) {
             continue;
         }
@@ -435,6 +476,13 @@ uint64_t countContinuityErrors(
         continuity[pid] = continuityCounter;
         continuityValid[pid] = true;
     }
+
+    if (offset < bytes.size()) {
+        remainder.assign(bytes.begin() + offset, bytes.end());
+        if (remainder.size() > kTsPacketSize * 4) {
+            remainder.erase(remainder.begin(), remainder.end() - (kTsPacketSize * 4));
+        }
+    }
     return errors;
 }
 
@@ -443,7 +491,8 @@ void updateInputContinuityErrors(StreamState* state, GstBuffer* buffer) {
     GstMapInfo map {};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
     const uint64_t errors = countContinuityErrors(
-        map.data, map.size, state->inputContinuity, state->inputContinuityValid, state->inputContinuityMutex);
+        map.data, map.size, state->inputContinuity, state->inputContinuityValid,
+        state->inputTsRemainder, state->inputContinuityMutex);
     gst_buffer_unmap(buffer, &map);
     if (errors > 0) state->inputCcErrors.fetch_add(errors, std::memory_order_relaxed);
 }
@@ -453,7 +502,8 @@ void updateOutputContinuityErrors(StreamState* state, GstBuffer* buffer) {
     GstMapInfo map {};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
     const uint64_t errors = countContinuityErrors(
-        map.data, map.size, state->outputContinuity, state->outputContinuityValid, state->outputContinuityMutex);
+        map.data, map.size, state->outputContinuity, state->outputContinuityValid,
+        state->outputTsRemainder, state->outputContinuityMutex);
     gst_buffer_unmap(buffer, &map);
     if (errors > 0) state->outputCcErrors.fetch_add(errors, std::memory_order_relaxed);
 }
@@ -1653,10 +1703,12 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     {
         std::lock_guard<std::mutex> lock(state->inputContinuityMutex);
         state->inputContinuityValid.fill(false);
+        state->inputTsRemainder.clear();
     }
     {
         std::lock_guard<std::mutex> lock(state->outputContinuityMutex);
         state->outputContinuityValid.fill(false);
+        state->outputTsRemainder.clear();
     }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
