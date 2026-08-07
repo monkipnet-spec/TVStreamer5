@@ -174,12 +174,15 @@ uridecodebin
  -> raw video
  -> videoconvert
  -> deinterlace method=yadif
- -> videoscale method=lanczos
+ -> videoscale method=lanczos (selected output resolution, preserve display aspect with borders when required)
  -> videorate
- -> 25 fps progressive I420
- -> x264enc superfast / zerolatency
+ -> 25 fps progressive I420, SAR/PAR 1:1 (square pixels)
+ -> x264enc superfast / zerolatency with VUI enabled
  -> h264parse
 ```
+
+
+The transcoder always normalizes the scaled video to **SAR/PAR 1:1** before H.264 encoding. The selected output width/height therefore use square pixels, and `x264enc` is instructed to emit VUI information. `videoscale add-borders=true` preserves the source display aspect ratio when the selected resolution has a different shape, adding borders instead of stretching the picture.
 
 Audio is normalized to 48 kHz stereo before encoding. AAC is the stable/default transcoder path; MP3 is used when explicitly configured and an MP3 encoder is available. In the clean transcoder path, a UI/config value intended as audio `copy` is currently handled as AAC re-encode rather than bit-exact passthrough.
 
@@ -862,3 +865,25 @@ ss -lntp | grep -E ':9000|:9100'
 ```
 
 The listening ports should belong to `TVStreamer` only; `gst-launch-1.0` should not appear as an owner of those sockets.
+
+### SRT после транскодирования
+
+В Release 2 внешний GStreamer-транскодер использует тот же смысл полей SRT, что и обычный поток TVStreamer5:
+
+- `Listener`: процесс слушает `srt://:<port>` на `0.0.0.0` либо на адресе выбранного выходного интерфейса. Поле `Адрес выхода` используется только как адрес, показываемый в ссылке клиенту, и не используется как bind-адрес.
+- `Caller`: `Адрес выхода` является адресом удалённого SRT-сервера, а выбранный выходной интерфейс применяется как локальный bind-адрес.
+- SRT получает MPEG-TS блоками по 1316 байт, latency 250 мс; поток не блокирует весь транскодер в ожидании клиента.
+- Если `gst-launch-1.0` завершается сразу из-за ошибки bind/URI/плагина, запуск потока теперь завершается ошибкой вместо ложного статуса `running`.
+
+Для проверки SRT Listener на сервере:
+
+```bash
+ss -lunp | grep '<SRT_PORT>'
+journalctl -u tvstreamer5 -n 100 --no-pager | grep -Ei 'srt|GStreamer transcoder|error|failed|exit'
+```
+
+Проверка приёмником GStreamer:
+
+```bash
+gst-launch-1.0 -v srtsrc uri="srt://SERVER_IP:SRT_PORT?mode=caller" ! tsparse ! fakesink sync=false
+```
