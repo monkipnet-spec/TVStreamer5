@@ -287,53 +287,157 @@ sudo systemctl status tvstreamer5 --no-pager --full
 
 ## Docker
 
-The Docker image is based on Ubuntu 24.04. The build stage contains only the development packages used by the current CMake target. The runtime stage contains the shared libraries and GStreamer plugins used by Release 2.
+TVStreamer5 can be built and run entirely in Docker. This keeps compiler and
+GStreamer development packages out of the host operating system. The runtime
+container still uses the host network because IPTV multicast, RTP, SRT listener
+mode and interface-specific bindings work most reliably with `--network host`.
 
-Build:
+### Install Docker Engine on Ubuntu
+
+The recommended production installation uses Docker's official `apt`
+repository. The commands below are suitable for supported Ubuntu releases such
+as 22.04 LTS and 24.04 LTS.
+
+Remove packages that can conflict with the official Docker Engine packages:
 
 ```bash
+sudo apt remove -y docker.io docker-compose docker-compose-v2 docker-doc \
+  docker-buildx podman-docker containerd runc || true
+```
+
+Add Docker's signing key and repository:
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt update
+```
+
+Install Docker Engine, Buildx and the Compose plugin:
+
+```bash
+sudo apt install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+```
+
+Enable Docker at boot and verify the daemon:
+
+```bash
+sudo systemctl enable --now docker
+sudo systemctl status docker --no-pager --full
+sudo docker run --rm hello-world
+```
+
+Docker commands require `sudo` by default. To allow the current user to run
+Docker commands without `sudo`:
+
+```bash
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker version
+```
+
+Membership in the `docker` group effectively grants root-level access to the
+host. Keep using `sudo docker ...` instead if that is preferable for the server.
+
+### Build the TVStreamer5 Docker image
+
+From the repository directory:
+
+```bash
+cd /home/monk/TVStreamer5
 chmod +x scripts/build_container.sh scripts/run_container.sh
 ./scripts/build_container.sh
 ```
 
-Run interactively:
-
-```bash
-./scripts/run_container.sh
-```
-
-The scripts can be launched from any current working directory; they resolve the repository root from their own location.
-
-Default image name:
+The default image name is:
 
 ```text
 tvstreamer5:release2
 ```
 
-Override it when needed:
+Verify that the image exists:
+
+```bash
+docker image ls tvstreamer5:release2
+docker image inspect tvstreamer5:release2 >/dev/null && echo "TVStreamer5 image OK"
+```
+
+The build script can be launched from any working directory because it resolves
+the repository path from the script location itself. To use another image name:
 
 ```bash
 IMAGE_NAME=my-tvstreamer:release2 ./scripts/build_container.sh
-IMAGE_NAME=my-tvstreamer:release2 ./scripts/run_container.sh
 ```
 
-Use a different config file:
+A direct equivalent build command is:
 
 ```bash
-CONFIG_FILE=/srv/tvstreamer/tvstreamer5-config.json ./scripts/run_container.sh
+docker build --pull -t tvstreamer5:release2 .
 ```
 
-If the config has a different filename, the run script mounts its containing directory as `/data` and additionally maps the selected file to `/data/tvstreamer5-config.json`. This keeps `tvstreamer5-subscribers.json` and backup files in the same persistent host directory.
+### Prepare persistent TVStreamer5 data
 
-Host networking is intentional:
+For a production container, keep configuration and application data outside the
+container. Example:
+
+```bash
+sudo mkdir -p /srv/tvstreamer5
+sudo cp tvstreamer5-config.json /srv/tvstreamer5/tvstreamer5-config.json
+sudo chown -R "$USER":"$USER" /srv/tvstreamer5
+```
+
+The `/srv/tvstreamer5` directory can then persist:
 
 ```text
---network host
+tvstreamer5-config.json
+tvstreamer5-subscribers.json
+backup-files/
 ```
 
-It is strongly recommended for UDP multicast, RTP, SRT listener mode and interface-specific input/output binding. Docker bridge/NAT is not a reliable choice for multicast IPTV transport.
+### Test the container interactively
 
-A production detached example:
+The supplied run script starts an interactive temporary container:
+
+```bash
+CONFIG_FILE=/srv/tvstreamer5/tvstreamer5-config.json \
+  ./scripts/run_container.sh
+```
+
+Press `Ctrl+C` to stop it. Because this helper uses `--rm`, the temporary
+container is automatically removed after exit; configuration and other data
+remain on the host.
+
+To increase GStreamer logging temporarily:
+
+```bash
+GST_DEBUG=2 \
+CONFIG_FILE=/srv/tvstreamer5/tvstreamer5-config.json \
+  ./scripts/run_container.sh
+```
+
+### Run TVStreamer5 as a background Docker service
+
+Create the persistent production container:
 
 ```bash
 docker run -d \
@@ -341,20 +445,236 @@ docker run -d \
   --restart unless-stopped \
   --init \
   --network host \
-  -v /srv/tvstreamer:/data \
+  -v /srv/tvstreamer5:/data \
   -w /data \
   -e GST_DEBUG=1 \
   tvstreamer5:release2
 ```
 
-Useful commands:
+The web interface then uses the HTTP port configured by TVStreamer5, normally:
+
+```text
+http://SERVER_IP:9000
+```
+
+`--network host` is intentional. With host networking, Docker does not need
+`-p 9000:9000`, `-p` mappings for UDP multicast, or separate SRT port
+forwarding. TVStreamer5 binds directly to the host's interfaces and ports.
+
+### Docker management from the console
+
+The following commands manage the `tvstreamer5` container directly from a Linux
+console. If the current user is not in the `docker` group, prefix each
+`docker ...` command with `sudo`. Commands that stop or restart the Docker daemon
+affect **all** containers on the host, not only TVStreamer5.
 
 ```bash
+# Show Docker Engine status
+systemctl status docker --no-pager --full
+
+# Start / stop / restart the Docker daemon
+sudo systemctl start docker
+sudo systemctl stop docker
+sudo systemctl restart docker
+
+# Enable / disable Docker daemon autostart
+sudo systemctl enable docker
+sudo systemctl disable docker
+
+# Show all running containers
+docker ps
+
+# Show running and stopped containers
+docker ps -a
+
+# Show only TVStreamer5
+docker ps -a --filter name=tvstreamer5
+
+# Start TVStreamer5
+docker start tvstreamer5
+
+# Stop TVStreamer5 gracefully
+docker stop -t 15 tvstreamer5
+
+# Restart TVStreamer5
+docker restart -t 15 tvstreamer5
+
+# Show container state, exit code and restart count
+docker inspect tvstreamer5 --format \
+  'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} restart={{.RestartCount}}'
+
+# Follow logs in real time
 docker logs -f tvstreamer5
-docker restart tvstreamer5
+
+# Show the last 200 log lines
+docker logs --tail 200 tvstreamer5
+
+# Show logs from the last 10 minutes
+docker logs --since 10m tvstreamer5
+
+# Show CPU, RAM and network usage
+docker stats tvstreamer5
+
+# Open a shell inside the running container
 docker exec -it tvstreamer5 bash
-docker ps --filter name=tvstreamer5
+
+# Show processes running in the TVStreamer5 container
+docker top tvstreamer5
+
+# Check GStreamer plugins inside the container
+docker exec tvstreamer5 gst-inspect-1.0 x264enc
+docker exec tvstreamer5 gst-inspect-1.0 srtsink
+docker exec tvstreamer5 gst-inspect-1.0 rtspclientsink
+
+# Check the config visible inside the container
+docker exec tvstreamer5 ls -lah /data
+docker exec tvstreamer5 test -f /data/tvstreamer5-config.json && echo "config OK"
+
+# Inspect mounted host directories
+docker inspect tvstreamer5 --format '{{json .Mounts}}'
+
+# Inspect container network mode
+docker inspect tvstreamer5 --format '{{.HostConfig.NetworkMode}}'
+
+# Show the image used by the container
+docker inspect tvstreamer5 --format '{{.Config.Image}}'
+
+# Show installed TVStreamer5 images
+docker image ls 'tvstreamer5*'
+
+# Show Docker disk usage
+docker system df
 ```
+
+### Update TVStreamer5 in Docker
+
+After pulling new source code, rebuild the image and recreate the container. A
+running container does not automatically switch to a newly built image.
+
+```bash
+cd /home/monk/TVStreamer5
+git pull origin main
+
+./scripts/build_container.sh
+
+docker stop -t 15 tvstreamer5
+docker rm tvstreamer5
+
+docker run -d \
+  --name tvstreamer5 \
+  --restart unless-stopped \
+  --init \
+  --network host \
+  -v /srv/tvstreamer5:/data \
+  -w /data \
+  -e GST_DEBUG=1 \
+  tvstreamer5:release2
+
+# Verify the new container
+docker ps --filter name=tvstreamer5
+docker logs --tail 100 tvstreamer5
+```
+
+The bind-mounted `/srv/tvstreamer5` directory is not removed when the container
+is recreated, so the configuration, subscriber database and backup files remain
+persistent.
+
+### Change the configuration and restart
+
+Edit the host copy of the configuration:
+
+```bash
+sudoedit /srv/tvstreamer5/tvstreamer5-config.json
+```
+
+Then restart the container:
+
+```bash
+docker restart -t 15 tvstreamer5
+docker logs --tail 100 tvstreamer5
+```
+
+### Remove or recreate the container
+
+Removing the container does not remove `/srv/tvstreamer5` because that directory
+is a host bind mount.
+
+```bash
+docker stop -t 15 tvstreamer5
+docker rm tvstreamer5
+```
+
+Force-remove a stuck container only when a normal stop does not work:
+
+```bash
+docker rm -f tvstreamer5
+```
+
+Remove an old TVStreamer5 image after the container using it has been removed:
+
+```bash
+docker image rm tvstreamer5:release2
+```
+
+Remove only unused Docker objects:
+
+```bash
+docker container prune
+docker image prune
+docker builder prune
+```
+
+Do not use `docker system prune -a --volumes` on a production server unless you
+explicitly intend to delete all unused images, networks, build cache and unused
+Docker volumes.
+
+### Docker troubleshooting
+
+If the container immediately exits:
+
+```bash
+docker ps -a --filter name=tvstreamer5
+docker inspect tvstreamer5 --format 'exit={{.State.ExitCode}} error={{.State.Error}}'
+docker logs --tail 300 tvstreamer5
+```
+
+If port 9000 is already occupied:
+
+```bash
+sudo ss -lntp | grep ':9000'
+```
+
+If UDP multicast or SRT traffic is missing, first verify that host networking is
+actually enabled and inspect the host interface directly:
+
+```bash
+docker inspect tvstreamer5 --format '{{.HostConfig.NetworkMode}}'
+ip -br addr
+ip route
+sudo tcpdump -ni eth0 udp
+```
+
+Replace `eth0` with the real IPTV interface. Since TVStreamer5 uses host
+networking, protocol diagnostics are performed on the host network namespace.
+
+If the image needs to be rebuilt without Docker layer cache:
+
+```bash
+cd /home/monk/TVStreamer5
+docker build --pull --no-cache -t tvstreamer5:release2 .
+```
+
+If Docker itself is unhealthy:
+
+```bash
+sudo systemctl status docker --no-pager --full
+sudo journalctl -u docker -n 200 --no-pager
+docker info
+```
+
+Docker's official Ubuntu installation documentation should be checked when
+upgrading the host to a new Ubuntu release because supported distributions and
+package names can change.
 
 ## Network tuning for high-bitrate UDP
 
