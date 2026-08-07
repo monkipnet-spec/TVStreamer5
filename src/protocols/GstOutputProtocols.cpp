@@ -13,24 +13,24 @@
 namespace tvs::protocols {
 
 std::vector<std::string> requiredOutputElements() {
-    return {"mpegtsmux", "udpsink", "rtpmp2tpay", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
+    return {"mpegtsmux", "tsparse", "udpsink", "rtpmp2tpay", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
 }
 
 std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
     switch (kind) {
         case OutputKind::UdpCbr:
         case OutputKind::UdpVbr:
-            return {"mpegtsmux", "udpsink"};
+            return {"mpegtsmux", "tsparse", "udpsink"};
         case OutputKind::FifoRelay:
             return {"mpegtsmux", "filesink"};
         case OutputKind::Rtp:
-            return {"mpegtsmux", "rtpmp2tpay", "udpsink"};
+            return {"mpegtsmux", "tsparse", "rtpmp2tpay", "udpsink"};
         case OutputKind::Srt:
-            return {"mpegtsmux", "srtsink"};
+            return {"mpegtsmux", "tsparse", "srtsink"};
         case OutputKind::Http:
-            return {"mpegtsmux", "tcpserversink"};
+            return {"mpegtsmux", "tsparse", "tcpserversink"};
         case OutputKind::Hls:
-            return {"mpegtsmux", "hlssink"};
+            return {"mpegtsmux", "tsparse", "hlssink"};
         case OutputKind::Rtsp:
             return {"rtspclientsink"};
         case OutputKind::Rtmp:

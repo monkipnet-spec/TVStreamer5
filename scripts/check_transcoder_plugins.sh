@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# v49: transcoded streams use direct protocol output modules again. The base
+# v50: transcoded streams use direct protocol output modules again. The base
 # transcoder chain is required; protocol-specific elements are checked and
 # reported separately because they are only required when that output is used.
 required=(
@@ -21,11 +21,11 @@ required=(
 )
 
 protocol_elements=(
-  "udp/udp-cbr/udp-vbr:mpegtsmux udpsink"
-  "rtp:mpegtsmux rtpmp2tpay udpsink"
-  "http:mpegtsmux tcpserversink"
-  "hls:mpegtsmux hlssink"
-  "srt:mpegtsmux srtsink"
+  "udp/udp-cbr/udp-vbr:mpegtsmux tsparse udpsink"
+  "rtp:mpegtsmux tsparse rtpmp2tpay udpsink"
+  "http:mpegtsmux tsparse tcpserversink"
+  "hls:mpegtsmux tsparse hlssink"
+  "srt:mpegtsmux tsparse srtsink"
   "rtmp/youtube:flvmux rtmpsink"
   "rtsp-push:rtspclientsink"
   "fifo-debug:mpegtsmux filesink"

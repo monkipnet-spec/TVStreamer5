@@ -149,7 +149,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {
         "!", "video/x-raw",
         "!", "videoconvert",
-        "!", "deinterlace", "method=yadif",
+        "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
         "!", "videoscale", "add-borders=true",
         "!", "videorate", "drop-only=false",
         "!", "video/x-raw,format=I420,width=" + std::to_string(width) +
@@ -158,12 +158,12 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "tune=zerolatency",
         "speed-preset=ultrafast",
         property("bitrate", std::to_string(bitrateKbps)),
-        "key-int-max=50",
+        "key-int-max=25",
         "bframes=0",
         property("byte-stream", flv ? "false" : "true"),
         "aud=true",
-        "sliced-threads=true",
-        "vbv-buf-capacity=500",
+        "sliced-threads=false",
+        "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
         "!", "h264parse", property("config-interval", flv ? "-1" : "1"),
         "!", flv
@@ -262,9 +262,9 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
         "!", "video/x-raw,format=I420,width=1280,height=720,framerate=25/1,interlace-mode=progressive",
         "!", "x264enc", "tune=zerolatency", "speed-preset=ultrafast",
         property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
-        "key-int-max=50", "bframes=0",
+        "key-int-max=25", "bframes=0",
         property("byte-stream", spec.container == ContainerKind::Flv ? "false" : "true"),
-        "aud=true", "sliced-threads=true", "vbv-buf-capacity=500",
+        "aud=true", "sliced-threads=false", "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
         "!", "h264parse", property("config-interval", spec.container == ContainerKind::Flv ? "-1" : "1"),
         "!", spec.container == ContainerKind::Flv
@@ -436,7 +436,12 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         }
         std::cerr << "GStreamer transcoder command: " << commandLineForLog(args) << std::endl;
         std::cerr << "GStreamer transcoder started pid=" << child.pid
-                  << " output=" << description << std::endl;
+                  << " output=" << description
+                  << " remap=" << (config.remapEnabled ? "on" : "off")
+                  << " service=" << config.serviceId
+                  << " vpid=" << config.videoPid
+                  << " apid=" << config.audioPid
+                  << std::endl;
         started.push_back(child);
     }
 

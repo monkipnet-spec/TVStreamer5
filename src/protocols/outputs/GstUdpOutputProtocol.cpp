@@ -4,6 +4,7 @@
 namespace tvs::protocols::outputs {
 bool appendUdpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
+    appendTsSmoother(args, "transcode_udp_ts_smoother", 250000);
     appendOutputQueue(args, "transcode_udp_output_queue", false);
     args.insert(args.end(), {
         "udpsink",
@@ -11,9 +12,10 @@ bool appendUdpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         "port=" + std::to_string(cfg.outputPort),
         "sync=true",
         "async=false",
+        "qos=false",
         "auto-multicast=true",
         "ttl-mc=32",
-        "buffer-size=4194304"
+        "buffer-size=8388608"
     });
     if (!cfg.interfaceAddress.empty()) args.push_back("bind-address=" + cfg.interfaceAddress);
     assignTsPads(cfg, spec);

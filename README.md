@@ -924,3 +924,16 @@ behavior is preserved.
 - HLS transcoded output writes segments under `/tmp/tvstreamer5-hls/<id>` and the existing HTTP server serves `/hls/<id>/playlist.m3u8`.
 - Removed downstream-leaky queues from direct protocol outputs to avoid corrupt TS bursts, frozen pictures and audio crackling.
 - Switched the deinterlacer method to `yadif` for the clean GStreamer transcoder video branch.
+
+
+## v50 transcoder transport stabilization
+
+The GStreamer transcoder keeps protocol outputs modular, but the MPEG-TS based outputs now share the same transport rules:
+
+- UDP/RTP/SRT/HTTP/HLS run the encoded TS through `tsparse set-timestamps=true` with live timestamp smoothing before the network/file sink.
+- SRT is clock-synchronised and uses a 400 ms SRT latency so buffers are not dumped as fast as possible.
+- HLS remap is applied in `mpegtsmux`: requested video/audio PIDs are mapped to the configured service/program with `prog-map`.
+- Deinterlace uses YADIF with one output field per source frame (`fields=top`) before the fixed 25 fps stage, avoiding the previous 50->25 field-rate churn.
+- The transcoder monitor thread now runs for external GStreamer pipelines, so the input bitrate graph remains populated while transcoding.
+
+For a remapped HLS stream, `ffprobe -show_programs -show_streams` should show the configured service ID and V-PID/A-PID in every segment.

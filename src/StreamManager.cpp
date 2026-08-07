@@ -333,6 +333,14 @@ uint64_t transcodeAudioBitrateForStats(const StreamConfig& cfg) {
     return std::clamp<uint64_t>(cfg.transcodeAudioBitrate, 64000, 320000);
 }
 
+uint64_t transcodeInputBitrateForStats(const StreamConfig& cfg) {
+    // The external GStreamer transcoder owns the input socket, so StreamManager cannot
+    // attach its normal source pad probe. Keep the UI graph alive with a conservative
+    // estimate derived from the configured encode rate until the transcoder is moved
+    // fully in-process.
+    return transcodeVideoBitrateForStats(cfg) + transcodeAudioBitrateForStats(cfg) + 300000;
+}
+
 uint64_t transcodeMuxBitrateForStats(const StreamConfig& cfg) {
     const uint64_t minimum = transcodeVideoBitrateForStats(cfg) + transcodeAudioBitrateForStats(cfg) + 1200000;
     return cfg.targetBitrate > 0 ? std::max<uint64_t>(cfg.targetBitrate, minimum) : minimum;
@@ -1106,7 +1114,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         state->active = true;
         state->statusMessage = "running via gstreamer";
         state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
-        state->inputBitrate = transcodeMuxBitrateForStats(streamConfig);
+        state->inputBitrate = transcodeInputBitrateForStats(streamConfig);
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
         state->lastBitrateSample = state->lastInputActivity;
@@ -1118,6 +1126,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
                 duplicateStart = true;
             } else {
                 streams[streamConfig.id] = std::move(state);
+                streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
             }
         }
         if (duplicateStart) {
@@ -3230,8 +3239,7 @@ void StreamManager::monitorBus(const std::string& id) {
             auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyntheticSample).count();
             if (elapsedMs >= 1000) {
                 const double seconds = static_cast<double>(elapsedMs) / 1000.0;
-                const uint64_t inputEstimate = transcodeVideoBitrateForStats(state->config) +
-                    transcodeAudioBitrateForStats(state->config) + 300000;
+                const uint64_t inputEstimate = transcodeInputBitrateForStats(state->config);
                 const uint64_t outputEstimate = transcodeMuxBitrateForStats(state->config);
                 state->inputBitrate = inputEstimate;
                 state->outputBitrate = outputEstimate;
@@ -3265,10 +3273,8 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
                 return;
             }
-            // The user-visible source is the original URL, but the in-process pipeline now reads
-            // from the internal FIFO relay. Treat a live transcoder process as input activity so
-            // the failover watchdog does not mark valid transcoded streams as "no input signal"
-            // while the FIFO reader and writer are synchronizing.
+            // The external transcoder owns the original input socket. Treat a live process as
+            // input activity; its dedicated monitor loop updates the synthetic input counters.
             state->lastInputActivity = now;
         }
         const uint64_t currentInputBytes = state->inputBytes.load();
