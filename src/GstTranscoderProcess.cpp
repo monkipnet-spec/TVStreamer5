@@ -523,12 +523,16 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         started.push_back(child);
     }
 
-    children = std::move(started);
+    {
+        std::lock_guard<std::mutex> lock(childrenMutex);
+        children = std::move(started);
+    }
     return true;
 }
 
 void GstTranscoderProcess::stop() {
     stopping = true;
+    std::lock_guard<std::mutex> lock(childrenMutex);
     for (auto& child : children) {
         if (child.pid <= 0) continue;
         int status = 0;
@@ -551,6 +555,7 @@ void GstTranscoderProcess::stop() {
 }
 
 bool GstTranscoderProcess::isRunning() {
+    std::lock_guard<std::mutex> lock(childrenMutex);
     bool anyRunning = false;
     for (auto& child : children) {
         if (child.pid <= 0) continue;
@@ -570,7 +575,19 @@ bool GstTranscoderProcess::isRunning() {
     return anyRunning;
 }
 
+std::vector<pid_t> GstTranscoderProcess::childPids() const {
+    std::lock_guard<std::mutex> lock(childrenMutex);
+    std::vector<pid_t> result;
+    for (const auto& child : children) {
+        if (child.pid > 0) {
+            result.push_back(child.pid);
+        }
+    }
+    return result;
+}
+
 std::string GstTranscoderProcess::description() const {
+    std::lock_guard<std::mutex> lock(childrenMutex);
     std::ostringstream ss;
     for (size_t i = 0; i < children.size(); ++i) {
         if (i > 0) ss << ", ";

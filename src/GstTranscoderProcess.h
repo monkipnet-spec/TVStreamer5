@@ -3,6 +3,7 @@
 #include "ConfigManager.h"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@ public:
     void stop();
     bool isRunning();
     std::string description() const;
+    std::vector<pid_t> childPids() const;
 
 private:
     struct ChildProcess {
@@ -30,6 +32,7 @@ private:
     };
 
     std::vector<ChildProcess> children;
+    mutable std::mutex childrenMutex;
     std::atomic<bool> stopping{false};
 
     static std::vector<std::string> buildCommand(
