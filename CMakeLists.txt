@@ -43,6 +43,24 @@ add_executable(TVStreamer
     src/protocols/GstProtocolTypes.cpp
     src/protocols/GstInputProtocols.cpp
     src/protocols/GstOutputProtocols.cpp
+    src/protocols/stream/StreamInputProtocol.cpp
+    src/protocols/stream/StreamOutputProtocol.cpp
+    src/protocols/stream/inputs/StreamTestInputProtocol.cpp
+    src/protocols/stream/inputs/StreamHttpInputProtocol.cpp
+    src/protocols/stream/inputs/StreamHlsInputProtocol.cpp
+    src/protocols/stream/inputs/StreamUdpInputProtocol.cpp
+    src/protocols/stream/inputs/StreamRtpInputProtocol.cpp
+    src/protocols/stream/inputs/StreamSrtInputProtocol.cpp
+    src/protocols/stream/inputs/StreamRtspInputProtocol.cpp
+    src/protocols/stream/inputs/StreamRtmpInputProtocol.cpp
+    src/protocols/stream/inputs/StreamFileInputProtocol.cpp
+    src/protocols/stream/outputs/StreamUdpOutputProtocol.cpp
+    src/protocols/stream/outputs/StreamRtpOutputProtocol.cpp
+    src/protocols/stream/outputs/StreamHttpOutputProtocol.cpp
+    src/protocols/stream/outputs/StreamHlsOutputProtocol.cpp
+    src/protocols/stream/outputs/StreamSrtOutputProtocol.cpp
+    src/protocols/stream/outputs/StreamRtspOutputProtocol.cpp
+    src/protocols/stream/outputs/StreamRtmpOutputProtocol.cpp
     src/protocols/inputs/GstHttpInputProtocol.cpp
     src/protocols/inputs/GstHlsInputProtocol.cpp
     src/protocols/inputs/GstUdpInputProtocol.cpp
@@ -50,6 +68,7 @@ add_executable(TVStreamer
     src/protocols/inputs/GstRtspInputProtocol.cpp
     src/protocols/inputs/GstRtmpInputProtocol.cpp
     src/protocols/outputs/GstOutputProtocolUtils.cpp
+    src/protocols/outputs/GstFifoOutputProtocol.cpp
     src/protocols/outputs/GstUdpOutputProtocol.cpp
     src/protocols/outputs/GstSrtOutputProtocol.cpp
     src/protocols/outputs/GstHttpOutputProtocol.cpp

@@ -4,6 +4,8 @@
 #include "UdpInput.h"
 #include "UdpVbrOutput.h"
 #include "protocols/GstProtocolTypes.h"
+#include "protocols/stream/StreamInputProtocol.h"
+#include "protocols/stream/StreamOutputProtocol.h"
 
 #include <algorithm>
 #include <chrono>
@@ -344,10 +346,10 @@ uint16_t transcodeRelayPort(const StreamConfig& cfg) {
 
 StreamConfig transcodeRelayOutputConfig(const StreamConfig& cfg) {
     StreamConfig relay = cfg;
-    relay.outputType = "udp-vbr";
+    relay.outputType = "fifo";
     relay.outputMode.clear();
-    relay.outputHost = "127.0.0.1";
-    relay.outputPort = transcodeRelayPort(cfg);
+    relay.outputHost = tvs::protocols::transcodedFifoRelayPath(cfg);
+    relay.outputPort = 0;
     relay.additionalOutputs.clear();
     relay.cbr = false;
     relay.targetBitrate = transcodeMuxBitrateForStats(cfg);
@@ -356,8 +358,10 @@ StreamConfig transcodeRelayOutputConfig(const StreamConfig& cfg) {
 
 StreamConfig transcodeRelayPipelineConfig(const StreamConfig& cfg) {
     StreamConfig relay = cfg;
-    relay.inputUri = "udp://@127.0.0.1:" + std::to_string(transcodeRelayPort(cfg));
-    relay.inputMode = "udp";
+    relay.inputUri = "file://" + tvs::protocols::transcodedFifoRelayPath(cfg);
+    relay.inputMode = "file";
+    relay.inputInterfaceAddress.clear();
+    relay.inputInterfaceAddressConfigured = true;
     relay.testPattern = false;
     relay.transcodeEnabled = false;
     relay.remapEnabled = false;
@@ -1088,10 +1092,17 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
         const StreamConfig relayOutput = transcodeRelayOutputConfig(streamConfig);
+        if (!tvs::protocols::prepareFifoRelay(streamConfig, gstError)) {
+            std::cerr << "GStreamer transcoder relay fifo setup failed for " << streamConfig.id
+                      << ": " << gstError << std::endl;
+            state->statusMessage = "gstreamer relay fifo failed: " + gstError;
+            return false;
+        }
         if (!gstTranscoder->start(relayOutput, gstError)) {
             std::cerr << "GStreamer transcoder relay setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
+            tvs::protocols::removeFifoRelay(streamConfig);
             return false;
         }
 
@@ -1107,6 +1118,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
                   << " transcode=" << streamConfig.transcodeResolution
                   << "@" << streamConfig.transcodeVideoBitrate
                   << " relay=" << pipelineConfig.inputUri
+                  << " fifo=" << tvs::protocols::transcodedFifoRelayPath(streamConfig)
                   << " outputs=" << buildPipelineDescription(streamConfig) << std::endl;
     }
 
@@ -1117,6 +1129,9 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         if (state->gstTranscoder) {
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
+        }
+        if (usingTranscodeRelay) {
+            tvs::protocols::removeFifoRelay(streamConfig);
         }
         return false;
     }
@@ -1193,6 +1208,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         if (state->gstTranscoder) {
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
+            tvs::protocols::removeFifoRelay(streamConfig);
         }
         if (state->pipeline) {
             gst_element_set_state(state->pipeline, GST_STATE_NULL);
@@ -1212,7 +1228,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         "🟢",
         telegramText(configManager, "Поток запущен", "Stream started"),
         (usingTranscodeRelay
-            ? telegramText(configManager, "GStreamer-транскодер через внутренний UDP relay", "GStreamer transcoder through internal UDP relay")
+            ? telegramText(configManager, "GStreamer-транскодер через внутренний FIFO relay", "GStreamer transcoder through internal FIFO relay")
             : telegramText(configManager, "Источник: основной", "Source: primary")) + "\nURL: " + streamConfig.inputUri);
     return true;
 }
@@ -1260,6 +1276,7 @@ bool StreamManager::stopStream(const std::string& id) {
     if (state.gstTranscoder) {
         state.gstTranscoder->stop();
         state.gstTranscoder.reset();
+        tvs::protocols::removeFifoRelay(stoppedConfig);
     }
     if (state.bus) {
         gst_object_unref(state.bus);
@@ -1315,6 +1332,7 @@ void StreamManager::stopAll() {
         if (state.gstTranscoder) {
             state.gstTranscoder->stop();
             state.gstTranscoder.reset();
+            tvs::protocols::removeFifoRelay(state.config);
         }
         if (state.bus) {
             gst_object_unref(state.bus);
@@ -1370,6 +1388,8 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     std::ostringstream desc;
     desc << "manual-pipeline"
          << " input=" << cfg.inputUri
+         << " input_proto=" << tvs::stream_protocols::inputKindName(tvs::stream_protocols::inputKind(cfg))
+         << " output_proto=" << tvs::stream_protocols::outputKindName(tvs::stream_protocols::outputKind(cfg))
          << " input_mode=" << cfg.inputMode
          << " input_iface=" << (inputInterface.empty() ? "auto" : inputInterface)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
@@ -2035,6 +2055,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     const StreamConfig& cfg = state->config;
     const std::string input = cfg.testPattern ? kTestPatternUri : cfg.inputUri;
     const std::string inputLower = toLower(input);
+    const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
 
     auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL) -> GstElement* {
         GstElement* queue = gst_element_factory_make("queue", name);
@@ -2045,11 +2066,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return queue;
     };
 
-    if (inputLower == "test://bars" || inputLower == "testsrc://bars" || inputLower == "bars://hd") {
+    if (tvs::stream_protocols::isTestPatternInput(inputProtocol)) {
         return createTestPatternChain(cfg, pipeline, terminalElement);
     }
 
-    if (isRtmpUri(inputLower)) {
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Rtmp) {
         if (!hasElementFactory("rtmpsrc") || !hasElementFactory("flvdemux") || !hasElementFactory("mpegtsmux")) {
             std::cerr << "missing RTMP input elements: rtmpsrc, flvdemux or mpegtsmux" << std::endl;
             return nullptr;
@@ -2093,7 +2114,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (inputLower.rfind("rtsp://", 0) == 0 || inputLower.rfind("rtsps://", 0) == 0) {
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Rtsp) {
         if (!hasElementFactory("rtspsrc") || !hasElementFactory("mpegtsmux")) {
             std::cerr << "missing RTSP input elements: rtspsrc or mpegtsmux" << std::endl;
             return nullptr;
@@ -2135,7 +2156,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (inputLower.rfind("srt://", 0) == 0) {
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Srt) {
         std::string mode = toLower(cfg.inputMode);
         const std::string inputInterface = configuredInputInterfaceAddress(cfg);
         const char* factory = (mode == "listener") ? "srtsrc" : "srtclientsrc";
@@ -2173,7 +2194,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (isHlsUri(inputLower, cfg.inputMode)) {
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls) {
         if (!hasElementFactory("souphttpsrc")) {
             std::cerr << missingElementStatus("souphttpsrc") << std::endl;
             return nullptr;
@@ -2229,7 +2250,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (inputLower.rfind("http://", 0) == 0 || inputLower.rfind("https://", 0) == 0) {
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http) {
         if (!hasElementFactory("souphttpsrc")) {
             std::cerr << missingElementStatus("souphttpsrc") << std::endl;
             return nullptr;
@@ -2661,6 +2682,11 @@ bool StreamManager::buildRtmpOutputPipeline(
 
 GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName) {
     const std::string type = outputType(cfg);
+    const auto outputProtocol = tvs::stream_protocols::outputKind(cfg);
+    if (outputProtocol == tvs::stream_protocols::OutputProtocolKind::Unknown) {
+        std::cerr << "unknown output protocol module for type: " << type << std::endl;
+        return nullptr;
+    }
     if (isUdpOutputType(type)) {
         std::string error;
         GstElement* sink = udpCbrOutputEnabled(cfg)
@@ -3236,6 +3262,23 @@ void StreamManager::monitorBus(const std::string& id) {
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
+        if (state->gstTranscoder) {
+            if (!state->gstTranscoder->isRunning()) {
+                state->statusMessage = "error: gstreamer transcoder exited";
+                state->active = false;
+                notifyStreamState(
+                    state->config,
+                    "🔴",
+                    telegramText(configManager, "Ошибка GStreamer-транскодера", "GStreamer transcoder error"),
+                    telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
+                return;
+            }
+            // The user-visible source is the original URL, but the in-process pipeline now reads
+            // from the internal FIFO relay. Treat a live transcoder process as input activity so
+            // the failover watchdog does not mark valid transcoded streams as "no input signal"
+            // while the FIFO reader and writer are synchronizing.
+            state->lastInputActivity = now;
+        }
         const uint64_t currentInputBytes = state->inputBytes.load();
         if (currentInputBytes != state->lastInputBytesSeen) {
             state->lastInputBytesSeen = currentInputBytes;

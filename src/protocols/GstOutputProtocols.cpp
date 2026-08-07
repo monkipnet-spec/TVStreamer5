@@ -1,6 +1,7 @@
 #include "protocols/GstOutputProtocols.h"
 
 #include "protocols/GstProtocolTypes.h"
+#include "protocols/outputs/GstFifoOutputProtocol.h"
 #include "protocols/outputs/GstHlsOutputProtocol.h"
 #include "protocols/outputs/GstHttpOutputProtocol.h"
 #include "protocols/outputs/GstRtmpOutputProtocol.h"
@@ -11,7 +12,7 @@
 namespace tvs::protocols {
 
 std::vector<std::string> requiredOutputElements() {
-    return {"mpegtsmux", "udpsink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
+    return {"mpegtsmux", "udpsink", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
 }
 
 std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
@@ -19,6 +20,8 @@ std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
         case OutputKind::UdpCbr:
         case OutputKind::UdpVbr:
             return {"mpegtsmux", "udpsink"};
+        case OutputKind::FifoRelay:
+            return {"mpegtsmux", "filesink"};
         case OutputKind::Srt:
             return {"mpegtsmux", "srtsink"};
         case OutputKind::Http:
@@ -48,6 +51,8 @@ bool appendOutputMuxAndSink(
         case OutputKind::UdpCbr:
         case OutputKind::UdpVbr:
             return outputs::appendUdpSink(args, cfg, spec);
+        case OutputKind::FifoRelay:
+            return outputs::appendFifoSink(args, cfg, spec);
         case OutputKind::Srt:
             return outputs::appendSrtSink(args, cfg, spec);
         case OutputKind::Http:

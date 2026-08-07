@@ -903,3 +903,12 @@ input protocol -> clean GStreamer transcode -> local UDP TS relay -> TVStreamer5
 
 Non-transcoded streams are not transcoded or rerouted; their existing protocol
 behavior is preserved.
+
+### v48 - FIFO transcode relay and stream protocol modules
+- Replaced the internal UDP transcode relay from v47 with a local FIFO MPEG-TS relay under `/tmp/tvstreamer5-relay/`.
+- The GStreamer transcoder now writes the completed MPEG-TS stream to a FIFO through `filesink`, and the normal TVStreamer5 pipeline reads the same FIFO through the existing file/TS input path.
+- This avoids the localhost UDP relay startup race that could mark transcoded streams as `no input signal`.
+- Non-transcoded streams are unchanged.
+- Transcoded streams still reuse the stable normal output path for UDP, RTP, HTTP, HLS, SRT, RTMP/YouTube and RTSP after the FIFO relay.
+- Added stream input/output protocol classification modules for the remaining normal pipeline protocols so protocol routing is no longer hidden only inside `StreamManager` conditionals.
+- Added a dedicated FIFO relay output protocol module for the transcoder process.

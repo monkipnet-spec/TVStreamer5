@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <cerrno>
+#include <cstring>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace tvs::protocols {
 
@@ -31,6 +35,7 @@ OutputKind outputKind(const StreamConfig& cfg) {
     if (type == "rtsp") return OutputKind::Rtsp;
     if (type == "rtmp") return OutputKind::Rtmp;
     if (type == "youtube") return OutputKind::Youtube;
+    if (type == "fifo" || type == "filepipe" || type == "pipe") return OutputKind::FifoRelay;
     return OutputKind::Unknown;
 }
 
@@ -40,7 +45,8 @@ bool isUdpOutput(OutputKind kind) {
 
 bool isTsOutput(OutputKind kind) {
     return kind == OutputKind::UdpCbr || kind == OutputKind::UdpVbr ||
-           kind == OutputKind::Srt || kind == OutputKind::Http || kind == OutputKind::Hls;
+           kind == OutputKind::Srt || kind == OutputKind::Http || kind == OutputKind::Hls ||
+           kind == OutputKind::FifoRelay;
 }
 
 bool isFlvOutput(OutputKind kind) {
@@ -141,6 +147,61 @@ uint16_t transcodedHttpInternalPort(const StreamConfig& cfg) {
     const std::string key = cfg.id.empty() ? cfg.name : cfg.id;
     const size_t hash = std::hash<std::string>{}(key);
     return static_cast<uint16_t>(20000 + (hash % 20000));
+}
+
+std::string transcodedFifoRelayPath(const StreamConfig& cfg) {
+    std::string key = cfg.id.empty() ? cfg.name : cfg.id;
+    if (key.empty()) key = "stream";
+    std::string safe;
+    safe.reserve(key.size());
+    for (unsigned char ch : key) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+            safe.push_back(static_cast<char>(ch));
+        } else {
+            safe.push_back('_');
+        }
+    }
+    return "/tmp/tvstreamer5-relay/" + safe + ".ts";
+}
+
+bool prepareFifoRelay(const StreamConfig& cfg, std::string& error) {
+    const std::string path = transcodedFifoRelayPath(cfg);
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    if (ec) {
+        error = "failed to create relay directory: " + ec.message();
+        return false;
+    }
+
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0) {
+        if (!S_ISFIFO(st.st_mode)) {
+            if (::unlink(path.c_str()) != 0) {
+                error = std::string("failed to replace stale relay file ") + path + ": " + std::strerror(errno);
+                return false;
+            }
+        } else {
+            return true;
+        }
+    } else if (errno != ENOENT) {
+        error = std::string("failed to inspect relay fifo ") + path + ": " + std::strerror(errno);
+        return false;
+    }
+
+    if (::mkfifo(path.c_str(), 0666) != 0 && errno != EEXIST) {
+        error = std::string("failed to create relay fifo ") + path + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+void removeFifoRelay(const StreamConfig& cfg) {
+    const std::string path = transcodedFifoRelayPath(cfg);
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0 && S_ISFIFO(st.st_mode)) {
+        ::unlink(path.c_str());
+    }
 }
 
 } // namespace tvs::protocols

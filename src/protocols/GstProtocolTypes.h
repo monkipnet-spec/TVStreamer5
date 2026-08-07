@@ -17,6 +17,7 @@ enum class OutputKind {
     Rtsp,
     Rtmp,
     Youtube,
+    FifoRelay,
     Unknown
 };
 
@@ -46,5 +47,8 @@ std::string hlsDirectory(const StreamConfig& cfg);
 std::string rtmpOutputLocation(const StreamConfig& cfg);
 std::string rtspOutputLocation(const StreamConfig& cfg);
 uint16_t transcodedHttpInternalPort(const StreamConfig& cfg);
+std::string transcodedFifoRelayPath(const StreamConfig& cfg);
+bool prepareFifoRelay(const StreamConfig& cfg, std::string& error);
+void removeFifoRelay(const StreamConfig& cfg);
 
 } // namespace tvs::protocols

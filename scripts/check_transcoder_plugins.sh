@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# v47: the clean GStreamer transcoder always outputs to an internal localhost
-# UDP MPEG-TS relay. TVStreamer5 then uses its existing passthrough protocol
+# v48: the clean GStreamer transcoder always outputs to an internal
+# FIFO MPEG-TS relay. TVStreamer5 then uses its existing passthrough protocol
 # modules for HTTP, HLS, SRT, UDP/RTP, RTMP/YouTube and RTSP. Therefore the
-# transcoder hard requirement is only the decode/encode/mux/UDP-relay chain.
+# transcoder hard requirement is only the decode/encode/mux/FIFO-relay chain.
 required=(
   gst-launch-1.0
   uridecodebin
@@ -20,7 +20,7 @@ required=(
   audiorate
   aacparse
   mpegtsmux
-  udpsink
+  filesink
 )
 
 optional_protocols=(
@@ -38,6 +38,7 @@ optional_protocols=(
   flvmux
   rtmpsink
   rtpmp2tdepay
+  rtpmp2tpay
 )
 
 missing=()
@@ -83,7 +84,7 @@ echo "  Launcher: $(command -v gst-launch-1.0)"
 echo "  Video encoder: x264enc"
 echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
-echo "  Relay output: mpegtsmux + udpsink"
+echo "  Relay output: mpegtsmux + filesink FIFO"
 echo
 echo "Optional protocol elements used by passthrough input/output modules:"
 for element in "${optional_protocols[@]}"; do
