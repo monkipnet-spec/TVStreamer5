@@ -1,47 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Installing dependencies for TVStreamer5..."
+# TVStreamer5 Release 2 host build/runtime dependencies for Ubuntu/Debian.
+# This script intentionally installs only libraries used by the current CMake
+# target plus GStreamer runtime plugins used by the protocol/transcoder modules.
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo "This installer requires an apt-based Ubuntu/Debian system." >&2
+    exit 1
+fi
 
 SUDO=()
 if [[ "${EUID}" -ne 0 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Run as root or install sudo first." >&2
+        exit 1
+    fi
     SUDO=(sudo)
 fi
 
 APT_GET=("${SUDO[@]}" apt-get)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "Installing TVStreamer5 Release 2 dependencies..."
 
 "${APT_GET[@]}" update
-"${APT_GET[@]}" install -y \
+"${APT_GET[@]}" install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
-    libgstreamer-plugins-good1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
+    libcurl4-openssl-dev \
+    libjsoncpp-dev \
+    libboost-system-dev \
+    libboost-thread-dev \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
-    libgstrtspserver-1.0-dev \
-    libcurl4-openssl-dev \
-    libjsoncpp-dev \
-    libboost-system-dev \
-    libboost-thread-dev \
-    libboost-program-options-dev \
-    libboost-filesystem-dev \
-    libboost-dev \
-    libssl-dev \
-    git \
-    wget \
+    gstreamer1.0-rtsp \
     ca-certificates
 
 "${APT_GET[@]}" clean
 
-echo "Dependencies installed."
-if [[ -x "$(dirname "$0")/scripts/check_transcoder_plugins.sh" ]]; then
-    "$(dirname "$0")/scripts/check_transcoder_plugins.sh" || true
+if [[ -x "${ROOT_DIR}/scripts/check_transcoder_plugins.sh" ]]; then
+    "${ROOT_DIR}/scripts/check_transcoder_plugins.sh"
 fi
-echo "Build with: cmake -S . -B build && cmake --build build --parallel"
+
+echo "Dependencies installed."
+echo "Build with: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel"

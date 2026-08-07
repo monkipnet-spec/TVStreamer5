@@ -1,5 +1,11 @@
 build/
 .git/
 .vscode/
+docs/
+backup-files/
 *.log
+*.zip
+*.patch
+*.apk
 tvstreamer5-config.json
+tvstreamer5-subscribers.json

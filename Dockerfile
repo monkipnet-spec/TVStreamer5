@@ -2,9 +2,9 @@ FROM ubuntu:24.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Build dependencies match the libraries requested by CMakeLists.txt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    ca-certificates \
     cmake \
     pkg-config \
     libboost-system-dev \
@@ -12,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4-openssl-dev \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
-    libgstreamer-plugins-good1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
     libjsoncpp-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -27,11 +26,13 @@ FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Ubuntu 24.04 uses the time64 curl runtime package (libcurl4t64).
+# gstreamer1.0-rtsp is required for rtspclientsink used by RTSP push output.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libboost-system1.83.0 \
     libboost-thread1.83.0 \
-    libcurl4 \
+    libcurl4t64 \
     libjsoncpp25 \
     libgstreamer1.0-0 \
     gstreamer1.0-tools \
@@ -40,11 +41,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
+    gstreamer1.0-rtsp \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/build/TVStreamer /app/TVStreamer
 
 WORKDIR /data
 EXPOSE 9000/tcp
-
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/app/TVStreamer"]
