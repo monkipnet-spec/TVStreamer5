@@ -882,3 +882,24 @@ and proxies that request to the internal transcoder relay. This fixes the previo
 The output queues for HTTP, HLS, SRT and RTMP/YouTube are leaky downstream queues, so a slow or missing client cannot freeze the video encoder. UDP keeps the normal paced MPEG-TS path.
 
 RTSP output is implemented as RTSP push through `rtspclientsink`. It requires an external RTSP server target. RTSP server/listener mode is intentionally not exposed as a fake TCP stream.
+
+### v47 — stable transcoded protocol relay
+
+Transcoded streams now use the clean GStreamer transcoder only to produce a local
+MPEG-TS relay on `udp://127.0.0.1:<internal-port>`. TVStreamer5 then reads that
+relay with the same passthrough pipeline used by non-transcoded streams and sends
+it through the selected output protocol modules.
+
+This keeps the stable non-transcoded HTTP, HLS, SRT, UDP, RTP, RTMP/YouTube and
+RTSP protocol behavior unchanged, while avoiding the previous problems caused by
+making the external `gst-launch-1.0` process talk directly to each client-facing
+protocol.
+
+The practical flow is:
+
+```text
+input protocol -> clean GStreamer transcode -> local UDP TS relay -> TVStreamer5 passthrough output modules -> selected protocol
+```
+
+Non-transcoded streams are not transcoded or rerouted; their existing protocol
+behavior is preserved.

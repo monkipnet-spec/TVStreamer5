@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# v47: the clean GStreamer transcoder always outputs to an internal localhost
+# UDP MPEG-TS relay. TVStreamer5 then uses its existing passthrough protocol
+# modules for HTTP, HLS, SRT, UDP/RTP, RTMP/YouTube and RTSP. Therefore the
+# transcoder hard requirement is only the decode/encode/mux/UDP-relay chain.
 required=(
   gst-launch-1.0
   uridecodebin
@@ -17,12 +21,23 @@ required=(
   aacparse
   mpegtsmux
   udpsink
+)
+
+optional_protocols=(
+  srtsrc
+  srtclientsrc
   srtsink
-  tcpserversink
+  souphttpsrc
+  hlsdemux
   hlssink
+  multifdsink
+  rtspsrc
+  rtspclientsink
+  rtmpsrc
+  flvdemux
   flvmux
   rtmpsink
-  rtspclientsink
+  rtpmp2tdepay
 )
 
 missing=()
@@ -57,22 +72,24 @@ if [[ -z "$aac_encoder" ]]; then
 fi
 
 if ((${#missing[@]} > 0)); then
-  echo "GStreamer transcoding is unavailable. Missing elements/tools:"
+  echo "GStreamer transcoding relay is unavailable. Missing required elements/tools:"
   printf '  - %s\n' "${missing[@]}"
   echo "Install GStreamer plugins base/good/bad/ugly and gstreamer1.0-libav."
   exit 1
 fi
 
-echo "GStreamer transcoding dependencies are available."
+echo "GStreamer transcoding relay dependencies are available."
 echo "  Launcher: $(command -v gst-launch-1.0)"
 echo "  Video encoder: x264enc"
 echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
-echo "  Deinterlace: deinterlace"
-echo "  Audio pacing: audiorate"
-echo "  UDP MPEG-TS mux/output: mpegtsmux + udpsink"
-echo "  SRT output: srtsink"
-echo "  HTTP raw TS output: tcpserversink"
-echo "  HLS output: hlssink"
-echo "  RTMP output: flvmux + rtmpsink"
-echo "  RTSP push output: rtspclientsink"
+echo "  Relay output: mpegtsmux + udpsink"
+echo
+echo "Optional protocol elements used by passthrough input/output modules:"
+for element in "${optional_protocols[@]}"; do
+  if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+    printf '  [ok]      %s\n' "$element"
+  else
+    printf '  [missing] %s\n' "$element"
+  fi
+done
