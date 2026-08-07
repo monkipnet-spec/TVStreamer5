@@ -174,15 +174,12 @@ uridecodebin
  -> raw video
  -> videoconvert
  -> deinterlace method=yadif
- -> videoscale method=lanczos (selected output resolution, preserve display aspect with borders when required)
+ -> videoscale method=lanczos
  -> videorate
- -> 25 fps progressive I420, SAR/PAR 1:1 (square pixels)
- -> x264enc superfast / zerolatency with VUI enabled
+ -> 25 fps progressive I420
+ -> x264enc superfast / zerolatency
  -> h264parse
 ```
-
-
-The transcoder always normalizes the scaled video to **SAR/PAR 1:1** before H.264 encoding. The selected output width/height therefore use square pixels, and `x264enc` is instructed to emit VUI information. `videoscale add-borders=true` preserves the source display aspect ratio when the selected resolution has a different shape, adding borders instead of stretching the picture.
 
 Audio is normalized to 48 kHz stereo before encoding. AAC is the stable/default transcoder path; MP3 is used when explicitly configured and an MP3 encoder is available. In the clean transcoder path, a UI/config value intended as audio `copy` is currently handled as AAC re-encode rather than bit-exact passthrough.
 
@@ -851,3 +848,17 @@ docker exec tvstreamer5 gst-inspect-1.0 udpsink
 ```
 
 Dockerfile также выполняет обязательную проверку этих элементов во время `docker build`. Если один из критических GStreamer-плагинов отсутствует, новый образ теперь не будет собран успешно.
+
+### Web UI polling and external transcoder sockets
+
+Release 2 updates live dashboard values without rebuilding every stream card on every poll. The `/api/state` and `/api/system-metrics` requests run as independent sequential polling loops: the next request is scheduled only after the previous request finishes. This avoids overlapping HTTP requests behind reverse proxies such as Nginx/HestiaCP and prevents visible dashboard flicker on busy servers.
+
+A full stream-card render is now performed only when the stream configuration, stream order or UI language changes. Runtime values such as Online/Offline, backup state, active input, input/output bitrate and status are updated in place.
+
+External `gst-launch-1.0` transcoders must not inherit TVStreamer5 HTTP, metrics or listener sockets. TVStreamer5 marks non-standard file descriptors `FD_CLOEXEC` before starting an external GStreamer process. Verify after starting a transcoded stream:
+
+```bash
+ss -lntp | grep -E ':9000|:9100'
+```
+
+The listening ports should belong to `TVStreamer` only; `gst-launch-1.0` should not appear as an owner of those sockets.

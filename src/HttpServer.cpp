@@ -1604,7 +1604,7 @@ function toggleLanguage() {
   language = language === 'en' ? 'ru' : 'en';
   localStorage.setItem('tvstreamer-language', language);
   applyLanguage();
-  render();
+  render(true);
   saveLanguagePreference();
 }
 function closeSystemMenu() {
@@ -1615,7 +1615,11 @@ document.addEventListener('click', event => {
   if (menu && !menu.contains(event.target)) closeSystemMenu();
 });
 let state = {};
-let networkRefreshTimer = null;
+let statePollTimer = null;
+let metricsPollTimer = null;
+let stateFetchPromise = null;
+let metricsFetchPromise = null;
+let lastTileStructureSignature = '';
 let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
 function saveLanguagePreference(sourceState=state) {
@@ -1635,21 +1639,36 @@ function saveLanguagePreference(sourceState=state) {
   }).catch(()=>{});
 }
 function fetchState() {
-  Promise.all([fetch('/api/state', {cache:'no-store'}).then(r=>r.json()), fetch('/api/system-metrics', {cache:'no-store'}).then(r=>r.json())])
-    .then(([data, metrics])=>{
+  if (stateFetchPromise) return stateFetchPromise;
+  stateFetchPromise = fetch('/api/state', {cache:'no-store'})
+    .then(response => {
+      if (!response.ok) throw new Error(`state HTTP ${response.status}`);
+      return response.json();
+    })
+    .then(data => {
       const storedLanguage = localStorage.getItem('tvstreamer-language');
       const serverLanguage = normalizeLanguage(data.language);
       language = normalizeLanguage(storedLanguage || language);
       localStorage.setItem('tvstreamer-language', language);
       data.language = language;
-      state=data;
-      state.system_metrics=metrics;
+      state = data;
       applyLanguage();
-      render();
-      updateSystemLoad(metrics);
+      render(false);
       refreshSubscriberSessions();
       if (serverLanguage !== language) saveLanguagePreference(data);
-    });
+      return data;
+    })
+    .catch(error => {
+      console.warn('TVStreamer5 state refresh failed:', error);
+      return null;
+    })
+    .finally(() => { stateFetchPromise = null; });
+  return stateFetchPromise;
+}
+async function statePollLoop() {
+  await fetchState();
+  clearTimeout(statePollTimer);
+  statePollTimer = setTimeout(statePollLoop, 2000);
 }
 function updateSystemLoad(metrics) {
   document.getElementById('cpuLoad').textContent = `${Number(metrics.cpu_percent || 0).toFixed(1)}%`;
@@ -1662,7 +1681,28 @@ function updateSystemLoad(metrics) {
   `).join('') : `<tr><td colspan="3" class="network-empty">${t('interfacesNotFound')}</td></tr>`;
 }
 function fetchSystemMetrics() {
-  fetch('/api/system-metrics', {cache:'no-store'}).then(r=>r.json()).then(updateSystemLoad).catch(()=>{});
+  if (metricsFetchPromise) return metricsFetchPromise;
+  metricsFetchPromise = fetch('/api/system-metrics', {cache:'no-store'})
+    .then(response => {
+      if (!response.ok) throw new Error(`metrics HTTP ${response.status}`);
+      return response.json();
+    })
+    .then(metrics => {
+      state.system_metrics = metrics;
+      updateSystemLoad(metrics);
+      return metrics;
+    })
+    .catch(error => {
+      console.warn('TVStreamer5 metrics refresh failed:', error);
+      return null;
+    })
+    .finally(() => { metricsFetchPromise = null; });
+  return metricsFetchPromise;
+}
+async function metricsPollLoop() {
+  await fetchSystemMetrics();
+  clearTimeout(metricsPollTimer);
+  metricsPollTimer = setTimeout(metricsPollLoop, 3000);
 }
 function downloadVlcPlaylist() {
   const entries = (state.streams || [])
@@ -1705,8 +1745,6 @@ function openModal(html) {
 function closeModal() {
   subscribersModalOpen = false;
   stopQualityAutoRefresh();
-  clearInterval(networkRefreshTimer);
-  networkRefreshTimer = null;
   document.getElementById('modal').classList.remove('active', 'quality-open', 'stream-open');
 }
 function normalizedOutputType(stream) {
@@ -1748,12 +1786,82 @@ function streamBitrateMode(stream) {
   if (type === 'udp-vbr') return 'VBR';
   return stream.cbr ? 'CBR' : 'VBR';
 }
-function render() {
-  document.getElementById('totalCount').textContent = state.stream_count;
-  document.getElementById('activeCount').textContent = state.active_count;
+function streamTileStructureSignature(stream) {
+  return {
+    id: stream.id,
+    name: stream.name,
+    input_uri: stream.input_uri,
+    backup_input_uri: stream.backup_input_uri,
+    backup_input_type: stream.backup_input_type,
+    backup_file_loop: stream.backup_file_loop,
+    service_id: stream.service_id,
+    cbr: stream.cbr,
+    outputs: outputConfigsForStream(stream),
+    links: streamLinks(stream)
+  };
+}
+function tilesStructureSignature() {
+  return JSON.stringify({
+    language,
+    streams: (state.streams || []).map(streamTileStructureSignature)
+  });
+}
+function updateStreamTile(tile, stream) {
+  if (!tile || !stream) return;
+  tile.classList.toggle('active', !!stream.active);
+
+  const statusPill = tile.querySelector('[data-role="status-pill"]');
+  if (statusPill) {
+    statusPill.className = `status-pill ${stream.active ? 'active' : 'stopped'}`;
+    statusPill.textContent = stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline';
+  }
+
+  const activeInput = tile.querySelector('[data-role="active-input"]');
+  if (activeInput) {
+    activeInput.textContent = `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}`;
+  }
+
+  const bitrateIn = tile.querySelector('[data-role="bitrate-in"]');
+  if (bitrateIn) bitrateIn.textContent = stream.bitrate_in_kbps ? `${stream.bitrate_in_kbps} kbps` : '—';
+
+  const bitrateOut = tile.querySelector('[data-role="bitrate-out"]');
+  if (bitrateOut) bitrateOut.textContent = stream.bitrate_out_kbps ? `${stream.bitrate_out_kbps} kbps` : '—';
+
+  const status = tile.querySelector('[data-role="stream-status"]');
+  if (status) status.textContent = stream.status || '';
+
+  const toggleButton = tile.querySelector('[data-role="stream-toggle"]');
+  if (toggleButton) {
+    toggleButton.className = stream.active ? 'stop-button' : 'start-button';
+    toggleButton.textContent = stream.active ? t('stop') : t('start');
+    toggleButton.onclick = () => toggleStream(stream.id, !!stream.active);
+  }
+}
+function updateLiveTiles() {
+  const totalCount = document.getElementById('totalCount');
+  const activeCount = document.getElementById('activeCount');
+  if (totalCount) totalCount.textContent = state.stream_count ?? (state.streams || []).length;
+  if (activeCount) activeCount.textContent = state.active_count ?? (state.streams || []).filter(stream => stream.active).length;
+
   const tiles = document.getElementById('tiles');
+  if (!tiles) return;
+  const tileElements = Array.from(tiles.querySelectorAll('.tile[data-stream-id]'));
+  const byId = new Map(tileElements.map(tile => [tile.dataset.streamId, tile]));
+  (state.streams || []).forEach(stream => updateStreamTile(byId.get(String(stream.id)), stream));
+}
+function render(force=false) {
+  const tiles = document.getElementById('tiles');
+  if (!tiles) return;
+
+  const signature = tilesStructureSignature();
+  const streams = state.streams || [];
+  if (!force && signature === lastTileStructureSignature && tiles.children.length === streams.length) {
+    updateLiveTiles();
+    return;
+  }
+
   tiles.innerHTML = '';
-  state.streams.forEach(stream => {
+  streams.forEach(stream => {
     const outputs = outputConfigsForStream(stream);
     const outputType = normalizedOutputType(outputs[0] || stream);
     const bitrateMode = streamBitrateMode(stream);
@@ -1761,33 +1869,37 @@ function render() {
     const primaryLink = links[0]?.url || stream.vlc_link || `${stream.output_host || ''}:${stream.output_port || ''}`;
     const tile = document.createElement('div');
     tile.className = 'tile' + (stream.active ? ' active' : '');
+    tile.dataset.streamId = String(stream.id);
     tile.innerHTML = `
       <div class="top">
         <div>
           <div class="title">${stream.name || stream.id}</div>
-          <div class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
+          <div data-role="status-pill" class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
         </div>
         <div class="badge">${outputs.length > 1 ? outputBadgeText(stream) : bitrateMode}</div>
       </div>
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
         <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
-        <div class="info-row"><strong>${t('activeInput')}</strong><span>${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
-        <div class="info-row"><strong>${t('bitrateIn')}</strong><span>${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>${t('bitrateOut')}</strong><span>${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>${t('status')}</strong><span>${stream.status}</span></div>
+        <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
+        <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
+        <div class="info-row"><strong>${t('status')}</strong><span data-role="stream-status">${stream.status || ''}</span></div>
       </div>
       <div class="controls">
-        <button class="${stream.active ? 'stop-button' : 'start-button'}" onclick="toggleStream('${stream.id}', ${stream.active})">${stream.active ? t('stop') : t('start')}</button>
+        <button data-role="stream-toggle" class="${stream.active ? 'stop-button' : 'start-button'}">${stream.active ? t('stop') : t('start')}</button>
         <button onclick="editStream('${stream.id}')">${t('edit')}</button>
         <button class="quality-button" onclick="openQualityModal('${stream.id}')">${t('chart')}</button>
         <button class="copy-button" onclick="copyStreamLinks('${stream.id}', this)">${links.length > 1 ? 'URLs' : 'URL'}</button>
       </div>`;
     tiles.appendChild(tile);
+    updateStreamTile(tile, stream);
   });
+  lastTileStructureSignature = signature;
+  updateLiveTiles();
 }
 function toggleStream(id, active) {
   const url = active ? '/api/stop-stream' : '/api/start-stream';
@@ -1826,12 +1938,8 @@ function openNetworkModal() {
   `;
   document.getElementById('modal').classList.add('active');
   fetchSystemMetrics();
-  clearInterval(networkRefreshTimer);
-  networkRefreshTimer = setInterval(fetchSystemMetrics, 2000);
 }
 function closeNetworkModal() {
-  clearInterval(networkRefreshTimer);
-  networkRefreshTimer = null;
   closeModal();
 }
 function openSubscribersModal() {
@@ -2922,10 +3030,14 @@ function loadInterfaces() {
 }
 window.onload = () => {
   applyLanguage();
-  fetchState();
   loadInterfaces();
-  setInterval(fetchState, 2000);
+  statePollLoop();
+  metricsPollLoop();
 };
+window.addEventListener('beforeunload', () => {
+  clearTimeout(statePollTimer);
+  clearTimeout(metricsPollTimer);
+});
 </script>
 </body>
 </html>
