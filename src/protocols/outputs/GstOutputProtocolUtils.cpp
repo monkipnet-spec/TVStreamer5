@@ -50,12 +50,18 @@ void appendMpegTsMux(std::vector<std::string>& args, const StreamConfig& cfg) {
         "mpegtsmux",
         "name=mux",
         "alignment=7",
-        "bitrate=" + std::to_string(muxBitrate(cfg)),
         "pat-interval=9000",
         "pmt-interval=9000",
         "pcr-interval=1800",
         "si-interval=9000"
     });
+
+    // CBR null-packet padding is only useful for UDP-CBR.  Applying a fixed
+    // muxrate to SRT/HTTP/HLS/RTP/UDP-VBR makes file/TCP/SRT delivery burstier
+    // and can create stalls on receivers after transcoding.
+    if (outputKind(cfg) == OutputKind::UdpCbr) {
+        args.push_back("bitrate=" + std::to_string(muxBitrate(cfg)));
+    }
 
     // Remap belongs to the MPEG-TS mux, not to the network sink.  Requesting
     // sink_<PID> pads fixes the elementary PIDs.  prog-map then places both

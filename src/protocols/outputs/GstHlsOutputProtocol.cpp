@@ -39,12 +39,15 @@ void appendHlsMux(std::vector<std::string>& args, const StreamConfig& cfg, GstOu
         "mpegtsmux",
         "name=hls_mux",
         "alignment=7",
-        "bitrate=" + std::to_string(muxBitrate(cfg)),
         "pat-interval=9000",
         "pmt-interval=9000",
         "pcr-interval=1800",
         "si-interval=9000"
     });
+
+    // HLS should segment the encoded A/V elementary streams as they are
+    // produced.  Do not force UDP-style CBR padding into every segment; it
+    // increases disk/TCP bursts and was seen as periodic HLS stalls.
 
     if (cfg.remapEnabled) {
         // mpegtsmux uses the numeric suffix of a requested sink_<PID> pad as

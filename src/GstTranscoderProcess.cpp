@@ -61,39 +61,6 @@ void markOpenDescriptorsCloseOnExec() {
     }
 }
 
-void appendAvailableStderr(int fd, std::string& output) {
-    if (fd < 0) return;
-    char buffer[1024];
-    for (;;) {
-        const ssize_t count = ::read(fd, buffer, sizeof(buffer));
-        if (count > 0) {
-            output.append(buffer, static_cast<size_t>(count));
-            if (output.size() > 8192) output.erase(0, output.size() - 8192);
-            continue;
-        }
-        if (count < 0 && errno == EINTR) continue;
-        break;
-    }
-}
-
-void relayChildStderr(int fd) {
-    if (fd < 0) return;
-    const int flags = ::fcntl(fd, F_GETFL);
-    if (flags >= 0) ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-    char buffer[1024];
-    for (;;) {
-        const ssize_t count = ::read(fd, buffer, sizeof(buffer));
-        if (count > 0) {
-            std::cerr.write(buffer, count);
-            std::cerr.flush();
-            continue;
-        }
-        if (count < 0 && errno == EINTR) continue;
-        break;
-    }
-    ::close(fd);
-}
-
 bool executableInPath(const std::string& name, std::string* path = nullptr) {
     const char* envPath = std::getenv("PATH");
     std::string paths = envPath ? envPath : "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -193,21 +160,8 @@ std::string scaledVideoCaps(int width, int height) {
 }
 
 bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& error) {
-    const auto kind = tvs::protocols::outputKind(outputConfig);
-    if (kind == tvs::protocols::OutputKind::Srt) {
-        if (outputConfig.outputPort <= 0 || outputConfig.outputPort > 65535) {
-            error = "invalid SRT port: " + std::to_string(outputConfig.outputPort);
-            return false;
-        }
-        if (tvs::protocols::srtOutputMode(outputConfig) == "caller" &&
-            (outputConfig.outputHost.empty() || outputConfig.outputHost == "0.0.0.0" || outputConfig.outputHost == "::")) {
-            error = "SRT caller requires a remote server address";
-            return false;
-        }
-    }
-
     std::vector<std::string> missing;
-    validateFactories(tvs::protocols::requiredElementsForOutput(kind), missing);
+    validateFactories(tvs::protocols::requiredElementsForOutput(tvs::protocols::outputKind(outputConfig)), missing);
     if (!missing.empty()) {
         std::ostringstream ss;
         ss << "missing output protocol elements for " << tvs::protocols::normalizedOutputType(outputConfig);
@@ -246,8 +200,8 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         property("byte-stream", flv ? "false" : "true"),
         "aud=true",
         "insert-vui=true",
-        "sliced-threads=false",
-        "vbv-buf-capacity=1500",
+        "sliced-threads=true",
+        "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
         "!", "h264parse", property("config-interval", flv ? "-1" : "1"),
         "!", flv
@@ -351,7 +305,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
         property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
         "key-int-max=25", "bframes=0",
         property("byte-stream", spec.container == ContainerKind::Flv ? "false" : "true"),
-        "aud=true", "insert-vui=true", "sliced-threads=false", "vbv-buf-capacity=1500",
+        "aud=true", "insert-vui=true", "sliced-threads=true", "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
         "!", "h264parse", property("config-interval", spec.container == ContainerKind::Flv ? "-1" : "1"),
         "!", spec.container == ContainerKind::Flv
@@ -428,34 +382,13 @@ bool GstTranscoderProcess::spawnProcess(
     // sockets cannot remain alive in the external transcoder process.
     markOpenDescriptorsCloseOnExec();
 
-    int stderrPipe[2] = {-1, -1};
-    const bool captureStderr = ::pipe(stderrPipe) == 0;
-    if (captureStderr) {
-        for (int fd : stderrPipe) {
-            const int fdFlags = ::fcntl(fd, F_GETFD);
-            if (fdFlags >= 0) ::fcntl(fd, F_SETFD, fdFlags | FD_CLOEXEC);
-        }
-        const int flags = ::fcntl(stderrPipe[0], F_GETFL);
-        if (flags >= 0) ::fcntl(stderrPipe[0], F_SETFL, flags | O_NONBLOCK);
-    }
-
     pid_t pid = ::fork();
     if (pid < 0) {
-        if (captureStderr) {
-            ::close(stderrPipe[0]);
-            ::close(stderrPipe[1]);
-        }
         error = std::string("fork failed: ") + std::strerror(errno);
         return false;
     }
 
     if (pid == 0) {
-        if (captureStderr) {
-            ::close(stderrPipe[0]);
-            if (::dup2(stderrPipe[1], STDERR_FILENO) < 0) std::_Exit(126);
-            if (stderrPipe[1] != STDERR_FILENO) ::close(stderrPipe[1]);
-        }
-
         int devNull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (devNull >= 0) {
             ::dup2(devNull, STDIN_FILENO);
@@ -472,28 +405,20 @@ bool GstTranscoderProcess::spawnProcess(
         std::_Exit(127);
     }
 
-    if (captureStderr) ::close(stderrPipe[1]);
     child.pid = pid;
     child.description = description;
 
-    // SRT bind/URI errors can be posted slightly later than a simple command-line
-    // parse failure. Give SRT a longer startup observation window and preserve
-    // gst-launch stderr so the HTTP API can show the actual startup error.
-    const int attempts = description.rfind("srt-", 0) == 0 ? 24 : 8;
-    std::string startupStderr;
-    for (int attempt = 0; attempt < attempts; ++attempt) {
+    // gst-launch may fail immediately (for example when an SRT listener cannot
+    // bind its local address/port).  Do not report such a child as a running
+    // transcoder and leave the UI waiting for a stream that can never appear.
+    for (int attempt = 0; attempt < 8; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (captureStderr) appendAvailableStderr(stderrPipe[0], startupStderr);
-
         int status = 0;
         const pid_t done = ::waitpid(pid, &status, WNOHANG);
-        if (done == 0) continue;
+        if (done == 0) {
+            continue;
+        }
         if (done == pid) {
-            if (captureStderr) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                appendAvailableStderr(stderrPipe[0], startupStderr);
-                ::close(stderrPipe[0]);
-            }
             std::ostringstream ss;
             ss << "GStreamer transcoder exited during startup for " << description;
             if (WIFEXITED(status)) {
@@ -503,27 +428,17 @@ bool GstTranscoderProcess::spawnProcess(
             } else {
                 ss << " (status=" << status << ")";
             }
-            if (!startupStderr.empty()) ss << "\n" << startupStderr;
             error = ss.str();
             child.pid = -1;
             return false;
         }
         if (done < 0 && errno != EINTR) {
-            if (captureStderr) ::close(stderrPipe[0]);
             error = std::string("waitpid failed after gst-launch start: ") + std::strerror(errno);
             child.pid = -1;
             return false;
         }
     }
 
-    if (captureStderr) {
-        appendAvailableStderr(stderrPipe[0], startupStderr);
-        if (!startupStderr.empty()) {
-            std::cerr << startupStderr;
-            if (startupStderr.back() != '\n') std::cerr << std::endl;
-        }
-        std::thread(relayChildStderr, stderrPipe[0]).detach();
-    }
     return true;
 }
 
