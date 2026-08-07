@@ -40,6 +40,9 @@ add_executable(TVStreamer
     src/StreamManager.cpp
     src/TranscoderModule.cpp
     src/GstTranscoderProcess.cpp
+    src/protocols/GstProtocolTypes.cpp
+    src/protocols/GstInputProtocols.cpp
+    src/protocols/GstOutputProtocols.cpp
     src/HttpServer.cpp
 )
 

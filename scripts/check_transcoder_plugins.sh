@@ -17,6 +17,11 @@ required=(
   aacparse
   mpegtsmux
   udpsink
+  srtsink
+  tcpserversink
+  hlssink
+  flvmux
+  rtmpsink
 )
 
 missing=()
@@ -65,3 +70,7 @@ echo "  MP3 encoder: ${mp3_encoder:-not available}"
 echo "  Deinterlace: deinterlace"
 echo "  Audio pacing: audiorate"
 echo "  UDP MPEG-TS mux/output: mpegtsmux + udpsink"
+echo "  SRT output: srtsink"
+echo "  HTTP raw TS output: tcpserversink"
+echo "  HLS output: hlssink"
+echo "  RTMP output: flvmux + rtmpsink"

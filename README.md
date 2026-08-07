@@ -848,3 +848,17 @@ interface-specific socket option is rejected.
 ### v42 — FFmpeg H.264 Annex-B output hardening
 
 The FFmpeg transcoder now prints the complete generated ffmpeg command to the service log before starting each child process. MPEG-TS outputs force H.264 codec extradata to be dumped at every key frame with `dump_extra=freq=keyframe`, keep x264 headers repeated, disable global-header-only output, and use zero mux delay/preload with immediate packet flushing. This is intended to make multicast joins self-describing when `ffprobe` or VLC join an already running UDP-CBR stream.
+
+### v45 protocol module split
+
+The clean GStreamer transcoder is now split into protocol modules:
+
+- `src/protocols/GstInputProtocols.*` builds input protocol handling for `uridecodebin` based inputs, including HLS URL normalization.
+- `src/protocols/GstOutputProtocols.*` builds output mux/sink chains for UDP/UDP-CBR/UDP-VBR, SRT, HLS, RTMP/YouTube and raw MPEG-TS TCP output for HTTP-mode streams.
+- `src/protocols/GstProtocolTypes.*` owns protocol normalization, per-output config expansion, bitrate safety limits and shared URL/path helpers.
+
+The transcoder core now only builds the common decode -> deinterlace -> scale -> encode video/audio chain. Protocol-specific sink details are isolated in output modules, so adding or repairing a protocol no longer changes the encoder path.
+
+For stable mode, audio is still re-encoded to AAC by default even when the UI says copy. This avoids the previous AAC passthrough caps/PMT/silent-audio failure mode.
+
+HTTP note: the external `gst-launch-1.0` transcoder cannot attach directly to TVStreamer5's in-process `multifdsink` HTTP session manager. For HTTP-mode transcoded output v45 starts a raw MPEG-TS TCP listener using `tcpserversink`. HLS remains available through TVStreamer5's `/hls/<id>/playlist.m3u8` file server.

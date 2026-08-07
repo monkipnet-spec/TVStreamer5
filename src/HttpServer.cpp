@@ -297,6 +297,12 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
             : "rtmp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
     }
     if (type == "http") {
+        if (cfg.transcodeEnabled) {
+            // External gst-launch based transcoder cannot attach to the in-process
+            // multifdsink HTTP session manager. Its HTTP-mode output is exposed
+            // as raw MPEG-TS over TCP. VLC can open this URL directly.
+            return "tcp://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort));
+        }
         return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/stream/" + cfg.id + ".ts";
     }
     if (type == "hls") {

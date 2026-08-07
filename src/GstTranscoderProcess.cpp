@@ -1,6 +1,9 @@
 #include "GstTranscoderProcess.h"
 
 #include "TranscoderModule.h"
+#include "protocols/GstInputProtocols.h"
+#include "protocols/GstOutputProtocols.h"
+#include "protocols/GstProtocolTypes.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -9,6 +12,7 @@
 #include <cctype>
 #include <csignal>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -19,6 +23,9 @@
 #include <gst/gst.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+using tvs::protocols::ContainerKind;
+using tvs::protocols::GstOutputSpec;
 
 namespace {
 
@@ -45,6 +52,17 @@ bool hasFactory(const char* name) {
     return true;
 }
 
+bool validateFactories(const std::vector<std::string>& names, std::vector<std::string>& missing) {
+    bool ok = true;
+    for (const auto& name : names) {
+        if (!hasFactory(name.c_str())) {
+            missing.push_back(name);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 std::string findAacEncoder() {
     for (const char* name : {"voaacenc", "fdkaacenc", "avenc_aac"}) {
         if (hasFactory(name)) return name;
@@ -59,72 +77,18 @@ std::string findMp3Encoder() {
     return {};
 }
 
-std::string normalizedOutputType(const StreamConfig& cfg) {
-    std::string type = toLower(cfg.outputType);
-    if (type == "udp_vbr" || type == "udpvbr") {
-        type = "udp-vbr";
-    } else if (type == "udp_cbr" || type == "udpcbr") {
-        type = "udp-cbr";
-    }
-    if (type == "udp") {
-        return cfg.cbr ? "udp-cbr" : "udp-vbr";
-    }
-    if (type != "udp-vbr" && type != "udp-cbr") {
-        return type;
-    }
-    return type;
-}
-
-bool isUdpType(const std::string& type) {
-    return type == "udp" || type == "udp-vbr" || type == "udp-cbr";
-}
-
-StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
-    StreamOutputConfig output;
-    output.outputType = cfg.outputType;
-    output.outputMode = cfg.outputMode;
-    output.outputHost = cfg.outputHost;
-    output.outputPort = cfg.outputPort;
-    return output;
-}
-
-StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig& output) {
-    StreamConfig cfg = base;
-    cfg.outputType = output.outputType;
-    cfg.outputMode = output.outputMode;
-    cfg.outputHost = output.outputHost;
-    cfg.outputPort = output.outputPort;
-    cfg.additionalOutputs.clear();
-    const std::string type = normalizedOutputType(cfg);
-    if (type == "udp-cbr") cfg.cbr = true;
-    if (type == "udp-vbr") cfg.cbr = false;
-    return cfg;
-}
-
-std::vector<StreamConfig> outputConfigs(const StreamConfig& cfg) {
-    std::vector<StreamConfig> outputs;
-    outputs.push_back(configForOutput(cfg, primaryOutputConfig(cfg)));
-    for (const auto& output : cfg.additionalOutputs) {
-        outputs.push_back(configForOutput(cfg, output));
-    }
-    return outputs;
-}
-
-void addArg(std::vector<std::string>& args, const std::string& value) {
-    if (!value.empty()) args.push_back(value);
+void addQueue(std::vector<std::string>& args, const std::string& name, uint64_t maxTimeNs = 5000000000ULL) {
+    args.insert(args.end(), {
+        "queue",
+        "name=" + name,
+        "max-size-buffers=0",
+        "max-size-bytes=0",
+        "max-size-time=" + std::to_string(maxTimeNs)
+    });
 }
 
 std::string property(const std::string& name, const std::string& value) {
     return name + "=" + value;
-}
-
-std::string inputUriForGstreamer(const StreamConfig& cfg) {
-    std::string input = cfg.inputUri;
-    const std::string lower = toLower(input);
-    if (lower.rfind("hls://", 0) == 0) {
-        input = "http://" + input.substr(6);
-    }
-    return input;
 }
 
 std::string shellQuote(const std::string& value) {
@@ -157,74 +121,67 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
     return ss.str();
 }
 
-uint64_t safeVideoBitrate(const StreamConfig& cfg) {
-    return std::max<uint64_t>(cfg.transcodeVideoBitrate, 500000);
-}
-
-uint64_t safeAudioBitrate(const StreamConfig& cfg) {
-    return std::clamp<uint64_t>(cfg.transcodeAudioBitrate, 64000, 320000);
-}
-
-uint64_t muxBitrate(const StreamConfig& cfg) {
-    const uint64_t video = safeVideoBitrate(cfg);
-    const uint64_t audio = safeAudioBitrate(cfg);
-    const uint64_t minimum = video + audio + 800000;
-    if (cfg.targetBitrate > 0) {
-        return std::max<uint64_t>(cfg.targetBitrate, minimum);
+bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& error) {
+    std::vector<std::string> missing;
+    validateFactories(tvs::protocols::requiredElementsForOutput(tvs::protocols::outputKind(outputConfig)), missing);
+    if (!missing.empty()) {
+        std::ostringstream ss;
+        ss << "missing output protocol elements for " << tvs::protocols::normalizedOutputType(outputConfig);
+        for (size_t i = 0; i < missing.size(); ++i) {
+            ss << (i == 0 ? ": " : ", ") << missing[i];
+        }
+        error = ss.str();
+        return false;
     }
-    return minimum;
+    return true;
 }
 
-void addQueue(std::vector<std::string>& args, const std::string& name, guint64 maxTimeNs = 5000000000ULL) {
-    args.insert(args.end(), {
-        "queue",
-        property("name", name),
-        "max-size-buffers=0",
-        "max-size-bytes=0",
-        property("max-size-time", std::to_string(maxTimeNs))
-    });
-}
-
-void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& muxPad) {
+void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec) {
     int width = 1920;
     int height = 1080;
     TranscoderModule::resolutionSize(cfg.transcodeResolution, width, height);
-    const uint64_t bitrateKbps = safeVideoBitrate(cfg) / 1000;
+    const uint64_t bitrateKbps = tvs::protocols::safeVideoBitrate(cfg) / 1000;
+    const bool flv = spec.container == ContainerKind::Flv;
 
     args.insert(args.end(), {"dec.", "!"});
-    addQueue(args, "transcode_video_queue");
+    addQueue(args, "transcode_video_queue", 8000000000ULL);
     args.insert(args.end(), {
         "!", "video/x-raw",
         "!", "videoconvert",
-        "!", "deinterlace",
+        "!", "deinterlace", "method=yadif",
         "!", "videoscale", "add-borders=true",
-        "!", "videorate",
+        "!", "videorate", "drop-only=false",
         "!", "video/x-raw,format=I420,width=" + std::to_string(width) +
               ",height=" + std::to_string(height) + ",framerate=25/1,pixel-aspect-ratio=1/1,interlace-mode=progressive",
         "!", "x264enc",
         "tune=zerolatency",
-        "speed-preset=superfast",
+        "speed-preset=ultrafast",
         property("bitrate", std::to_string(bitrateKbps)),
         "key-int-max=50",
         "bframes=0",
-        "byte-stream=true",
+        property("byte-stream", flv ? "false" : "true"),
         "aud=true",
-        "vbv-buf-capacity=1000",
+        "sliced-threads=true",
+        "vbv-buf-capacity=500",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
-        "!", "h264parse", "config-interval=1",
-        "!", "video/x-h264,stream-format=byte-stream,alignment=au",
+        "!", "h264parse", property("config-interval", flv ? "-1" : "1"),
+        "!", flv
+            ? "video/x-h264,stream-format=avc,alignment=au"
+            : "video/x-h264,stream-format=byte-stream,alignment=au",
         "!"
     });
-    addQueue(args, "transcode_video_mux_queue", 2000000000ULL);
-    args.insert(args.end(), {"!", muxPad});
+    addQueue(args, "transcode_video_mux_queue", 3000000000ULL);
+    args.insert(args.end(), {"!", spec.videoPad});
 }
 
-void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& muxPad, std::string& error) {
+void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec, std::string& error) {
     const std::string audioCodec = toLower(cfg.transcodeAudioCodec);
-    const uint64_t bitrate = safeAudioBitrate(cfg);
+    const uint64_t bitrate = tvs::protocols::safeAudioBitrate(cfg);
+    const bool flv = spec.container == ContainerKind::Flv;
 
     args.insert(args.end(), {"dec.", "!"});
-    addQueue(args, "transcode_audio_queue");
+    addQueue(args, "transcode_audio_queue", 8000000000ULL);
+
     std::string selectedAacEncoder;
     std::string selectedMp3Encoder;
     if (audioCodec == "mp3") {
@@ -232,6 +189,7 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     } else {
         selectedAacEncoder = findAacEncoder();
     }
+
     const std::string rawAudioCaps = selectedAacEncoder == "avenc_aac"
         ? "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2"
         : "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2";
@@ -269,9 +227,6 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
             });
         }
     } else {
-        // Stable mode intentionally re-encodes audio even when the UI value is
-        // "copy". Copy/passthrough caused the previous AAC caps-list and PMT
-        // problems; raw audio -> AAC makes the muxed TS deterministic.
         const std::string encoder = selectedAacEncoder;
         if (encoder.empty()) {
             error = "AAC encoder is not available";
@@ -281,56 +236,39 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
             encoder,
             property("bitrate", std::to_string(bitrate)),
             "!", "aacparse",
-            "!", "audio/mpeg,mpegversion=4,stream-format=adts"
+            "!", flv
+                ? "audio/mpeg,mpegversion=4,stream-format=raw"
+                : "audio/mpeg,mpegversion=4,stream-format=adts"
         });
     }
 
     args.insert(args.end(), {"!"});
-    addQueue(args, "transcode_audio_mux_queue", 2000000000ULL);
-    args.insert(args.end(), {"!", muxPad});
+    addQueue(args, "transcode_audio_mux_queue", 3000000000ULL);
+    args.insert(args.end(), {"!", spec.audioPad});
 }
 
-void addMuxAndUdpSink(std::vector<std::string>& args, const StreamConfig& cfg) {
-    args.insert(args.end(), {
-        "mpegtsmux",
-        "name=mux",
-        "alignment=7",
-        property("bitrate", std::to_string(muxBitrate(cfg))),
-        "pat-interval=9000",
-        "pmt-interval=9000",
-        "pcr-interval=3600",
-        "si-interval=9000",
-        "!"
-    });
-    addQueue(args, "transcode_output_queue", 2000000000ULL);
-    args.insert(args.end(), {
-        "!", "udpsink",
-        property("host", cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost),
-        property("port", std::to_string(cfg.outputPort)),
-        "sync=true",
-        "async=false",
-        "auto-multicast=true",
-        "ttl-mc=32"
-    });
-    if (!cfg.interfaceAddress.empty()) {
-        args.push_back(property("bind-address", cfg.interfaceAddress));
-    }
-}
+void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec, std::string& error) {
+    StreamConfig testCfg = cfg;
+    testCfg.transcodeResolution = cfg.transcodeResolution.empty() ? "1280x720" : cfg.transcodeResolution;
 
-void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& videoPad, const std::string& audioPad, std::string& error) {
     args.insert(args.end(), {
         "videotestsrc", "is-live=true", "pattern=smpte", "!", "video/x-raw,framerate=25/1", "!"
     });
-    addQueue(args, "test_video_queue");
+    addQueue(args, "test_video_queue", 3000000000ULL);
     args.insert(args.end(), {
         "!", "videoconvert", "!", "videoscale", "add-borders=true", "!", "videorate",
-        "!", "video/x-raw,format=I420,width=1280,height=720,framerate=25/1",
-        "!", "x264enc", "tune=zerolatency", "speed-preset=veryfast",
-        property("bitrate", std::to_string(safeVideoBitrate(cfg) / 1000)),
-        "key-int-max=50", "bframes=0", "byte-stream=true", "aud=true",
+        "!", "video/x-raw,format=I420,width=1280,height=720,framerate=25/1,interlace-mode=progressive",
+        "!", "x264enc", "tune=zerolatency", "speed-preset=ultrafast",
+        property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
+        "key-int-max=50", "bframes=0",
+        property("byte-stream", spec.container == ContainerKind::Flv ? "false" : "true"),
+        "aud=true", "sliced-threads=true", "vbv-buf-capacity=500",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
-        "!", "h264parse", "config-interval=1",
-        "!", "video/x-h264,stream-format=byte-stream,alignment=au", "!", videoPad,
+        "!", "h264parse", property("config-interval", spec.container == ContainerKind::Flv ? "-1" : "1"),
+        "!", spec.container == ContainerKind::Flv
+            ? "video/x-h264,stream-format=avc,alignment=au"
+            : "video/x-h264,stream-format=byte-stream,alignment=au",
+        "!", spec.videoPad,
         "audiotestsrc", "is-live=true", "wave=sine", "freq=1000", "!", "audio/x-raw,rate=48000,channels=2", "!"
     });
     const std::string encoder = findAacEncoder();
@@ -339,8 +277,12 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
         return;
     }
     args.insert(args.end(), {
-        encoder, property("bitrate", std::to_string(safeAudioBitrate(cfg))),
-        "!", "aacparse", "!", "audio/mpeg,mpegversion=4,stream-format=adts", "!", audioPad
+        encoder, property("bitrate", std::to_string(tvs::protocols::safeAudioBitrate(cfg))),
+        "!", "aacparse", "!",
+        spec.container == ContainerKind::Flv
+            ? "audio/mpeg,mpegversion=4,stream-format=raw"
+            : "audio/mpeg,mpegversion=4,stream-format=adts",
+        "!", spec.audioPad
     });
 }
 
@@ -357,21 +299,21 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
         return false;
     }
 
-    const char* required[] = {
-        "uridecodebin", "queue", "videoconvert", "deinterlace", "videoscale", "videorate",
-        "x264enc", "h264parse", "audioconvert", "audioresample", "audiorate",
-        "aacparse", "mpegtsmux", "udpsink", nullptr
+    std::vector<std::string> required = tvs::protocols::requiredInputElements();
+    const std::vector<std::string> common = {
+        "queue", "videoconvert", "deinterlace", "videoscale", "videorate",
+        "x264enc", "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
     };
+    required.insert(required.end(), common.begin(), common.end());
+
     std::vector<std::string> missing;
-    for (const char** name = required; *name; ++name) {
-        if (!hasFactory(*name)) missing.emplace_back(*name);
-    }
+    validateFactories(required, missing);
     if (findAacEncoder().empty()) {
         missing.emplace_back("AAC encoder: fdkaacenc, voaacenc or avenc_aac");
     }
     if (!missing.empty()) {
         std::ostringstream ss;
-        ss << "missing GStreamer elements";
+        ss << "missing GStreamer transcoder elements";
         for (size_t i = 0; i < missing.size(); ++i) {
             ss << (i == 0 ? ": " : ", ") << missing[i];
         }
@@ -425,37 +367,26 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
     const StreamConfig& outputConfig,
     std::string& description,
     std::string& error) {
-    const std::string type = normalizedOutputType(outputConfig);
-    if (!isUdpType(type)) {
-        error = "stable GStreamer transcoder currently supports UDP/UDP-CBR/UDP-VBR outputs only";
+    if (!validateOutputAvailability(outputConfig, error)) {
         return {};
     }
 
-    const std::string videoPad = outputConfig.videoPid > 0
-        ? "mux.sink_" + std::to_string(outputConfig.videoPid)
-        : "mux.";
-    const std::string audioPad = outputConfig.audioPid > 0
-        ? "mux.sink_" + std::to_string(outputConfig.audioPid)
-        : "mux.";
-
     std::vector<std::string> args = {"gst-launch-1.0", "-e"};
-    addMuxAndUdpSink(args, outputConfig);
+    GstOutputSpec outputSpec;
+    if (!tvs::protocols::appendOutputMuxAndSink(args, outputConfig, outputSpec, error)) {
+        return {};
+    }
 
     if (baseConfig.testPattern) {
-        addTestSources(args, baseConfig, videoPad, audioPad, error);
+        addTestSources(args, baseConfig, outputSpec, error);
     } else {
-        args.insert(args.end(), {
-            "uridecodebin",
-            "name=dec",
-            property("uri", inputUriForGstreamer(baseConfig)),
-            "use-buffering=true"
-        });
-        addVideoBranch(args, baseConfig, videoPad);
-        addAudioBranch(args, baseConfig, audioPad, error);
+        tvs::protocols::appendDecodeInput(args, baseConfig);
+        addVideoBranch(args, baseConfig, outputSpec);
+        addAudioBranch(args, baseConfig, outputSpec, error);
     }
     if (!error.empty()) return {};
 
-    description = type + "@udp://" + outputConfig.outputHost + ":" + std::to_string(outputConfig.outputPort);
+    description = outputSpec.description;
     return args;
 }
 
@@ -469,7 +400,7 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         return false;
     }
 
-    const auto outputs = outputConfigs(config);
+    const auto outputs = tvs::protocols::outputConfigs(config);
     if (outputs.empty()) {
         error = "no outputs configured";
         return false;
