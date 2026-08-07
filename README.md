@@ -174,12 +174,15 @@ uridecodebin
  -> raw video
  -> videoconvert
  -> deinterlace method=yadif
- -> videoscale method=lanczos
+ -> videoscale method=lanczos (selected output resolution, preserve display aspect with borders when required)
  -> videorate
- -> 25 fps progressive I420
- -> x264enc superfast / zerolatency
+ -> 25 fps progressive I420, SAR/PAR 1:1 (square pixels)
+ -> x264enc superfast / zerolatency with VUI enabled
  -> h264parse
 ```
+
+
+The transcoder always normalizes the scaled video to **SAR/PAR 1:1** before H.264 encoding. The selected output width/height therefore use square pixels, and `x264enc` is instructed to emit VUI information. `videoscale add-borders=true` preserves the source display aspect ratio when the selected resolution has a different shape, adding borders instead of stretching the picture.
 
 Audio is normalized to 48 kHz stereo before encoding. AAC is the stable/default transcoder path; MP3 is used when explicitly configured and an MP3 encoder is available. In the clean transcoder path, a UI/config value intended as audio `copy` is currently handled as AAC re-encode rather than bit-exact passthrough.
 

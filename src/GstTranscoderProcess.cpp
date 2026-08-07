@@ -121,6 +121,12 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
     return ss.str();
 }
 
+std::string scaledVideoCaps(int width, int height) {
+    return "video/x-raw,format=I420,width=" + std::to_string(width) +
+           ",height=" + std::to_string(height) +
+           ",framerate=25/1,pixel-aspect-ratio=(fraction)1/1,interlace-mode=progressive";
+}
+
 bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& error) {
     std::vector<std::string> missing;
     validateFactories(tvs::protocols::requiredElementsForOutput(tvs::protocols::outputKind(outputConfig)), missing);
@@ -152,8 +158,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
         "!", "videoscale", "add-borders=true", "method=lanczos",
         "!", "videorate", "drop-only=false",
-        "!", "video/x-raw,format=I420,width=" + std::to_string(width) +
-              ",height=" + std::to_string(height) + ",framerate=25/1,pixel-aspect-ratio=1/1,interlace-mode=progressive",
+        "!", scaledVideoCaps(width, height),
         "!", "x264enc",
         "tune=zerolatency",
         "speed-preset=superfast",
@@ -162,6 +167,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "bframes=0",
         property("byte-stream", flv ? "false" : "true"),
         "aud=true",
+        "insert-vui=true",
         "sliced-threads=false",
         "vbv-buf-capacity=1500",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
@@ -252,6 +258,9 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
 void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec, std::string& error) {
     StreamConfig testCfg = cfg;
     testCfg.transcodeResolution = cfg.transcodeResolution.empty() ? "1280x720" : cfg.transcodeResolution;
+    int width = 1280;
+    int height = 720;
+    TranscoderModule::resolutionSize(testCfg.transcodeResolution, width, height);
 
     args.insert(args.end(), {
         "videotestsrc", "is-live=true", "pattern=smpte", "!", "video/x-raw,framerate=25/1", "!"
@@ -259,12 +268,12 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     addQueue(args, "test_video_queue", 3000000000ULL);
     args.insert(args.end(), {
         "!", "videoconvert", "!", "videoscale", "add-borders=true", "method=lanczos", "!", "videorate",
-        "!", "video/x-raw,format=I420,width=1280,height=720,framerate=25/1,interlace-mode=progressive",
+        "!", scaledVideoCaps(width, height),
         "!", "x264enc", "tune=zerolatency", "speed-preset=superfast",
         property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
         "key-int-max=25", "bframes=0",
         property("byte-stream", spec.container == ContainerKind::Flv ? "false" : "true"),
-        "aud=true", "sliced-threads=false", "vbv-buf-capacity=1500",
+        "aud=true", "insert-vui=true", "sliced-threads=false", "vbv-buf-capacity=1500",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
         "!", "h264parse", property("config-interval", spec.container == ContainerKind::Flv ? "-1" : "1"),
         "!", spec.container == ContainerKind::Flv
