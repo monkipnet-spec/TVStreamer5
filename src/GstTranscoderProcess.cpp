@@ -149,7 +149,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {
         "!", "video/x-raw",
         "!", "videoconvert",
-        "!", "deinterlace", "method=linear",
+        "!", "deinterlace", "method=yadif",
         "!", "videoscale", "add-borders=true",
         "!", "videorate", "drop-only=false",
         "!", "video/x-raw,format=I420,width=" + std::to_string(width) +

@@ -7,7 +7,7 @@ bool appendHttpSink(std::vector<std::string>& args, const StreamConfig& cfg, Gst
     // Do not bind the public TVStreamer HTTP port here. gst-launch exposes an
     // internal localhost MPEG-TS TCP port; HttpServer proxies /stream/<id>.ts
     // to this endpoint and adds proper HTTP headers for clients.
-    appendOutputQueue(args, "transcode_http_output_queue", true);
+    appendOutputQueue(args, "transcode_http_output_queue", false);
     const int internalPort = static_cast<int>(transcodedHttpInternalPort(cfg));
     args.insert(args.end(), {
         "tcpserversink",

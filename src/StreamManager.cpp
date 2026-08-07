@@ -1085,68 +1085,69 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
 
-    StreamConfig pipelineConfig = streamConfig;
-    bool usingTranscodeRelay = false;
-
     if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
-        const StreamConfig relayOutput = transcodeRelayOutputConfig(streamConfig);
-        if (!tvs::protocols::prepareFifoRelay(streamConfig, gstError)) {
-            std::cerr << "GStreamer transcoder relay fifo setup failed for " << streamConfig.id
-                      << ": " << gstError << std::endl;
-            state->statusMessage = "gstreamer relay fifo failed: " + gstError;
-            return false;
-        }
-        if (!gstTranscoder->start(relayOutput, gstError)) {
-            std::cerr << "GStreamer transcoder relay setup failed for " << streamConfig.id
+        if (!gstTranscoder->start(streamConfig, gstError)) {
+            std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
-            tvs::protocols::removeFifoRelay(streamConfig);
             return false;
         }
 
-        pipelineConfig = transcodeRelayPipelineConfig(streamConfig);
-        usingTranscodeRelay = true;
-        state->gstTranscoder = std::move(gstTranscoder);
-        state->primaryInputUri = streamConfig.inputUri;
-        state->activeInputUri = pipelineConfig.inputUri;
-        state->sourceContext->config = pipelineConfig;
-
-        std::cerr << "Transcode relay for stream '" << streamConfig.name
-                  << "': input=" << streamConfig.inputUri
+        std::cerr << "Pipeline for stream '" << streamConfig.name
+                  << "': gstreamer-transcoder input=" << streamConfig.inputUri
                   << " transcode=" << streamConfig.transcodeResolution
                   << "@" << streamConfig.transcodeVideoBitrate
-                  << " relay=" << pipelineConfig.inputUri
-                  << " fifo=" << tvs::protocols::transcodedFifoRelayPath(streamConfig)
-                  << " outputs=" << buildPipelineDescription(streamConfig) << std::endl;
+                  << " outputs=" << gstTranscoder->description() << std::endl;
+
+        state->gstTranscoder = std::move(gstTranscoder);
+        state->running = true;
+        state->active = true;
+        state->statusMessage = "running via gstreamer";
+        state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
+        state->inputBitrate = transcodeMuxBitrateForStats(streamConfig);
+        state->lastInputActivity = std::chrono::steady_clock::now();
+        state->lastPrimaryRetry = state->lastInputActivity;
+        state->lastBitrateSample = state->lastInputActivity;
+
+        bool duplicateStart = false;
+        {
+            std::lock_guard<std::mutex> lock(managerMutex);
+            if (streams.count(streamConfig.id)) {
+                duplicateStart = true;
+            } else {
+                streams[streamConfig.id] = std::move(state);
+            }
+        }
+        if (duplicateStart) {
+            if (state && state->gstTranscoder) {
+                state->gstTranscoder->stop();
+            }
+            return false;
+        }
+        notifyStreamState(
+            streamConfig,
+            "🟢",
+            telegramText(configManager, "Поток запущен", "Stream started"),
+            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + streamConfig.inputUri);
+        return true;
     }
 
-    state->config = pipelineConfig;
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
-        if (state->gstTranscoder) {
-            state->gstTranscoder->stop();
-            state->gstTranscoder.reset();
-        }
-        if (usingTranscodeRelay) {
-            tvs::protocols::removeFifoRelay(streamConfig);
-        }
         return false;
     }
 
     std::cerr << "Pipeline for stream '" << streamConfig.name
-              << "': " << buildPipelineDescription(pipelineConfig) << std::endl;
+              << "': " << buildPipelineDescription(streamConfig) << std::endl;
 
     state->pipeline = pipeline;
     state->bus = gst_element_get_bus(pipeline);
     state->running = true;
     state->active = true;
-    state->statusMessage = usingTranscodeRelay ? "starting via gstreamer relay" : "starting";
-    if (usingTranscodeRelay) {
-        state->config = streamConfig;
-    }
+    state->statusMessage = "starting";
     state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
@@ -1205,11 +1206,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     }
     if (duplicateStart) {
         state->running = false;
-        if (state->gstTranscoder) {
-            state->gstTranscoder->stop();
-            state->gstTranscoder.reset();
-            tvs::protocols::removeFifoRelay(streamConfig);
-        }
         if (state->pipeline) {
             gst_element_set_state(state->pipeline, GST_STATE_NULL);
         }
@@ -1227,9 +1223,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
         streamConfig,
         "🟢",
         telegramText(configManager, "Поток запущен", "Stream started"),
-        (usingTranscodeRelay
-            ? telegramText(configManager, "GStreamer-транскодер через внутренний FIFO relay", "GStreamer transcoder through internal FIFO relay")
-            : telegramText(configManager, "Источник: основной", "Source: primary")) + "\nURL: " + streamConfig.inputUri);
+        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + streamConfig.inputUri);
     return true;
 }
 
@@ -1276,7 +1270,6 @@ bool StreamManager::stopStream(const std::string& id) {
     if (state.gstTranscoder) {
         state.gstTranscoder->stop();
         state.gstTranscoder.reset();
-        tvs::protocols::removeFifoRelay(stoppedConfig);
     }
     if (state.bus) {
         gst_object_unref(state.bus);
@@ -1332,7 +1325,6 @@ void StreamManager::stopAll() {
         if (state.gstTranscoder) {
             state.gstTranscoder->stop();
             state.gstTranscoder.reset();
-            tvs::protocols::removeFifoRelay(state.config);
         }
         if (state.bus) {
             gst_object_unref(state.bus);

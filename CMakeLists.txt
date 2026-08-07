@@ -64,12 +64,14 @@ add_executable(TVStreamer
     src/protocols/inputs/GstHttpInputProtocol.cpp
     src/protocols/inputs/GstHlsInputProtocol.cpp
     src/protocols/inputs/GstUdpInputProtocol.cpp
+    src/protocols/inputs/GstRtpInputProtocol.cpp
     src/protocols/inputs/GstSrtInputProtocol.cpp
     src/protocols/inputs/GstRtspInputProtocol.cpp
     src/protocols/inputs/GstRtmpInputProtocol.cpp
     src/protocols/outputs/GstOutputProtocolUtils.cpp
     src/protocols/outputs/GstFifoOutputProtocol.cpp
     src/protocols/outputs/GstUdpOutputProtocol.cpp
+    src/protocols/outputs/GstRtpOutputProtocol.cpp
     src/protocols/outputs/GstSrtOutputProtocol.cpp
     src/protocols/outputs/GstHttpOutputProtocol.cpp
     src/protocols/outputs/GstHlsOutputProtocol.cpp

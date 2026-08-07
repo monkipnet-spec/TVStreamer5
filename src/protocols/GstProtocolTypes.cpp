@@ -29,6 +29,7 @@ OutputKind outputKind(const StreamConfig& cfg) {
     const std::string type = normalizedOutputType(cfg);
     if (type == "udp-cbr") return OutputKind::UdpCbr;
     if (type == "udp-vbr") return OutputKind::UdpVbr;
+    if (type == "rtp") return OutputKind::Rtp;
     if (type == "srt") return OutputKind::Srt;
     if (type == "http") return OutputKind::Http;
     if (type == "hls") return OutputKind::Hls;
@@ -40,11 +41,11 @@ OutputKind outputKind(const StreamConfig& cfg) {
 }
 
 bool isUdpOutput(OutputKind kind) {
-    return kind == OutputKind::UdpCbr || kind == OutputKind::UdpVbr;
+    return kind == OutputKind::UdpCbr || kind == OutputKind::UdpVbr || kind == OutputKind::Rtp;
 }
 
 bool isTsOutput(OutputKind kind) {
-    return kind == OutputKind::UdpCbr || kind == OutputKind::UdpVbr ||
+    return kind == OutputKind::UdpCbr || kind == OutputKind::UdpVbr || kind == OutputKind::Rtp ||
            kind == OutputKind::Srt || kind == OutputKind::Http || kind == OutputKind::Hls ||
            kind == OutputKind::FifoRelay;
 }

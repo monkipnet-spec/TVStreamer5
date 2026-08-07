@@ -4,7 +4,7 @@
 namespace tvs::protocols::outputs {
 bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendOutputQueue(args, "transcode_hls_output_queue", true);
+    appendOutputQueue(args, "transcode_hls_output_queue", false);
     const std::string dir = hlsDirectory(cfg);
     args.insert(args.end(), {
         "hlssink",

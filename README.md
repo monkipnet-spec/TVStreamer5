@@ -912,3 +912,15 @@ behavior is preserved.
 - Transcoded streams still reuse the stable normal output path for UDP, RTP, HTTP, HLS, SRT, RTMP/YouTube and RTSP after the FIFO relay.
 - Added stream input/output protocol classification modules for the remaining normal pipeline protocols so protocol routing is no longer hidden only inside `StreamManager` conditionals.
 - Added a dedicated FIFO relay output protocol module for the transcoder process.
+
+### v49 - Direct modular transcoder protocol outputs
+
+- Reverted the broken FIFO transcode relay path that could make every transcoded stream report `no input signal`.
+- The clean GStreamer transcoder now outputs directly through protocol-specific modules again.
+- Kept the normal non-transcoded input/output protocol modules unchanged.
+- Added a dedicated transcoded RTP MPEG-TS output module through `rtpmp2tpay`.
+- Added a dedicated transcoded RTP input classifier module.
+- HTTP transcoded TS output uses an internal localhost `tcpserversink`; TVStreamer5 proxies `/stream/<id>.ts` to that sink so clients still use the normal HTTP URL.
+- HLS transcoded output writes segments under `/tmp/tvstreamer5-hls/<id>` and the existing HTTP server serves `/hls/<id>/playlist.m3u8`.
+- Removed downstream-leaky queues from direct protocol outputs to avoid corrupt TS bursts, frozen pictures and audio crackling.
+- Switched the deinterlacer method to `yadif` for the clean GStreamer transcoder video branch.

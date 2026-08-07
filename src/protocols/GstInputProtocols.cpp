@@ -3,6 +3,7 @@
 #include "protocols/inputs/GstHttpInputProtocol.h"
 #include "protocols/inputs/GstHlsInputProtocol.h"
 #include "protocols/inputs/GstRtmpInputProtocol.h"
+#include "protocols/inputs/GstRtpInputProtocol.h"
 #include "protocols/inputs/GstRtspInputProtocol.h"
 #include "protocols/inputs/GstSrtInputProtocol.h"
 #include "protocols/inputs/GstUdpInputProtocol.h"
@@ -14,6 +15,7 @@ std::string inputUriForGstreamer(const StreamConfig& cfg) {
     if (inputs::isSrtInput(cfg)) return inputs::srtInputUri(cfg);
     if (inputs::isRtspInput(cfg)) return inputs::rtspInputUri(cfg);
     if (inputs::isRtmpInput(cfg)) return inputs::rtmpInputUri(cfg);
+    if (inputs::isRtpInput(cfg)) return inputs::rtpInputUri(cfg);
     if (inputs::isUdpInput(cfg)) return inputs::udpInputUri(cfg);
     if (inputs::isHttpInput(cfg)) return inputs::httpInputUri(cfg);
     return cfg.inputUri;

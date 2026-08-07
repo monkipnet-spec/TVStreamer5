@@ -11,6 +11,7 @@ namespace tvs::protocols {
 enum class OutputKind {
     UdpCbr,
     UdpVbr,
+    Rtp,
     Srt,
     Http,
     Hls,

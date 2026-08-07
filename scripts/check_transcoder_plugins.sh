@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# v48: the clean GStreamer transcoder always outputs to an internal
-# FIFO MPEG-TS relay. TVStreamer5 then uses its existing passthrough protocol
-# modules for HTTP, HLS, SRT, UDP/RTP, RTMP/YouTube and RTSP. Therefore the
-# transcoder hard requirement is only the decode/encode/mux/FIFO-relay chain.
+# v49: transcoded streams use direct protocol output modules again. The base
+# transcoder chain is required; protocol-specific elements are checked and
+# reported separately because they are only required when that output is used.
 required=(
   gst-launch-1.0
   uridecodebin
@@ -19,26 +18,17 @@ required=(
   audioresample
   audiorate
   aacparse
-  mpegtsmux
-  filesink
 )
 
-optional_protocols=(
-  srtsrc
-  srtclientsrc
-  srtsink
-  souphttpsrc
-  hlsdemux
-  hlssink
-  multifdsink
-  rtspsrc
-  rtspclientsink
-  rtmpsrc
-  flvdemux
-  flvmux
-  rtmpsink
-  rtpmp2tdepay
-  rtpmp2tpay
+protocol_elements=(
+  "udp/udp-cbr/udp-vbr:mpegtsmux udpsink"
+  "rtp:mpegtsmux rtpmp2tpay udpsink"
+  "http:mpegtsmux tcpserversink"
+  "hls:mpegtsmux hlssink"
+  "srt:mpegtsmux srtsink"
+  "rtmp/youtube:flvmux rtmpsink"
+  "rtsp-push:rtspclientsink"
+  "fifo-debug:mpegtsmux filesink"
 )
 
 missing=()
@@ -73,24 +63,33 @@ if [[ -z "$aac_encoder" ]]; then
 fi
 
 if ((${#missing[@]} > 0)); then
-  echo "GStreamer transcoding relay is unavailable. Missing required elements/tools:"
+  echo "GStreamer transcoding is unavailable. Missing required elements/tools:"
   printf '  - %s\n' "${missing[@]}"
   echo "Install GStreamer plugins base/good/bad/ugly and gstreamer1.0-libav."
   exit 1
 fi
 
-echo "GStreamer transcoding relay dependencies are available."
+echo "GStreamer transcoder core dependencies are available."
 echo "  Launcher: $(command -v gst-launch-1.0)"
 echo "  Video encoder: x264enc"
 echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
-echo "  Relay output: mpegtsmux + filesink FIFO"
 echo
-echo "Optional protocol elements used by passthrough input/output modules:"
-for element in "${optional_protocols[@]}"; do
-  if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
-    printf '  [ok]      %s\n' "$element"
+echo "Protocol output elements:"
+for entry in "${protocol_elements[@]}"; do
+  protocol="${entry%%:*}"
+  elements="${entry#*:}"
+  ok=true
+  missing_list=()
+  for element in $elements; do
+    if ! gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+      ok=false
+      missing_list+=("$element")
+    fi
+  done
+  if $ok; then
+    printf '  [ok]      %s\n' "$protocol"
   else
-    printf '  [missing] %s\n' "$element"
+    printf '  [missing] %s -> %s\n' "$protocol" "${missing_list[*]}"
   fi
 done

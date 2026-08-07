@@ -4,7 +4,7 @@
 namespace tvs::protocols::outputs {
 bool appendRtmpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     args.insert(args.end(), {"flvmux", "name=mux", "streamable=true", "latency=0", "!"});
-    appendOutputQueue(args, "transcode_rtmp_output_queue", true);
+    appendOutputQueue(args, "transcode_rtmp_output_queue", false);
     args.insert(args.end(), {"rtmpsink", "location=" + rtmpOutputLocation(cfg), "sync=false", "async=false"});
     spec.videoPad = "mux.";
     spec.audioPad = "mux.";
