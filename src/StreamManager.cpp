@@ -11,12 +11,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <functional>
-#include <set>
-#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -1065,137 +1062,6 @@ GstElement* makeCapsFilter(const char* capsDescription) {
 }
 
 
-struct ExternalSrtWatch {
-    std::string streamId;
-    int port = 0;
-    std::set<pid_t> pids;
-};
-
-std::string runCommandCapture(const char* command) {
-    std::string output;
-    FILE* pipe = ::popen(command, "r");
-    if (!pipe) {
-        return output;
-    }
-    char buffer[4096];
-    while (std::fgets(buffer, sizeof(buffer), pipe)) {
-        output += buffer;
-    }
-    ::pclose(pipe);
-    return output;
-}
-
-bool parseEndpoint(const std::string& endpoint, std::string& host, int& port) {
-    host.clear();
-    port = 0;
-    if (endpoint.empty() || endpoint == "*" || endpoint == "*:*") {
-        return false;
-    }
-
-    size_t portPos = std::string::npos;
-    if (endpoint.front() == '[') {
-        const size_t close = endpoint.find(']');
-        if (close == std::string::npos || close + 1 >= endpoint.size() || endpoint[close + 1] != ':') {
-            return false;
-        }
-        host = endpoint.substr(1, close - 1);
-        portPos = close + 2;
-    } else {
-        const size_t colon = endpoint.rfind(':');
-        if (colon == std::string::npos || colon + 1 >= endpoint.size()) {
-            return false;
-        }
-        host = endpoint.substr(0, colon);
-        portPos = colon + 1;
-    }
-
-    const std::string portText = endpoint.substr(portPos);
-    if (portText == "*" || portText.empty()) {
-        return false;
-    }
-    try {
-        port = std::stoi(portText);
-    } catch (const std::exception&) {
-        return false;
-    }
-
-    const size_t zone = host.find('%');
-    if (zone != std::string::npos) {
-        host = host.substr(0, zone);
-    }
-    host = normalizeIpAddress(host);
-    return !host.empty() && port > 0;
-}
-
-bool lineHasWatchedPid(const std::string& line, const std::set<pid_t>& pids) {
-    if (line.find("users:") == std::string::npos) {
-        return true;
-    }
-    if (pids.empty()) {
-        return line.find("gst-launch-1.0") != std::string::npos;
-    }
-    for (const pid_t pid : pids) {
-        if (pid <= 0) continue;
-        const std::string needle = "pid=" + std::to_string(pid);
-        if (line.find(needle) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::map<std::string, std::set<std::string>> detectExternalSrtSessions(const std::vector<ExternalSrtWatch>& watches) {
-    std::map<std::string, std::set<std::string>> sessions;
-    if (watches.empty()) {
-        return sessions;
-    }
-
-    const std::string ssOutput = runCommandCapture("ss -H -u -a -n -p 2>/dev/null");
-    std::istringstream lines(ssOutput);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (line.empty() || line.find(':') == std::string::npos) {
-            continue;
-        }
-
-        std::istringstream fields(line);
-        std::string state;
-        std::string recvQ;
-        std::string sendQ;
-        std::string localEndpoint;
-        std::string peerEndpoint;
-        if (!(fields >> state >> recvQ >> sendQ >> localEndpoint >> peerEndpoint)) {
-            continue;
-        }
-
-        std::string localHost;
-        int localPort = 0;
-        if (!parseEndpoint(localEndpoint, localHost, localPort)) {
-            continue;
-        }
-        std::string peerHost;
-        int peerPort = 0;
-        if (!parseEndpoint(peerEndpoint, peerHost, peerPort)) {
-            continue;
-        }
-        (void)peerPort;
-        if (peerHost == "0.0.0.0" || peerHost == "::" || peerHost == "*") {
-            continue;
-        }
-
-        for (const auto& watch : watches) {
-            if (watch.port != localPort) {
-                continue;
-            }
-            if (!lineHasWatchedPid(line, watch.pids)) {
-                continue;
-            }
-            sessions[watch.streamId].insert(peerHost);
-        }
-    }
-    return sessions;
-}
-
 bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
     return tvs::protocols::outputKind(outputConfig) == tvs::protocols::OutputKind::Srt &&
            tvs::protocols::srtOutputMode(outputConfig) != "caller" &&
@@ -1206,16 +1072,215 @@ bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
     : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(gst_is_initialized()) {
-    externalSrtSessionThread = std::thread(&StreamManager::monitorExternalSrtSessions, this);
     std::cerr << "StreamManager constructed" << std::endl;
 }
 
 StreamManager::~StreamManager() {
-    externalSrtSessionMonitorStop = true;
-    if (externalSrtSessionThread.joinable()) {
-        externalSrtSessionThread.join();
-    }
     stopAll();
+}
+
+
+void StreamManager::attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg) {
+    if (!sink) {
+        return;
+    }
+
+    auto* ctx = new SrtAccessContext{this, cfg.id};
+    g_object_set_data_full(G_OBJECT(sink), "srt-access-context", ctx, freeSrtAccessContext);
+
+    if (configManager.subscribers.filteringEnabled) {
+        g_signal_connect_data(
+            sink, "caller-connecting", G_CALLBACK(StreamManager::onSrtCallerConnecting),
+            ctx, nullptr, static_cast<GConnectFlags>(0));
+        g_signal_connect_data(
+            sink, "caller-rejected", G_CALLBACK(StreamManager::onSrtCallerRejected),
+            ctx, nullptr, static_cast<GConnectFlags>(0));
+    }
+
+    g_signal_connect_data(
+        sink, "caller-added", G_CALLBACK(StreamManager::onSrtCallerAdded),
+        ctx, nullptr, static_cast<GConnectFlags>(0));
+    g_signal_connect_data(
+        sink, "caller-removed", G_CALLBACK(StreamManager::onSrtCallerRemoved),
+        ctx, nullptr, static_cast<GConnectFlags>(0));
+
+    std::cerr << "SRT connection monitoring attached for stream " << cfg.id
+              << " port=" << cfg.outputPort
+              << " filtering=" << (configManager.subscribers.filteringEnabled ? "on" : "off")
+              << std::endl;
+}
+
+GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& cfg, std::string& error) {
+    error.clear();
+    const uint16_t relayPort = tvs::protocols::transcodedSrtInternalPort(cfg);
+
+    for (const char* factory : {"udpsrc", "queue", "tsparse"}) {
+        if (!hasElementFactory(factory)) {
+            error = missingElementStatus(factory);
+            return nullptr;
+        }
+    }
+
+    GstElement* pipeline = gst_pipeline_new(nullptr);
+    GstElement* src = gst_element_factory_make("udpsrc", nullptr);
+    GstElement* inputQueue = gst_element_factory_make("queue", nullptr);
+    GstElement* tsparse = gst_element_factory_make("tsparse", nullptr);
+    GstElement* outputQueue = gst_element_factory_make("queue", nullptr);
+
+    if (!pipeline || !src || !inputQueue || !tsparse || !outputQueue) {
+        error = "failed to create transcoded SRT relay elements";
+        if (pipeline) gst_object_unref(pipeline);
+        if (src) gst_object_unref(src);
+        if (inputQueue) gst_object_unref(inputQueue);
+        if (tsparse) gst_object_unref(tsparse);
+        if (outputQueue) gst_object_unref(outputQueue);
+        return nullptr;
+    }
+
+    gst_bin_add_many(GST_BIN(pipeline), src, inputQueue, tsparse, outputQueue, nullptr);
+
+    // Use the exact same SRT sink constructor as a non-transcoded stream.
+    // This is important for subscriber monitoring: caller-connecting,
+    // caller-added, caller-removed and caller-rejected are connected in one
+    // common place and feed the same active-session table.
+    GstElement* sink = createOutputSink(cfg, pipeline, "transcoded_srt_sink");
+    if (!sink) {
+        error = "failed to create monitored SRT output sink";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    g_object_set(src,
+        "address", "127.0.0.1",
+        "port", static_cast<gint>(relayPort),
+        "reuse", TRUE,
+        "auto-multicast", FALSE,
+        "do-timestamp", FALSE,
+        "buffer-size", 4 * 1024 * 1024,
+        nullptr);
+    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true");
+    if (caps) {
+        g_object_set(src, "caps", caps, nullptr);
+        gst_caps_unref(caps);
+    }
+
+    g_object_set(inputQueue,
+        "max-size-buffers", 0,
+        "max-size-bytes", 0,
+        "max-size-time", static_cast<guint64>(12000000000ULL),
+        nullptr);
+    setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
+    setUIntPropertyIfPresent(tsparse, "smoothing-latency", 1800000);
+    setIntPropertyIfPresent(tsparse, "alignment", 7);
+    g_object_set(outputQueue,
+        "max-size-buffers", 0,
+        "max-size-bytes", 0,
+        "max-size-time", static_cast<guint64>(12000000000ULL),
+        nullptr);
+
+    if (!gst_element_link_many(src, inputQueue, tsparse, outputQueue, sink, nullptr)) {
+        error = "failed to link transcoded SRT relay pipeline";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    std::cerr << "Transcoded SRT output relay: stream=" << cfg.id
+              << " udp=127.0.0.1:" << relayPort
+              << " -> srt=" << (cfg.outputHost.empty() ? "auto" : cfg.outputHost)
+              << ":" << cfg.outputPort
+              << " mode=" << tvs::protocols::srtOutputMode(cfg)
+              << " monitoring=direct-callbacks"
+              << std::endl;
+    return pipeline;
+}
+
+bool StreamManager::startExternalSrtOutputs(StreamState* state, std::string& error) {
+    if (!state) {
+        return true;
+    }
+    error.clear();
+
+    for (const auto& outputConfig : tvs::protocols::outputConfigs(state->config)) {
+        if (!isExternalSrtListenerOutput(outputConfig)) {
+            continue;
+        }
+
+        auto output = std::make_unique<ExternalSrtOutputState>();
+        output->config = outputConfig;
+        output->pipeline = createExternalSrtOutputPipeline(outputConfig, error);
+        if (!output->pipeline) {
+            stopExternalSrtOutputs(state);
+            if (error.empty()) error = "failed to create transcoded SRT output relay";
+            return false;
+        }
+
+        output->bus = gst_element_get_bus(output->pipeline);
+        const GstStateChangeReturn stateChange = gst_element_set_state(output->pipeline, GST_STATE_PLAYING);
+        if (stateChange == GST_STATE_CHANGE_FAILURE) {
+            if (output->bus) {
+                GstMessage* msg = gst_bus_timed_pop_filtered(
+                    output->bus,
+                    2 * GST_SECOND,
+                    static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING));
+                if (msg) {
+                    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+                        GError* err = nullptr;
+                        gchar* dbg = nullptr;
+                        gst_message_parse_error(msg, &err, &dbg);
+                        if (err && err->message) error = err->message;
+                        if (dbg && *dbg) error += std::string(" | ") + dbg;
+                        if (err) g_error_free(err);
+                        g_free(dbg);
+                    }
+                    gst_message_unref(msg);
+                }
+            }
+            if (error.empty()) error = "failed to start transcoded SRT output relay";
+            if (output->pipeline) {
+                gst_element_set_state(output->pipeline, GST_STATE_NULL);
+                gst_object_unref(output->pipeline);
+                output->pipeline = nullptr;
+            }
+            if (output->bus) {
+                gst_object_unref(output->bus);
+                output->bus = nullptr;
+            }
+            stopExternalSrtOutputs(state);
+            return false;
+        }
+
+        state->externalSrtOutputs.push_back(std::move(output));
+    }
+    return true;
+}
+
+void StreamManager::stopExternalSrtOutputs(StreamState* state) {
+    if (!state) {
+        return;
+    }
+    for (auto& output : state->externalSrtOutputs) {
+        if (!output) continue;
+        if (output->pipeline) {
+            gst_element_set_state(output->pipeline, GST_STATE_NULL);
+        }
+        if (output->busThread.joinable()) {
+            output->busThread.join();
+        }
+        if (output->bus) {
+            gst_object_unref(output->bus);
+            output->bus = nullptr;
+        }
+        if (output->pipeline) {
+            gst_object_unref(output->pipeline);
+            output->pipeline = nullptr;
+        }
+    }
+    state->externalSrtOutputs.clear();
+}
+
+void StreamManager::monitorExternalSrtBus(const std::string& id, size_t outputIndex) {
+    (void)id;
+    (void)outputIndex;
 }
 
 bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
@@ -1241,12 +1306,22 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->sourceContext->config = streamConfig;
 
     if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
+        std::string srtRelayError;
+        if (!startExternalSrtOutputs(state.get(), srtRelayError)) {
+            std::cerr << "Transcoded SRT output setup failed for " << streamConfig.id
+                      << ": " << srtRelayError << std::endl;
+            state->statusMessage = "transcoded srt output failed: " + srtRelayError;
+            if (error) *error = srtRelayError.empty() ? "failed to start transcoded SRT output" : srtRelayError;
+            return false;
+        }
+
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
         if (!gstTranscoder->start(streamConfig, gstError)) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
+            stopExternalSrtOutputs(state.get());
             if (error) *error = gstError.empty() ? "GStreamer transcoder failed to start" : gstError;
             return false;
         }
@@ -1278,8 +1353,11 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             }
         }
         if (duplicateStart) {
-            if (state && state->gstTranscoder) {
-                state->gstTranscoder->stop();
+            if (state) {
+                stopExternalSrtOutputs(state.get());
+                if (state->gstTranscoder) {
+                    state->gstTranscoder->stop();
+                }
             }
             if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
@@ -1425,6 +1503,7 @@ bool StreamManager::stopStream(const std::string& id) {
     }
 
     auto& state = *statePtr;
+    stopExternalSrtOutputs(&state);
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
     }
@@ -1481,6 +1560,7 @@ void StreamManager::stopAll() {
 
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
+        stopExternalSrtOutputs(&state);
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
@@ -1684,72 +1764,6 @@ void StreamManager::pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::t
     }
 }
 
-void StreamManager::updateExternalSrtSessionsLocked(const std::map<std::string, std::set<std::string>>& sessionsByStream) {
-    for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
-        if (it->first.rfind("srt-ext:", 0) == 0) {
-            it = adHocSessions.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    for (const auto& [streamId, clientIps] : sessionsByStream) {
-        if (streamId.empty()) {
-            continue;
-        }
-        for (const auto& clientIp : clientIps) {
-            const std::string normalizedClientIp = normalizeIpAddress(clientIp);
-            if (normalizedClientIp.empty()) {
-                continue;
-            }
-            const std::string key = "srt-ext:" + streamId + ":" + normalizedClientIp;
-            adHocSessions[key] = {streamId, normalizedClientIp, "srt", now};
-        }
-    }
-}
-
-void StreamManager::monitorExternalSrtSessions() {
-    while (!externalSrtSessionMonitorStop.load()) {
-        std::vector<ExternalSrtWatch> watches;
-        {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            for (const auto& [streamId, state] : streams) {
-                if (!state || !state->active.load() || state->pipeline || !state->gstTranscoder) {
-                    continue;
-                }
-
-                std::set<pid_t> pids;
-                for (const auto pid : state->gstTranscoder->childPids()) {
-                    if (pid > 0) {
-                        pids.insert(pid);
-                    }
-                }
-                if (pids.empty()) {
-                    continue;
-                }
-
-                for (const auto& outputConfig : tvs::protocols::outputConfigs(state->config)) {
-                    if (!isExternalSrtListenerOutput(outputConfig)) {
-                        continue;
-                    }
-                    watches.push_back({streamId, outputConfig.outputPort, pids});
-                }
-            }
-        }
-
-        const auto sessionsByStream = detectExternalSrtSessions(watches);
-        {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            updateExternalSrtSessionsLocked(sessionsByStream);
-        }
-
-        for (int i = 0; i < 20 && !externalSrtSessionMonitorStop.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-}
-
 size_t StreamManager::activeHttpSessions(const std::string& clientIp) const {
     std::lock_guard<std::mutex> lock(managerMutex);
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
@@ -1899,8 +1913,10 @@ size_t StreamManager::restartSrtOutputsForStreams(const std::vector<std::string>
                 continue;
             }
             auto found = streams.find(streamId);
-            if (found == streams.end() || !found->second->pipeline ||
-                !hasSrtListenerOutput(found->second->config)) {
+            if (found == streams.end() || !hasSrtListenerOutput(found->second->config)) {
+                continue;
+            }
+            if (!found->second->pipeline && found->second->externalSrtOutputs.empty()) {
                 continue;
             }
             configs.push_back(found->second->config);
@@ -1951,7 +1967,8 @@ size_t StreamManager::restartAllSrtOutputs() {
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         for (const auto& [id, state] : streams) {
-            if (state->pipeline && hasSrtListenerOutput(state->config)) {
+            if (state && hasSrtListenerOutput(state->config) &&
+                (state->pipeline || !state->externalSrtOutputs.empty())) {
                 streamIds.push_back(id);
             }
         }
@@ -2941,14 +2958,7 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
     }
 
     if (type == "srt") {
-        auto* ctx = new SrtAccessContext{this, cfg.id};
-        g_object_set_data_full(G_OBJECT(sink), "srt-access-context", ctx, freeSrtAccessContext);
-        if (configManager.subscribers.filteringEnabled) {
-            g_signal_connect_data(sink, "caller-connecting", G_CALLBACK(StreamManager::onSrtCallerConnecting), ctx, nullptr, static_cast<GConnectFlags>(0));
-            g_signal_connect_data(sink, "caller-rejected", G_CALLBACK(StreamManager::onSrtCallerRejected), ctx, nullptr, static_cast<GConnectFlags>(0));
-        }
-        g_signal_connect_data(sink, "caller-added", G_CALLBACK(StreamManager::onSrtCallerAdded), ctx, nullptr, static_cast<GConnectFlags>(0));
-        g_signal_connect_data(sink, "caller-removed", G_CALLBACK(StreamManager::onSrtCallerRemoved), ctx, nullptr, static_cast<GConnectFlags>(0));
+        attachSrtConnectionMonitoring(sink, cfg);
         configureSrtSink(sink, cfg, configManager.subscribers.filteringEnabled);
     } else if (type == "http") {
         configureHttpSink(sink, cfg);

@@ -8,7 +8,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -29,6 +28,14 @@ struct RemapContext {
     bool programMapApplied = false;
     std::string videoPadName;
     std::string audioPadName;
+};
+
+
+struct ExternalSrtOutputState {
+    StreamConfig config;
+    GstElement* pipeline = nullptr;
+    GstBus* bus = nullptr;
+    std::thread busThread;
 };
 
 struct StreamState {
@@ -71,6 +78,7 @@ struct StreamState {
     std::mutex outputContinuityMutex;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<GstTranscoderProcess> gstTranscoder;
+    std::vector<std::unique_ptr<ExternalSrtOutputState>> externalSrtOutputs;
     std::vector<std::unique_ptr<RemapContext>> outputContexts;
 };
 
@@ -108,6 +116,9 @@ private:
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName);
+    GstElement* createExternalSrtOutputPipeline(const StreamConfig& cfg, std::string& error);
+    bool startExternalSrtOutputs(StreamState* state, std::string& error);
+    void stopExternalSrtOutputs(StreamState* state);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
     bool probeInputAvailable(const StreamConfig& baseConfig, const std::string& inputUri, std::chrono::milliseconds timeout);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
@@ -115,15 +126,15 @@ private:
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
+    void monitorExternalSrtBus(const std::string& id, size_t outputIndex);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);
     static GstPadProbeReturn inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     static GstPadProbeReturn outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
+    void attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg);
     void pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::time_point now);
-    void monitorExternalSrtSessions();
-    void updateExternalSrtSessionsLocked(const std::map<std::string, std::set<std::string>>& sessionsByStream);
     static gboolean onSrtCallerConnecting(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
     static void onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
     static void onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
@@ -142,7 +153,5 @@ private:
     std::map<std::string, HttpClientSession> adHocSessions;
     mutable std::mutex managerMutex;
     std::atomic<uint64_t> nextSessionId{0};
-    std::atomic<bool> externalSrtSessionMonitorStop{false};
-    std::thread externalSrtSessionThread;
     static void onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData);
 };

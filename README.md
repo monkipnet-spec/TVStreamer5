@@ -891,36 +891,35 @@ The listening ports should belong to `TVStreamer` only; `gst-launch-1.0` should 
 
 ### SRT после транскодирования
 
-В Release 2 внешний GStreamer-транскодер использует тот же смысл полей SRT, что и обычный поток TVStreamer5:
+В Release 2 внешний GStreamer-транскодер кодирует видео/звук и отдаёт готовый MPEG-TS во внутренний loopback UDP relay. Сам SRT Listener теперь снова принадлежит процессу `TVStreamer`, как и SRT без транскодинга. Поэтому события `caller-added` и `caller-removed` приходят напрямую из `srtsink`, а окно абонентов видит подключение сразу, без опроса `ss`.
 
-- `Listener`: процесс слушает `srt://:<port>` на `0.0.0.0` либо на адресе выбранного выходного интерфейса. Поле `Адрес выхода` используется только как адрес, показываемый в ссылке клиенту, и не используется как bind-адрес.
+Смысл полей SRT такой же, как у обычного SRT-потока:
+
+- `Listener`: TVStreamer слушает `srt://:<port>` на `0.0.0.0` либо на адресе выбранного выходного интерфейса. Поле `Адрес выхода` используется только как адрес, показываемый в ссылке клиенту, и не используется как bind-адрес.
 - `Caller`: `Адрес выхода` является адресом удалённого SRT-сервера, а выбранный выходной интерфейс применяется как локальный bind-адрес.
-- SRT получает MPEG-TS блоками по 1316 байт, latency 2500 мс и отправляется от live pipeline без дополнительного ожидания sink clock (`sync=false`). Входной `uridecodebin` работает без внутреннего buffering, чтобы live UDP/SRT источники не вызывали rebuffer/stall всей внешней pipeline. Для SRT/HTTP/HLS/RTP/UDP-VBR внешний транскодер не включает UDP-CBR `mpegtsmux bitrate`, чтобы не добавлять лишние null-пакеты и burst-паузы в файловые/TCP/SRT выходы.
+- Внешний `gst-launch-1.0` для SRT Listener больше не содержит `srtsink`; он содержит `udpsink host=127.0.0.1 port=<relay>`. SRT-сеть, фильтрация абонентов и активные сессии обслуживаются внутри TVStreamer.
 - Для совместимости с GStreamer 1.20.x на Ubuntu 22.04 внешний `gst-launch-1.0` не использует свойство `auto-reconnect` у `srtsink`, потому что в этой версии элемента такого свойства нет.
-- Если `gst-launch-1.0` завершается сразу из-за ошибки bind/URI/плагина, запуск потока теперь завершается ошибкой вместо ложного статуса `running`.
+- Если `gst-launch-1.0` завершается сразу из-за ошибки bind/URI/плагина, запуск потока завершается ошибкой вместо ложного статуса `running`.
 
-
-Если SRT после транскодирования запускается, но картинка/звук заикаются, сначала проверьте, что процесс запущен с pacing-настройками:
+Проверка процесса после запуска SRT Listener с транскодингом:
 
 ```bash
-ps -eo pid,ppid,args | grep gst-launch | grep srtsink | grep -v grep
+ps -eo pid,ppid,args | grep gst-launch | grep -v grep
 ```
 
-В команде должны быть видны:
+В команде внешнего транскодера должен быть виден внутренний relay:
 
 ```text
 uridecodebin ... use-buffering=false
 tsparse ... smoothing-latency=1800000
-srtsink ... latency=2500 sync=false blocksize=1316 wait-for-connection=false
+udpsink host=127.0.0.1 port=<relay>
 ```
 
-Для SRT Listener `wait-for-connection=false` оставляет live pipeline работающей даже до подключения клиента. Это уменьшает риск стартового клина и длинного rebuffer при подключении SRT-приёмника.
-
-Для проверки SRT Listener на сервере:
+А SRT-порт должен принадлежать процессу TVStreamer:
 
 ```bash
 ss -lunp | grep '<SRT_PORT>'
-journalctl -u tvstreamer5 -n 100 --no-pager | grep -Ei 'srt|GStreamer transcoder|error|failed|exit'
+journalctl -u tvstreamer5 -n 100 --no-pager | grep -Ei 'srt|caller|relay|GStreamer transcoder|error|failed|exit'
 ```
 
 Проверка приёмником GStreamer:
@@ -931,24 +930,7 @@ gst-launch-1.0 -v srtsrc uri="srt://SERVER_IP:SRT_PORT?mode=caller" ! tsparse ! 
 
 ### Active sessions for transcoded SRT
 
-Ordinary in-process SRT outputs receive `caller-added` and `caller-removed` callbacks directly from `srtsink`, so subscriber sessions are updated immediately.
+SRT без транскодинга и SRT Listener после транскодинга используют одинаковый механизм активных абонентских сессий: TVStreamer владеет `srtsink` и получает `caller-added`/`caller-removed` callbacks напрямую.
 
-Transcoded SRT outputs are produced by an external `gst-launch-1.0` process. Because that process owns the SRT listener, TVStreamer5 cannot receive the GStreamer SRT callback directly. Release 2 therefore polls the system UDP socket table and matches active SRT client sockets by `gst-launch-1.0` PID and SRT listener port. Matched remote IP addresses are added to the subscriber session table as active SRT sessions.
-
-Check active SRT client sockets on the server:
-
-```bash
-ss -H -u -a -n -p | grep gst-launch | grep ':<SRT_PORT>'
-```
-
-
-
-Release 2 build v65 fixes the build-fix package so the external SRT session monitor is included again. The monitor uses `ss -a` because SRT listener sockets may appear as UDP listener or established UDP sockets depending on the SRT library version.
-
-When a receiver is connected, the line should include the remote client IP. That IP must match the subscriber primary or backup IP and the subscriber must be assigned to the stream. The Subscribers dialog then shows the subscriber as Online.
-
-If the server hides process information from non-root users, run TVStreamer5 as root or check with:
-
-```bash
-sudo ss -H -u -a -n -p | grep ':<SRT_PORT>'
-```
+Когда приёмник подключён, его удалённый IP должен совпадать с основным или резервным IP абонента, а сам абонент должен быть привязан к этому потоку. После этого окно «Абоненты» показывает абонента как Online. Если приёмник подключается через NAT, указывайте тот IP, который видит сервер TVStreamer.
+\n\n### Единый мониторинг SRT-подключений\n\nSRT Listener без транскодинга и SRT Listener после транскодинга теперь создают `srtsink` через один и тот же код `StreamManager::createOutputSink()`. Поэтому для обоих режимов используются одинаковые GStreamer-события подключения:\n\n- `caller-connecting` — проверка доступа абонента;\n- `caller-added` — добавление активной SRT-сессии;\n- `caller-removed` — удаление активной SRT-сессии;\n- `caller-rejected` — журналирование отказа.\n\nОтдельный опрос `ss` для транскодированного SRT удалён. Он больше не нужен и мог давать двойной или запаздывающий подсчёт сессий. Внешний `gst-launch-1.0` только передаёт MPEG-TS на `127.0.0.1:<relay>`, а сетевой SRT Listener и мониторинг клиентов находятся внутри TVStreamer.\n\nДля проверки подключите SRT caller и смотрите журнал:\n\n```bash\njournalctl -u tvstreamer5 -f | grep -Ei 'SRT connection monitoring|SRT caller|Transcoded SRT output relay'\n```\n\nПри подключении ожидается `SRT caller added ... from <CLIENT_IP>`, а при отключении — `SRT caller removed ...`. Тот же IP используется для статуса Online в таблице абонентов.\n
