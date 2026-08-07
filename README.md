@@ -1,3 +1,20 @@
+### v44 — GStreamer deinterlace and pacing stabilization
+
+Version v44 stabilizes the clean GStreamer transcoder introduced in v43. The
+video path now always passes decoded frames through `deinterlace` and forces
+progressive `video/x-raw` caps before x264 encoding, so interlaced sources are
+not sent to viewers as combed/interlaced output.
+
+The MPEG-TS mux rate is now clamped to at least video bitrate + audio bitrate +
+800 kbit/s overhead. This prevents UDP-CBR output from being configured below
+the actual encoded stream rate, which could cause freezes or bursts when the UI
+target bitrate was lower than the selected transcoding bitrate.
+
+The gst-launch based transcoder also uses larger queues, `audiorate` for steady
+audio timestamps, `superfast` x264 preset for lower CPU pressure, and synthetic
+input/output bitrate statistics so the web quality graph no longer shows zero
+input while the external GStreamer transcoder is running.
+
 # TVStreamer5
 
 ### v43 — clean GStreamer transcoder engine
@@ -582,7 +599,7 @@ editor enables transcoding when these are available and reports:
 - AAC encoder: `fdkaacenc`, `voaacenc`, or `avenc_aac`;
 - MP3 encoder: `lamemp3enc` or `avenc_mp3` when installed.
 
-The stable v43 path re-encodes audio to AAC by default, even if the UI is still
+The stable v43/v44 path re-encodes audio to AAC by default, even if the UI is still
 set to `copy`, because AAC passthrough was the source of the earlier no-audio
 and broken-PMT problems. Existing passthrough streams remain available even when
 no transcoder engine is available.

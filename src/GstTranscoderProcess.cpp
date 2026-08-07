@@ -166,13 +166,16 @@ uint64_t safeAudioBitrate(const StreamConfig& cfg) {
 }
 
 uint64_t muxBitrate(const StreamConfig& cfg) {
-    if (cfg.targetBitrate > 0) return cfg.targetBitrate;
     const uint64_t video = safeVideoBitrate(cfg);
     const uint64_t audio = safeAudioBitrate(cfg);
-    return video + audio + 500000;
+    const uint64_t minimum = video + audio + 800000;
+    if (cfg.targetBitrate > 0) {
+        return std::max<uint64_t>(cfg.targetBitrate, minimum);
+    }
+    return minimum;
 }
 
-void addQueue(std::vector<std::string>& args, const std::string& name, guint64 maxTimeNs = 3000000000ULL) {
+void addQueue(std::vector<std::string>& args, const std::string& name, guint64 maxTimeNs = 5000000000ULL) {
     args.insert(args.end(), {
         "queue",
         property("name", name),
@@ -193,25 +196,26 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {
         "!", "video/x-raw",
         "!", "videoconvert",
+        "!", "deinterlace",
         "!", "videoscale", "add-borders=true",
         "!", "videorate",
         "!", "video/x-raw,format=I420,width=" + std::to_string(width) +
-              ",height=" + std::to_string(height) + ",framerate=25/1",
+              ",height=" + std::to_string(height) + ",framerate=25/1,pixel-aspect-ratio=1/1,interlace-mode=progressive",
         "!", "x264enc",
         "tune=zerolatency",
-        "speed-preset=veryfast",
+        "speed-preset=superfast",
         property("bitrate", std::to_string(bitrateKbps)),
         "key-int-max=50",
         "bframes=0",
         "byte-stream=true",
         "aud=true",
-        "sliced-threads=true",
+        "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
         "!", "h264parse", "config-interval=1",
         "!", "video/x-h264,stream-format=byte-stream,alignment=au",
         "!"
     });
-    addQueue(args, "transcode_video_mux_queue", 1000000000ULL);
+    addQueue(args, "transcode_video_mux_queue", 2000000000ULL);
     args.insert(args.end(), {"!", muxPad});
 }
 
@@ -236,6 +240,7 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "!", "audio/x-raw",
         "!", "audioconvert",
         "!", "audioresample",
+        "!", "audiorate",
         "!", rawAudioCaps,
         "!"
     });
@@ -281,7 +286,7 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     }
 
     args.insert(args.end(), {"!"});
-    addQueue(args, "transcode_audio_mux_queue", 1000000000ULL);
+    addQueue(args, "transcode_audio_mux_queue", 2000000000ULL);
     args.insert(args.end(), {"!", muxPad});
 }
 
@@ -297,7 +302,7 @@ void addMuxAndUdpSink(std::vector<std::string>& args, const StreamConfig& cfg) {
         "si-interval=9000",
         "!"
     });
-    addQueue(args, "transcode_output_queue", 1000000000ULL);
+    addQueue(args, "transcode_output_queue", 2000000000ULL);
     args.insert(args.end(), {
         "!", "udpsink",
         property("host", cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost),
@@ -353,8 +358,8 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
     }
 
     const char* required[] = {
-        "uridecodebin", "queue", "videoconvert", "videoscale", "videorate",
-        "x264enc", "h264parse", "audioconvert", "audioresample",
+        "uridecodebin", "queue", "videoconvert", "deinterlace", "videoscale", "videorate",
+        "x264enc", "h264parse", "audioconvert", "audioresample", "audiorate",
         "aacparse", "mpegtsmux", "udpsink", nullptr
     };
     std::vector<std::string> missing;
@@ -443,7 +448,7 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
             "uridecodebin",
             "name=dec",
             property("uri", inputUriForGstreamer(baseConfig)),
-            "use-buffering=false"
+            "use-buffering=true"
         });
         addVideoBranch(args, baseConfig, videoPad);
         addAudioBranch(args, baseConfig, audioPad, error);

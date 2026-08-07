@@ -6,12 +6,14 @@ required=(
   uridecodebin
   queue
   videoconvert
+  deinterlace
   videoscale
   videorate
   x264enc
   h264parse
   audioconvert
   audioresample
+  audiorate
   aacparse
   mpegtsmux
   udpsink
@@ -60,4 +62,6 @@ echo "  Launcher: $(command -v gst-launch-1.0)"
 echo "  Video encoder: x264enc"
 echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
+echo "  Deinterlace: deinterlace"
+echo "  Audio pacing: audiorate"
 echo "  UDP MPEG-TS mux/output: mpegtsmux + udpsink"

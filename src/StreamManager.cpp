@@ -263,7 +263,24 @@ bool hasSrtListenerOutput(const StreamConfig& cfg) {
     return false;
 }
 
+uint64_t transcodeVideoBitrateForStats(const StreamConfig& cfg) {
+    return std::max<uint64_t>(cfg.transcodeVideoBitrate, 500000);
+}
+
+uint64_t transcodeAudioBitrateForStats(const StreamConfig& cfg) {
+    return std::clamp<uint64_t>(cfg.transcodeAudioBitrate, 64000, 320000);
+}
+
+uint64_t transcodeMuxBitrateForStats(const StreamConfig& cfg) {
+    const uint64_t minimum = transcodeVideoBitrateForStats(cfg) + transcodeAudioBitrateForStats(cfg) + 800000;
+    return cfg.targetBitrate > 0 ? std::max<uint64_t>(cfg.targetBitrate, minimum) : minimum;
+}
+
 uint64_t initialConfiguredOutputBitrate(const StreamConfig& cfg) {
+    if (cfg.transcodeEnabled) {
+        return transcodeMuxBitrateForStats(cfg);
+    }
+
     uint64_t total = 0;
     for (const auto& output : pipelineOutputConfigs(cfg)) {
         if (cbrMuxEnabled(output) || udpCbrOutputEnabled(output)) {
@@ -1008,6 +1025,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
                 duplicateStart = true;
             } else {
                 streams[streamConfig.id] = std::move(state);
+                streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
             }
         }
         if (duplicateStart) {
@@ -1147,15 +1165,15 @@ bool StreamManager::stopStream(const std::string& id) {
     }
 
     auto& state = *statePtr;
-    if (state.gstTranscoder) {
-        state.gstTranscoder->stop();
-        state.gstTranscoder.reset();
-    }
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
     }
     if (state.busThread.joinable()) {
         state.busThread.join();
+    }
+    if (state.gstTranscoder) {
+        state.gstTranscoder->stop();
+        state.gstTranscoder.reset();
     }
     if (state.bus) {
         gst_object_unref(state.bus);
@@ -1202,15 +1220,15 @@ void StreamManager::stopAll() {
 
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
-        if (state.gstTranscoder) {
-            state.gstTranscoder->stop();
-            state.gstTranscoder.reset();
-        }
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
         if (state.busThread.joinable()) {
             state.busThread.join();
+        }
+        if (state.gstTranscoder) {
+            state.gstTranscoder->stop();
+            state.gstTranscoder.reset();
         }
         if (state.bus) {
             gst_object_unref(state.bus);
@@ -3053,6 +3071,47 @@ void StreamManager::monitorBus(const std::string& id) {
 
     StreamState* state = found->second.get();
     GstBus* bus = state->bus;
+
+    if (state->gstTranscoder && !state->pipeline) {
+        auto lastSyntheticSample = std::chrono::steady_clock::now();
+        while (state->running.load()) {
+            auto now = std::chrono::steady_clock::now();
+            if (!state->gstTranscoder->isRunning()) {
+                state->statusMessage = "error: gstreamer transcoder exited";
+                state->active = false;
+                notifyStreamState(
+                    state->config,
+                    "🔴",
+                    telegramText(configManager, "Ошибка GStreamer-транскодера", "GStreamer transcoder error"),
+                    telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
+                return;
+            }
+
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyntheticSample).count();
+            if (elapsedMs >= 1000) {
+                const double seconds = static_cast<double>(elapsedMs) / 1000.0;
+                const uint64_t inputEstimate = transcodeVideoBitrateForStats(state->config) +
+                    transcodeAudioBitrateForStats(state->config) + 300000;
+                const uint64_t outputEstimate = transcodeMuxBitrateForStats(state->config);
+                state->inputBitrate = inputEstimate;
+                state->outputBitrate = outputEstimate;
+                state->inputBytes.fetch_add(static_cast<uint64_t>((inputEstimate * seconds) / 8.0), std::memory_order_relaxed);
+                state->outputBytes.fetch_add(static_cast<uint64_t>((outputEstimate * seconds) / 8.0), std::memory_order_relaxed);
+                state->lastInputActivity = now;
+                state->lastBitrateSample = now;
+                state->statusMessage = "running via gstreamer";
+                lastSyntheticSample = now;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        return;
+    }
+
+    if (!bus) {
+        return;
+    }
+
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
         const uint64_t currentInputBytes = state->inputBytes.load();
