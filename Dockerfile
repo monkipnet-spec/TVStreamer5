@@ -44,6 +44,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-rtsp \
     && rm -rf /var/lib/apt/lists/*
 
+# Fail the image build immediately if a plugin required by the transcoder UI
+# is not actually visible to the runtime GStreamer registry. This catches
+# incomplete runtime images instead of showing every element as unavailable.
+RUN set -eux; \
+    for element in \
+      uridecodebin decodebin queue videoconvert deinterlace videoscale videorate \
+      capsfilter x264enc h264parse audioconvert audioresample audiorate aacparse \
+      mpegtsmux udpsink; do \
+        gst-inspect-1.0 "$element" >/dev/null; \
+    done; \
+    if gst-inspect-1.0 voaacenc >/dev/null 2>&1; then :; \
+    elif gst-inspect-1.0 fdkaacenc >/dev/null 2>&1; then :; \
+    elif gst-inspect-1.0 avenc_aac >/dev/null 2>&1; then :; \
+    else echo "No supported AAC encoder was found in the runtime image" >&2; exit 1; fi
+
 COPY --from=build /src/build/TVStreamer /app/TVStreamer
 
 WORKDIR /data

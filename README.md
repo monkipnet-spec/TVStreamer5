@@ -824,3 +824,27 @@ Network monitoring:
 - Non-transcoded behavior should be treated as the stable baseline when diagnosing protocol-specific transcoder issues.
 - Exact HLS PID preservation after transcoding remains a known limitation and must be verified on generated segments.
 - For live IPTV, transport stability depends on source quality, kernel socket buffers, routing, multicast interface selection and available CPU for x264 encoding.
+
+### Проверка GStreamer внутри Docker
+
+Release 2 инициализирует GStreamer до запуска HTTP-интерфейса. Это важно: страница настройки потоков проверяет наличие элементов транскодера сразу после запуска приложения. Если registry GStreamer еще не инициализирован, интерфейс ошибочно может показать все элементы как отсутствующие, даже если пакеты установлены в контейнере.
+
+После пересборки контейнера можно проверить runtime напрямую:
+
+```bash
+docker exec tvstreamer5 gst-inspect-1.0 uridecodebin
+docker exec tvstreamer5 gst-inspect-1.0 decodebin
+docker exec tvstreamer5 gst-inspect-1.0 x264enc
+docker exec tvstreamer5 gst-inspect-1.0 h264parse
+docker exec tvstreamer5 gst-inspect-1.0 aacparse
+docker exec tvstreamer5 gst-inspect-1.0 mpegtsmux
+docker exec tvstreamer5 gst-inspect-1.0 udpsink
+```
+
+Для краткой проверки всех обязательных элементов из исходного дерева:
+
+```bash
+./scripts/check_transcoder_plugins.sh
+```
+
+Dockerfile также выполняет обязательную проверку этих элементов во время `docker build`. Если один из критических GStreamer-плагинов отсутствует, новый образ теперь не будет собран успешно.

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <boost/asio.hpp>
+#include <gst/gst.h>
 
 #include "ConfigManager.h"
 #include "TelegramNotifier.h"
@@ -8,6 +9,21 @@
 
 int main() {
     std::cerr << "main() entered" << std::endl;
+
+    // Initialize GStreamer before HttpServer is created. The web UI queries
+    // transcoder capabilities during startup, and GstElementFactory lookups
+    // return no factories until the GStreamer registry has been initialized.
+    GError* gstError = nullptr;
+    if (!gst_init_check(nullptr, nullptr, &gstError)) {
+        std::cerr << "GStreamer initialization failed";
+        if (gstError && gstError->message) {
+            std::cerr << ": " << gstError->message;
+        }
+        std::cerr << std::endl;
+        if (gstError) g_error_free(gstError);
+        return 1;
+    }
+    std::cerr << "GStreamer initialized" << std::endl;
 
     ConfigManager configManager;
     if (!configManager.load()) {

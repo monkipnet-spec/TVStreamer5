@@ -1065,7 +1065,7 @@ GstElement* makeCapsFilter(const char* capsDescription) {
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
-    : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(false) {
+    : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(gst_is_initialized()) {
     std::cerr << "StreamManager constructed" << std::endl;
 }
 

@@ -14,17 +14,21 @@ done
 
 required=(
   uridecodebin
+  decodebin
   queue
   videoconvert
   deinterlace
   videoscale
   videorate
+  capsfilter
   x264enc
   h264parse
   audioconvert
   audioresample
   audiorate
   aacparse
+  mpegtsmux
+  udpsink
 )
 
 missing=()
