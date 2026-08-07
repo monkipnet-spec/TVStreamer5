@@ -11,43 +11,36 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
 
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
-    const int port = (cfg.outputPort > 0 && cfg.outputPort <= 65535) ? cfg.outputPort : 7001;
-    const std::string bindHost = (!cfg.interfaceAddress.empty() && cfg.interfaceAddress != "::")
-        ? cfg.interfaceAddress
-        : "0.0.0.0";
-    const std::string targetHost = safeHost(cfg.outputHost, "127.0.0.1");
+    const int port = cfg.outputPort > 0 ? cfg.outputPort : 7001;
 
-    // Match the in-process SRT path exactly.  In listener mode the selected
-    // output interface is the bind address; outputHost is only the advertised
-    // address shown to clients.  Explicitly set both the URI mode and the mode
-    // property because Ubuntu 22.04 commonly ships GStreamer 1.20.x and this is
-    // more robust than relying only on query-string parsing.
+    // Keep the external transcoder SRT semantics identical to the proven
+    // in-process StreamManager path.  outputHost is the remote/advertised
+    // address; it must never become the bind address for listener mode.
+    // GStreamer documents srt://:PORT as the listener form.  Bind a selected
+    // local interface explicitly through localaddress instead.
     const std::string uri = caller
-        ? "srt://" + targetHost + ":" + std::to_string(port) + "?mode=caller"
-        : "srt://" + bindHost + ":" + std::to_string(port) + "?mode=listener";
+        ? "srt://" + safeHost(cfg.outputHost, "127.0.0.1") + ":" + std::to_string(port) + "?mode=caller"
+        : "srt://:" + std::to_string(port) + "?mode=listener";
 
     args.insert(args.end(), {
         "srtsink",
         "uri=" + uri,
-        "mode=" + mode,
         "latency=250",
         "sync=false",
         "async=false",
         "qos=false",
         "max-lateness=-1",
         "blocksize=1316",
-        "auto-reconnect=true",
         "wait-for-connection=false",
         "poll-timeout=1000"
     });
 
+    if (!cfg.interfaceAddress.empty() && cfg.interfaceAddress != "0.0.0.0" && cfg.interfaceAddress != "::") {
+        args.push_back("localaddress=" + cfg.interfaceAddress);
+    }
     if (caller) {
-        if (!cfg.interfaceAddress.empty() && cfg.interfaceAddress != "0.0.0.0" && cfg.interfaceAddress != "::") {
-            args.push_back("localaddress=" + cfg.interfaceAddress);
-        }
         args.push_back("localport=0");
     } else {
-        args.push_back("localaddress=" + bindHost);
         args.push_back("localport=" + std::to_string(port));
     }
 
@@ -55,7 +48,7 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     if (caller) {
         spec.description = "srt-caller@" + uri;
     } else {
-        const std::string advertised = safeHost(cfg.outputHost, bindHost);
+        const std::string advertised = safeHost(cfg.outputHost, safeHost(cfg.interfaceAddress, "0.0.0.0"));
         spec.description = "srt-listener@srt://" + advertised + ":" + std::to_string(port);
     }
     return true;
