@@ -341,8 +341,7 @@ uint64_t transcodeInputBitrateForStats(const StreamConfig& cfg) {
 }
 
 uint64_t transcodeMuxBitrateForStats(const StreamConfig& cfg) {
-    const uint64_t minimum = transcodeVideoBitrateForStats(cfg) + transcodeAudioBitrateForStats(cfg) + 1200000;
-    return cfg.targetBitrate > 0 ? std::max<uint64_t>(cfg.targetBitrate, minimum) : minimum;
+    return tvs::protocols::muxBitrate(cfg);
 }
 
 uint16_t transcodeRelayPort(const StreamConfig& cfg) {
@@ -358,7 +357,7 @@ StreamConfig transcodeRelayOutputConfig(const StreamConfig& cfg) {
     relay.outputHost = tvs::protocols::transcodedFifoRelayPath(cfg);
     relay.outputPort = 0;
     relay.additionalOutputs.clear();
-    relay.cbr = false;
+    relay.cbr = true;
     relay.targetBitrate = transcodeMuxBitrateForStats(cfg);
     return relay;
 }
@@ -666,6 +665,7 @@ void updateOutputContinuityErrors(StreamState* state, GstBufferList* list) {
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilteringEnabled) {
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
+    const bool transcoded = cfg.transcodeEnabled;
     const std::string targetHost = cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::"
         ? "127.0.0.1"
         : cfg.outputHost;
@@ -689,14 +689,21 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
     }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "latency", 250);
+    setIntPropertyIfPresent(sink, "latency", transcoded ? 2500 : 250);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
     if (caller) {
         setUIntPropertyIfPresent(sink, "localport", 0);
     }
 
-    if (cfg.targetBitrate > 0) {
+    if (transcoded) {
+        // The external transcoder already produces and clock-paces a CBR TS.
+        // Do not apply GstBaseSink max-bitrate here: targetBitrate may still
+        // contain the UI default (for example 2 Mbit/s) while the transcoder
+        // is producing 6+ Mbit/s. Throttling the public SRT sink below the
+        // real mux bitrate creates periodic queue build-up and A/V stutter.
+        setUInt64PropertyIfPresent(sink, "max-bitrate", 0);
+    } else if (cfg.targetBitrate > 0) {
         setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
     }
 
@@ -706,6 +713,8 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
               << ":" << cfg.outputPort
               << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
               << " auth=" << (accessFilteringEnabled ? "on" : "off")
+              << " transcode=" << (transcoded ? "yes" : "no")
+              << " latency-ms=" << (transcoded ? 2500 : 250)
               << std::endl;
 }
 
@@ -1155,8 +1164,11 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
         "port", static_cast<gint>(relayPort),
         "reuse", TRUE,
         "auto-multicast", FALSE,
-        "do-timestamp", FALSE,
-        "buffer-size", 4 * 1024 * 1024,
+        // The external CBR pacer controls packet timing. Timestamp buffers at
+        // their loopback arrival time instead of rebuilding PCR timestamps a
+        // second time in the in-process SRT relay.
+        "do-timestamp", TRUE,
+        "buffer-size", 16 * 1024 * 1024,
         nullptr);
     GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true");
     if (caps) {
@@ -1167,15 +1179,17 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
     g_object_set(inputQueue,
         "max-size-buffers", 0,
         "max-size-bytes", 0,
-        "max-size-time", static_cast<guint64>(12000000000ULL),
+        "max-size-time", static_cast<guint64>(5000000000ULL),
         nullptr);
-    setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
-    setUIntPropertyIfPresent(tsparse, "smoothing-latency", 1800000);
+    // The external path already performs PCR smoothing and CBR pacing. A
+    // second set-timestamps/smoothing stage here periodically corrects the
+    // clock against loopback arrival time and can produce regular SRT pauses.
+    setBooleanPropertyIfPresent(tsparse, "set-timestamps", FALSE);
     setIntPropertyIfPresent(tsparse, "alignment", 7);
     g_object_set(outputQueue,
         "max-size-buffers", 0,
         "max-size-bytes", 0,
-        "max-size-time", static_cast<guint64>(12000000000ULL),
+        "max-size-time", static_cast<guint64>(5000000000ULL),
         nullptr);
 
     if (!gst_element_link_many(src, inputQueue, tsparse, outputQueue, sink, nullptr)) {

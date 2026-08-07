@@ -3,6 +3,7 @@
 #include "protocols/GstProtocolTypes.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace tvs::protocols::outputs {
 
@@ -56,12 +57,11 @@ void appendMpegTsMux(std::vector<std::string>& args, const StreamConfig& cfg) {
         "si-interval=9000"
     });
 
-    // CBR null-packet padding is only useful for UDP-CBR.  Applying a fixed
-    // muxrate to SRT/HTTP/HLS/RTP/UDP-VBR makes file/TCP/SRT delivery burstier
-    // and can create stalls on receivers after transcoding.
-    if (outputKind(cfg) == OutputKind::UdpCbr) {
-        args.push_back("bitrate=" + std::to_string(muxBitrate(cfg)));
-    }
+    // Every MPEG-TS output produced by the external transcoder uses one
+    // deterministic transport-stream bitrate. mpegtsmux inserts NULL packets
+    // when the encoded A/V payload is below the selected mux rate, so UDP,
+    // SRT, HTTP, HLS, RTP and relay outputs all leave the transcoder as CBR.
+    args.push_back("bitrate=" + std::to_string(muxBitrate(cfg)));
 
     // Remap belongs to the MPEG-TS mux, not to the network sink.  Requesting
     // sink_<PID> pads fixes the elementary PIDs.  prog-map then places both
@@ -86,6 +86,26 @@ void appendTsSmoother(std::vector<std::string>& args, const std::string& name, u
         "set-timestamps=true",
         "smoothing-latency=" + std::to_string(smoothingLatencyUs),
         "alignment=7",
+        "!"
+    });
+}
+
+void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name) {
+    const uint64_t bytesPerSecond64 = std::max<uint64_t>(muxBitrate(cfg) / 8, 1);
+    const uint64_t maxIdentityRate = static_cast<uint64_t>(std::numeric_limits<int>::max());
+    const int bytesPerSecond = static_cast<int>(std::min<uint64_t>(bytesPerSecond64, maxIdentityRate));
+
+    // identity.datarate retimestamps buffers from byte count and sync=true
+    // releases them against the pipeline clock. This prevents the CBR mux from
+    // being emitted in periodic bursts when a downstream sink has sync=false.
+    args.insert(args.end(), {
+        "identity",
+        "name=" + name,
+        "silent=true",
+        "signal-handoffs=false",
+        "single-segment=true",
+        "sync=true",
+        "datarate=" + std::to_string(bytesPerSecond),
         "!"
     });
 }

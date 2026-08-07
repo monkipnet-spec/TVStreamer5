@@ -2,6 +2,7 @@
 
 #include "utils.h"
 #include "TranscoderModule.h"
+#include "protocols/GstProtocolTypes.h"
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -972,7 +973,7 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     sample.active = state.get("active", false).asBool();
     sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
     sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
-    sample.targetKbps = cfg.targetBitrate / 1000;
+    sample.targetKbps = (cfg.transcodeEnabled ? tvs::protocols::muxBitrate(cfg) : cfg.targetBitrate) / 1000;
     sample.inputCcErrors = state.get("input_cc_errors", state.get("cc_errors", Json::UInt64(0))).asUInt64();
     sample.outputCcErrors = state.get("output_cc_errors", Json::UInt64(0)).asUInt64();
     sample.status = state.get("status", "").asString();

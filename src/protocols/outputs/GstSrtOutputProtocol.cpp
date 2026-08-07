@@ -6,8 +6,9 @@ namespace tvs::protocols::outputs {
 
 bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendTsSmoother(args, "transcode_srt_ts_smoother", 1800000);
-    appendOutputQueueWithTime(args, "transcode_srt_output_queue", 12000000000ULL, false);
+    appendTsSmoother(args, "transcode_srt_ts_smoother", 500000);
+    appendCbrPacer(args, cfg, "transcode_srt_cbr_pacer");
+    appendOutputQueueWithTime(args, "transcode_srt_output_queue", 5000000000ULL, false);
 
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
@@ -22,7 +23,8 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
             "sync=false",
             "async=false",
             "qos=false",
-            "blocksize=1316"
+            "blocksize=1316",
+            "buffer-size=8388608"
         });
 
         assignTsPads(cfg, spec);

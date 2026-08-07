@@ -4,8 +4,9 @@
 namespace tvs::protocols::outputs {
 bool appendHttpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendTsSmoother(args, "transcode_http_ts_smoother", 1200000);
-    appendOutputQueueWithTime(args, "transcode_http_output_queue", 12000000000ULL, false);
+    appendTsSmoother(args, "transcode_http_ts_smoother", 500000);
+    appendCbrPacer(args, cfg, "transcode_http_cbr_pacer");
+    appendOutputQueueWithTime(args, "transcode_http_output_queue", 8000000000ULL, false);
     const int internalPort = static_cast<int>(transcodedHttpInternalPort(cfg));
     args.insert(args.end(), {
         "tcpserversink",

@@ -590,8 +590,13 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
                   << " remap=" << (config.remapEnabled ? "on" : "off")
                   << " service=" << config.serviceId
                   << " vpid=" << config.videoPid
-                  << " apid=" << config.audioPid
-                  << std::endl;
+                  << " apid=" << config.audioPid;
+        if (tvs::protocols::isTsOutput(tvs::protocols::outputKind(output))) {
+            std::cerr << " ts-cbr-bitrate=" << tvs::protocols::muxBitrate(output);
+        } else {
+            std::cerr << " encoder-cbr-bitrate=" << tvs::protocols::safeVideoBitrate(output);
+        }
+        std::cerr << std::endl;
         started.push_back(child);
     }
 

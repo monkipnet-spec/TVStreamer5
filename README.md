@@ -828,28 +828,29 @@ Network monitoring:
 - Exact HLS PID preservation after transcoding remains a known limitation and must be verified on generated segments.
 - For live IPTV, transport stability depends on source quality, kernel socket buffers, routing, multicast interface selection and available CPU for x264 encoding.
 
-### Live pacing for transcoded SRT/HTTP/HLS
+### CBR pacing for all transcoded outputs
 
-For live IPTV inputs the external GStreamer transcoder now disables `uridecodebin use-buffering`. This avoids repeated live-source rebuffering that can stall all transcoded outputs at the same time.
+For live IPTV inputs the external GStreamer transcoder disables `uridecodebin use-buffering` so a live UDP/SRT source is not repeatedly paused by generic URI buffering.
 
-MPEG-TS muxrate padding is now reserved for `udp-cbr` output only. SRT, HTTP, HLS, RTP and UDP-VBR receive the encoded audio/video stream without forced UDP-CBR null-packet padding, which reduces burst delivery and periodic stalls on SRT clients, HTTP TS clients and HLS segment readers.
+All **MPEG-TS based outputs after transcoding** now use one CBR transport policy: `mpegtsmux bitrate=<effective_mux_bitrate>` inserts NULL packets to maintain the selected multiplex bitrate, then `tsparse` normalizes TS timing and an `identity datarate=<bytes/s> sync=true` pacer releases the transport stream against the pipeline clock. This applies to UDP (including the old `udp-vbr` selector while transcoding), SRT, HTTP TS, HLS, RTP and FIFO relay outputs.
 
-If SRT still stutters, compare the client latency with the server latency. Recommended first test value on the receiver side is 2500-3000 ms.
+The effective TS CBR bitrate is `max(target_bitrate, video_bitrate + audio_bitrate + 1.2 Mbit/s)`. The extra headroom is reserved for MPEG-TS/SI overhead and prevents the mux target from being lower than the encoded elementary streams. The effective value is printed in the journal as `ts-cbr-bitrate=<bits_per_second>`.
 
+RTMP/YouTube and RTSP do not carry MPEG-TS, so TS NULL-packet stuffing is not applicable to those protocols. Their transcoded H.264 branch still uses x264 CBR/HRD (`nal-hrd=cbr`, fixed encoder bitrate, VBV and CFR), and the audio encoder uses the configured fixed bitrate.
 
-### Live HTTP/HLS/SRT stability profile
-
-Release 2 uses a more buffered profile for file/TCP/SRT outputs after transcoding. HTTP, HLS and SRT do not use UDP-CBR null-packet padding; they use a larger MPEG-TS timestamp smoother and a 12 second output queue so short input jitter or receiver-side pauses do not immediately stop the live output.
-
-Current transcoded HTTP/HLS/SRT defaults:
+Current TS output pacing profile:
 
 ```text
-HTTP: tsparse smoothing-latency=1200000, output queue=12s, tcpserversink sync=false
-HLS:  tsparse smoothing-latency=1200000, output queue=12s, target-duration=6, playlist-length=3
-SRT:  tsparse smoothing-latency=1800000, output queue=12s, latency=2500, sync=false
+UDP/RTP: mpegtsmux CBR -> tsparse -> identity CBR pacer -> network sink
+HTTP:    mpegtsmux CBR -> tsparse -> identity CBR pacer -> tcpserversink
+HLS:     mpegtsmux CBR -> tsparse -> identity CBR pacer -> hlssink
+SRT:     mpegtsmux CBR -> tsparse -> identity CBR pacer -> loopback relay/public SRT
+FIFO:    mpegtsmux CBR -> tsparse -> identity CBR pacer -> filesink/FIFO
 ```
 
-If the SRT receiver has its own latency setting, set it to at least 2500 ms for the first test. Very low receiver latency values can still cause audio/video stutter even when the server sends a stable stream.
+For an SRT Listener with transcoding, the public `srtsink` is still owned by TVStreamer5 so subscriber monitoring continues to use the normal `caller-added`/`caller-removed` callbacks. The external transcoder only sends the already paced CBR MPEG-TS over `127.0.0.1:<relay>`. The in-process relay no longer rebuilds PCR timestamps a second time. Transcoded SRT also uses a 2500 ms SRT latency and disables `GstBaseSink max-bitrate`; the latter is important because a stale/default `target_bitrate` can otherwise throttle a 6+ Mbit/s transcoded stream to only about 2 Mbit/s and create periodic A/V stalls.
+
+Recommended first receiver test for transcoded SRT is 2500-3000 ms latency.
 
 ### Проверка GStreamer внутри Docker
 
@@ -864,6 +865,7 @@ docker exec tvstreamer5 gst-inspect-1.0 x264enc
 docker exec tvstreamer5 gst-inspect-1.0 h264parse
 docker exec tvstreamer5 gst-inspect-1.0 aacparse
 docker exec tvstreamer5 gst-inspect-1.0 mpegtsmux
+docker exec tvstreamer5 gst-inspect-1.0 identity
 docker exec tvstreamer5 gst-inspect-1.0 udpsink
 ```
 
@@ -911,7 +913,9 @@ ps -eo pid,ppid,args | grep gst-launch | grep -v grep
 
 ```text
 uridecodebin ... use-buffering=false
-tsparse ... smoothing-latency=1800000
+mpegtsmux ... bitrate=<effective_cbr_bitrate>
+tsparse ... smoothing-latency=500000
+identity ... datarate=<effective_cbr_bytes_per_second> sync=true
 udpsink host=127.0.0.1 port=<relay>
 ```
 

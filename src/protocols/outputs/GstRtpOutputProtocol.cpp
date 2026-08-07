@@ -7,7 +7,8 @@ namespace tvs::protocols::outputs {
 
 bool appendRtpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendTsSmoother(args, "transcode_rtp_ts_smoother", 250000);
+    appendTsSmoother(args, "transcode_rtp_ts_smoother", 300000);
+    appendCbrPacer(args, cfg, "transcode_rtp_cbr_pacer");
     appendOutputQueue(args, "transcode_rtp_output_queue", false);
     args.insert(args.end(), {
         "rtpmp2tpay",
@@ -15,7 +16,7 @@ bool appendRtpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         "udpsink",
         "host=" + safeHost(cfg.outputHost, "127.0.0.1"),
         "port=" + std::to_string(cfg.outputPort),
-        "sync=true",
+        "sync=false",
         "async=false",
         "qos=false",
         "auto-multicast=true",

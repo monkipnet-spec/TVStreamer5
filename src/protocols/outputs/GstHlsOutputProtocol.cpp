@@ -42,12 +42,12 @@ void appendHlsMux(std::vector<std::string>& args, const StreamConfig& cfg, GstOu
         "pat-interval=9000",
         "pmt-interval=9000",
         "pcr-interval=1800",
-        "si-interval=9000"
+        "si-interval=9000",
+        "bitrate=" + std::to_string(muxBitrate(cfg))
     });
 
-    // HLS should segment the encoded A/V elementary streams as they are
-    // produced.  Do not force UDP-style CBR padding into every segment; it
-    // increases disk/TCP bursts and was seen as periodic HLS stalls.
+    // HLS uses the same transport-stream CBR policy as the other transcoded
+    // MPEG-TS outputs. Null-packet stuffing keeps segment size/rate stable.
 
     if (cfg.remapEnabled) {
         // mpegtsmux uses the numeric suffix of a requested sink_<PID> pad as
@@ -73,8 +73,9 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     // generic mux helper. This keeps PID/service remapping deterministic for
     // every newly generated segment.
     appendHlsMux(args, cfg, spec);
-    appendTsSmoother(args, "transcode_hls_ts_smoother", 1200000);
-    appendOutputQueueWithTime(args, "transcode_hls_output_queue", 12000000000ULL, false);
+    appendTsSmoother(args, "transcode_hls_ts_smoother", 500000);
+    appendCbrPacer(args, cfg, "transcode_hls_cbr_pacer");
+    appendOutputQueueWithTime(args, "transcode_hls_output_queue", 8000000000ULL, false);
 
     // Remove an old playlist and stale .ts files before starting a new HLS
     // generation. Otherwise a client can briefly read segments from the

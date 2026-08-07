@@ -28,6 +28,7 @@ required=(
   audiorate
   aacparse
   mpegtsmux
+  identity
   udpsink
 )
 
@@ -76,11 +77,11 @@ input_elements=(
 )
 
 output_elements=(
-  "udp/udp-cbr/udp-vbr:mpegtsmux tsparse udpsink"
-  "rtp:mpegtsmux tsparse rtpmp2tpay udpsink"
-  "http:mpegtsmux tsparse tcpserversink"
-  "hls:mpegtsmux tsparse hlssink"
-  "srt:mpegtsmux tsparse srtsink"
+  "udp/udp-cbr/udp-vbr:mpegtsmux tsparse identity udpsink"
+  "rtp:mpegtsmux tsparse identity rtpmp2tpay udpsink"
+  "http:mpegtsmux tsparse identity tcpserversink"
+  "hls:mpegtsmux tsparse identity hlssink"
+  "srt:mpegtsmux tsparse identity srtsink udpsink"
   "rtmp/youtube:flvmux rtmpsink"
   "rtsp-push:rtspclientsink"
 )
