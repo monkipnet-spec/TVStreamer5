@@ -26,7 +26,7 @@ std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
         case OutputKind::Rtp:
             return {"mpegtsmux", "tsparse", "rtpmp2tpay", "udpsink"};
         case OutputKind::Srt:
-            return {"mpegtsmux", "tsparse", "srtsink"};
+            return {"mpegtsmux", "tsparse", "srtsink", "udpsink"};
         case OutputKind::Http:
             return {"mpegtsmux", "tsparse", "tcpserversink"};
         case OutputKind::Hls:

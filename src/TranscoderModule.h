@@ -20,9 +20,9 @@ class TranscoderModule {
 public:
     static TranscoderCapabilities inspectCapabilities();
 
-    // Creates a completely isolated GstBin with one MPEG-TS sink ghost pad and one
-    // MPEG-TS source ghost pad. The bin owns demuxing, decoding, scaling, encoding,
-    // audio conversion, remuxing and ignored-pad draining.
+    // Creates a completely isolated GstBin with one generic input ghost pad and one
+    // MPEG-TS source ghost pad. The bin owns parsing, decoding, scaling, encoding,
+    // optional original-audio passthrough, remuxing and ignored-pad draining.
     static GstElement* createBin(const StreamConfig& config, std::string& error);
 
     static bool resolutionSize(const std::string& resolution, int& width, int& height);

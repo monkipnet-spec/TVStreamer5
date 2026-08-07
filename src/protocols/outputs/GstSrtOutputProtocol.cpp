@@ -13,14 +13,27 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     const bool caller = mode == "caller";
     const int port = cfg.outputPort > 0 ? cfg.outputPort : 7001;
 
-    // Keep the external transcoder SRT semantics identical to the proven
-    // in-process StreamManager path.  outputHost is the remote/advertised
-    // address; it must never become the bind address for listener mode.
-    // GStreamer documents srt://:PORT as the listener form.  Bind a selected
-    // local interface explicitly through localaddress instead.
-    const std::string uri = caller
-        ? "srt://" + safeHost(cfg.outputHost, "127.0.0.1") + ":" + std::to_string(port) + "?mode=caller"
-        : "srt://:" + std::to_string(port) + "?mode=listener";
+    if (!caller) {
+        const uint16_t relayPort = transcodedSrtInternalPort(cfg);
+        args.insert(args.end(), {
+            "udpsink",
+            "host=127.0.0.1",
+            "port=" + std::to_string(relayPort),
+            "sync=false",
+            "async=false",
+            "qos=false",
+            "blocksize=1316"
+        });
+
+        assignTsPads(cfg, spec);
+        const std::string advertised = safeHost(cfg.outputHost, safeHost(cfg.interfaceAddress, "0.0.0.0"));
+        spec.description = "srt-listener-relay@127.0.0.1:" + std::to_string(relayPort) +
+                           "->srt://" + advertised + ":" + std::to_string(port);
+        return true;
+    }
+
+    const std::string uri = "srt://" + safeHost(cfg.outputHost, "127.0.0.1") + ":" +
+                            std::to_string(port) + "?mode=caller";
 
     args.insert(args.end(), {
         "srtsink",
@@ -38,19 +51,10 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     if (!cfg.interfaceAddress.empty() && cfg.interfaceAddress != "0.0.0.0" && cfg.interfaceAddress != "::") {
         args.push_back("localaddress=" + cfg.interfaceAddress);
     }
-    if (caller) {
-        args.push_back("localport=0");
-    } else {
-        args.push_back("localport=" + std::to_string(port));
-    }
+    args.push_back("localport=0");
 
     assignTsPads(cfg, spec);
-    if (caller) {
-        spec.description = "srt-caller@" + uri;
-    } else {
-        const std::string advertised = safeHost(cfg.outputHost, safeHost(cfg.interfaceAddress, "0.0.0.0"));
-        spec.description = "srt-listener@srt://" + advertised + ":" + std::to_string(port);
-    }
+    spec.description = "srt-caller@" + uri;
     return true;
 }
 

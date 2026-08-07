@@ -433,8 +433,9 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
             } else if (target == "/api/start-stream") {
+                handleStartStream(req.body());
                 res.set(http::field::content_type, "application/json");
-                res.body() = handleStartStream(req.body());
+                res.body() = "{\"result\": \"ok\"}";
             } else if (target == "/api/stop-stream") {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
@@ -1197,43 +1198,21 @@ std::string HttpServer::handleDeleteBackupFile(const std::string& body) {
     return Json::writeString(writer, response);
 }
 
-std::string HttpServer::handleStartStream(const std::string& body) {
-    Json::Value response;
+void HttpServer::handleStartStream(const std::string& body) {
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
     std::string errs;
     std::istringstream ss(body);
     if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
         std::cerr << "Invalid start-stream payload: " << errs << std::endl;
-        response["result"] = "error";
-        response["error"] = "invalid start-stream request: " + errs;
-    } else {
-        auto cfg = StreamConfig::fromJson(root);
-        std::string startError;
-        bool started = streamManager.startStream(cfg, &startError);
-        if (!started &&
-            !streamManager.isStreamActive(cfg.id) &&
-            streamManager.snapshot().count(cfg.id) > 0) {
-            std::string restartError;
-            started = streamManager.restartStream(cfg, &restartError);
-            if (!started && !restartError.empty()) startError = restartError;
-        }
-
-        if (started) {
-            response["result"] = "ok";
-            response["stream_id"] = cfg.id;
-        } else {
-            if (startError.empty()) startError = "stream failed to start";
-            std::cerr << "Start stream request failed for " << cfg.id << ": " << startError << std::endl;
-            response["result"] = "error";
-            response["stream_id"] = cfg.id;
-            response["error"] = startError;
-        }
+        return;
     }
-
-    Json::StreamWriterBuilder writer;
-    writer["indentation"] = "";
-    return Json::writeString(writer, response);
+    auto cfg = StreamConfig::fromJson(root);
+    if (!streamManager.startStream(cfg) &&
+        !streamManager.isStreamActive(cfg.id) &&
+        streamManager.snapshot().count(cfg.id) > 0) {
+        streamManager.restartStream(cfg);
+    }
 }
 
 void HttpServer::handleStopStream(const std::string& body) {
@@ -1509,12 +1488,6 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .form-row .checkbox-inline input{width:16px;height:16px}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
 .modal-actions button{min-width:100px;padding:8px 12px}
-.persistent-error{position:fixed;top:calc(var(--header-height,58px) + 14px);right:16px;z-index:80;width:min(560px,calc(100vw - 32px));background:rgba(66,14,18,.98);border:1px solid rgba(255,95,95,.72);border-radius:16px;padding:15px 17px;box-shadow:0 18px 50px rgba(0,0,0,.42);cursor:pointer;color:#fff;display:none}
-.persistent-error.active{display:block}
-.persistent-error-title{font-size:1.02rem;font-weight:800;color:#ffb5b5;margin-bottom:7px;padding-right:30px}
-.persistent-error-message{font-size:.9rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;color:#ffe5e5}
-.persistent-error-hint{margin-top:9px;font-size:.76rem;color:#ffc4c4;opacity:.84}
-.persistent-error-close{position:absolute;top:8px;right:10px;border:0;background:transparent;color:#ffd3d3;font-size:22px;line-height:26px;cursor:pointer;padding:0 4px}
 .about-list{display:grid;gap:10px;margin:4px 0 0}
 .about-row{display:grid;grid-template-columns:120px 1fr;gap:12px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:.9rem}
 .about-row:last-child{border-bottom:none}
@@ -1592,12 +1565,6 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <div id="modal" class="modal">
 <div class="modal-content" id="modalContent"></div>
 </div>
-<div id="persistentError" class="persistent-error" role="alert" aria-live="assertive" onclick="dismissPersistentError()">
-  <button class="persistent-error-close" type="button" aria-label="Close">×</button>
-  <div id="persistentErrorTitle" class="persistent-error-title"></div>
-  <div id="persistentErrorMessage" class="persistent-error-message"></div>
-  <div id="persistentErrorHint" class="persistent-error-hint"></div>
-</div>
 <script>
 const translations = {
   en: {
@@ -1606,7 +1573,7 @@ const translations = {
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     restartProgram:'Restart', restartConfirm:'Restart TVStreamer5 now?', restarting:'Restarting...',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
-    about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset', streamStartError:'Stream start error', streamStopError:'Stream stop error', clickToDismiss:'Click this message to close'
+    about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток',
@@ -1614,7 +1581,7 @@ const translations = {
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreamer5 сейчас?', restarting:'Перезапуск...',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
-    about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить', streamStartError:'Ошибка запуска потока', streamStopError:'Ошибка остановки потока', clickToDismiss:'Нажмите на это сообщение, чтобы закрыть'
+    about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
 };
 function normalizeLanguage(value) {
@@ -1655,7 +1622,6 @@ let metricsFetchPromise = null;
 let lastTileStructureSignature = '';
 let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
-const startupWatches = new Map();
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -1686,7 +1652,6 @@ function fetchState() {
       localStorage.setItem('tvstreamer-language', language);
       data.language = language;
       state = data;
-      checkStartupFailures(data);
       applyLanguage();
       render(false);
       refreshSubscriberSessions();
@@ -1781,35 +1746,6 @@ function closeModal() {
   subscribersModalOpen = false;
   stopQualityAutoRefresh();
   document.getElementById('modal').classList.remove('active', 'quality-open', 'stream-open');
-}
-function showPersistentError(title, message) {
-  const box = document.getElementById('persistentError');
-  if (!box) return;
-  document.getElementById('persistentErrorTitle').textContent = title || t('streamStartError');
-  document.getElementById('persistentErrorMessage').textContent = message || 'Unknown error';
-  document.getElementById('persistentErrorHint').textContent = t('clickToDismiss');
-  box.classList.add('active');
-}
-function dismissPersistentError() {
-  document.getElementById('persistentError')?.classList.remove('active');
-}
-function checkStartupFailures(data) {
-  if (!data || !Array.isArray(data.streams) || startupWatches.size === 0) return;
-  const now = Date.now();
-  for (const [id, deadline] of [...startupWatches.entries()]) {
-    if (now > deadline) {
-      startupWatches.delete(id);
-      continue;
-    }
-    const stream = data.streams.find(item => item.id === id);
-    if (!stream) continue;
-    const status = String(stream.status || '').toLowerCase();
-    const failed = status.includes('error') || status.includes('failed') || status.includes('exited');
-    if (failed || (!stream.active && status !== 'starting')) {
-      showPersistentError(t('streamStartError'), stream.status || `Stream ${id} stopped during startup`);
-      startupWatches.delete(id);
-    }
-  }
 }
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
@@ -1965,43 +1901,13 @@ function render(force=false) {
   lastTileStructureSignature = signature;
   updateLiveTiles();
 }
-const pendingStreamActions = new Set();
 function toggleStream(id, active) {
-  if (pendingStreamActions.has(id)) return;
   const url = active ? '/api/stop-stream' : '/api/start-stream';
   const body = active ? {id} : state.streams.find(s=>s.id===id);
-  if (!body) {
-    showPersistentError(t('streamStartError'), `Stream configuration not found: ${id}`);
-    return;
-  }
-
-  pendingStreamActions.add(id);
-  const tile = document.querySelector(`.tile[data-stream-id="${CSS.escape(id)}"]`);
-  const button = tile?.querySelector('[data-role="stream-toggle"]');
-  if (button) button.disabled = true;
-
   fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(async response => {
-      let result = {};
-      try { result = await response.json(); } catch (_) {}
-      if (!response.ok || result.result !== 'ok') {
-        const message = result.error || `HTTP ${response.status}`;
-        throw new Error(message);
-      }
-      if (!active) startupWatches.set(id, Date.now() + 10000);
-      setTimeout(fetchState,300);
-      setTimeout(fetchState,1000);
-      if (!active) setTimeout(fetchState,3000);
-    })
-    .catch(error => {
-      showPersistentError(active ? t('streamStopError') : t('streamStartError'), error.message || String(error));
-      fetchState();
-    })
-    .finally(() => {
-      pendingStreamActions.delete(id);
-      const currentTile = document.querySelector(`.tile[data-stream-id="${CSS.escape(id)}"]`);
-      const currentButton = currentTile?.querySelector('[data-role="stream-toggle"]');
-      if (currentButton) currentButton.disabled = false;
+    .then(()=>{
+      setTimeout(fetchState,500);
+      setTimeout(fetchState,1500);
     });
 }
 function deleteStream(id) {
