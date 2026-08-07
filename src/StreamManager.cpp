@@ -1073,10 +1073,12 @@ StreamManager::~StreamManager() {
     stopAll();
 }
 
-bool StreamManager::startStream(const StreamConfig& streamConfig) {
+bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
+    if (error) error->clear();
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         if (streams.count(streamConfig.id)) {
+            if (error) *error = "stream is already active: " + streamConfig.id;
             return false;
         }
 
@@ -1100,6 +1102,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
+            if (error) *error = gstError.empty() ? "GStreamer transcoder failed to start" : gstError;
             return false;
         }
 
@@ -1133,6 +1136,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             if (state && state->gstTranscoder) {
                 state->gstTranscoder->stop();
             }
+            if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
         }
         notifyStreamState(
@@ -1146,6 +1150,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
+        if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
         return false;
     }
 
@@ -1166,6 +1171,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING for stream: " << streamConfig.name << std::endl;
+        std::string playingError = "failed to set pipeline to PLAYING for stream: " + streamConfig.name;
         if (state->bus) {
             GstMessage* msg = gst_bus_timed_pop_filtered(
                 state->bus,
@@ -1178,6 +1184,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
                     gst_message_parse_error(msg, &err, &dbg);
                     std::cerr << "PLAYING error: " << (err ? err->message : "unknown")
                               << " debug=" << (dbg ? dbg : "") << std::endl;
+                    if (err && err->message) playingError = err->message;
+                    if (dbg && *dbg) playingError += std::string(" | ") + dbg;
                     if (err) g_error_free(err);
                     g_free(dbg);
                 } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
@@ -1199,6 +1207,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             state->gstTranscoder.reset();
         }
         gst_object_unref(pipeline);
+        if (error) *error = playingError;
         return false;
     }
 
@@ -1226,6 +1235,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             gst_object_unref(state->pipeline);
             state->pipeline = nullptr;
         }
+        if (error) *error = "duplicate stream start detected: " + streamConfig.id;
         return false;
     }
     notifyStreamState(
@@ -1299,13 +1309,14 @@ bool StreamManager::stopStream(const std::string& id) {
     return true;
 }
 
-bool StreamManager::restartStream(const StreamConfig& streamConfig) {
+bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string* error) {
+    if (error) error->clear();
     std::cerr << "Hard restarting stream: " << streamConfig.id << std::endl;
     const bool stopped = stopStream(streamConfig.id);
     if (stopped) {
         std::this_thread::sleep_for(kSrtRestartRetryDelay);
     }
-    return startStream(streamConfig);
+    return startStream(streamConfig, error);
 }
 
 void StreamManager::stopAll() {
