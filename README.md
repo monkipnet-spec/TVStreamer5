@@ -937,3 +937,10 @@ The GStreamer transcoder keeps protocol outputs modular, but the MPEG-TS based o
 - The transcoder monitor thread now runs for external GStreamer pipelines, so the input bitrate graph remains populated while transcoding.
 
 For a remapped HLS stream, `ffprobe -show_programs -show_streams` should show the configured service ID and V-PID/A-PID in every segment.
+
+### v51 — HLS PID remap, 3-segment window and picture quality
+
+- HLS transcoding now uses a dedicated `mpegtsmux name=hls_mux` and links video/audio to explicit `hls_mux.sink_<PID>` request pads when remap is enabled. The same pads are assigned to the configured service through `prog-map`.
+- The HLS directory is cleared before a new transcoded HLS pipeline starts, preventing an old playlist or stale transport-stream segments from exposing the previous PID map after restart.
+- The HLS live playlist now contains 3 segments. Segment target duration is increased from 4 to 5 seconds, while up to 5 files are retained on disk for cleanup/playback margin.
+- Transcoded video scaling now uses Lanczos instead of the default bilinear scaler and x264 uses the `superfast` preset instead of `ultrafast`. VBV capacity is increased to 1500 ms. These settings retain more detail without returning to a high-latency encoder configuration.
