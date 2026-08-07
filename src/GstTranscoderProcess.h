@@ -3,19 +3,20 @@
 #include "ConfigManager.h"
 
 #include <atomic>
-#include <sys/types.h>
 #include <string>
 #include <vector>
 
-class FfmpegTranscoderProcess {
+#include <sys/types.h>
+
+class GstTranscoderProcess {
 public:
-    FfmpegTranscoderProcess() = default;
-    ~FfmpegTranscoderProcess();
+    GstTranscoderProcess() = default;
+    ~GstTranscoderProcess();
 
-    FfmpegTranscoderProcess(const FfmpegTranscoderProcess&) = delete;
-    FfmpegTranscoderProcess& operator=(const FfmpegTranscoderProcess&) = delete;
+    GstTranscoderProcess(const GstTranscoderProcess&) = delete;
+    GstTranscoderProcess& operator=(const GstTranscoderProcess&) = delete;
 
-    static bool isAvailable(std::string* path = nullptr);
+    static bool isAvailable(std::string* error = nullptr);
 
     bool start(const StreamConfig& config, std::string& error);
     void stop();
@@ -37,5 +38,9 @@ private:
         std::string& description,
         std::string& error);
 
-    static bool spawnProcess(const std::vector<std::string>& args, const std::string& description, ChildProcess& child, std::string& error);
+    static bool spawnProcess(
+        const std::vector<std::string>& args,
+        const std::string& description,
+        ChildProcess& child,
+        std::string& error);
 };

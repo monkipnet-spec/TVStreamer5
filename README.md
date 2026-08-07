@@ -1,5 +1,23 @@
 # TVStreamer5
 
+### v43 — clean GStreamer transcoder engine
+
+Version v43 removes the FFmpeg process transcoder from the active stream path and replaces it with a clean GStreamer `gst-launch-1.0` based transcoder engine for stable UDP/UDP-CBR/UDP-VBR MPEG-TS output.
+
+The new engine intentionally does **not** reuse the previous in-process `parsebin`/dynamic-pad transcoder path that caused caps-list, audio passthrough and program-map problems. It builds a deterministic pipeline:
+
+```text
+uridecodebin
+  -> raw video -> videoscale/videorate -> x264enc -> h264parse config-interval=1 -> mpegtsmux
+  -> raw audio -> audioconvert/audioresample -> AAC encoder -> aacparse ADTS -> mpegtsmux
+  -> udpsink
+```
+
+Audio passthrough/copy is deliberately disabled in this stable mode. Even if the UI value is `copy`, the GStreamer engine re-encodes audio to AAC at 48 kHz stereo. This avoids the previous AAC caps-list, PMT and silent-audio problems.
+
+UDP-CBR output uses `mpegtsmux alignment=7`, repeated PAT/PMT/PCR/SI tables, x264 Annex-B byte-stream output, AUD units, repeated SPS/PPS and optional configured video/audio PIDs through `mux.sink_<pid>` pads.
+
+
 
 ### v41 FFmpeg timing стабилизация
 
@@ -556,17 +574,18 @@ playlist containing all primary and additional output URLs; save it from the
 Transcoding is optional. TVStreamer5 continues to run in passthrough mode when
 software encoding support is not installed.
 
-The preferred transcoder engine is now FFmpeg. At startup/runtime the application
-first checks for an executable `ffmpeg` in `PATH`. If it is found, the stream
-editor enables transcoding and reports:
+The preferred transcoder engine is now GStreamer. At startup/runtime the application
+checks for `gst-launch-1.0` and the required GStreamer elements. The stream
+editor enables transcoding when these are available and reports:
 
-- video encoder: `ffmpeg/libx264`;
-- AAC encoder: `ffmpeg/aac`;
-- MP3 encoder: `ffmpeg/libmp3lame`.
+- video encoder: `x264enc`;
+- AAC encoder: `fdkaacenc`, `voaacenc`, or `avenc_aac`;
+- MP3 encoder: `lamemp3enc` or `avenc_mp3` when installed.
 
-If `ffmpeg` is not present, the legacy GStreamer capability check is still used
-for compatibility. Existing passthrough streams remain available even when no
-transcoder engine is available.
+The stable v43 path re-encodes audio to AAC by default, even if the UI is still
+set to `copy`, because AAC passthrough was the source of the earlier no-audio
+and broken-PMT problems. Existing passthrough streams remain available even when
+no transcoder engine is available.
 
 ### Ubuntu/Debian installation
 
@@ -578,8 +597,7 @@ chmod +x install_deps.sh
 ```
 
 The script installs the GStreamer base, good, bad, ugly, and libav plugin sets.
-For the new transcoder engine also install the FFmpeg runtime package. The
-capability check now prefers FFmpeg and falls back to the legacy GStreamer check.
+For the v43 transcoder engine install the GStreamer runtime tools and plugins.
 
 Run the capability check manually:
 
@@ -590,11 +608,11 @@ Run the capability check manually:
 A successful result reports the selected encoders, for example:
 
 ```text
-FFmpeg transcoder is available.
-  ffmpeg: /usr/bin/ffmpeg
-  Video encoder: libx264
-  AAC encoder: available
-  MP3 encoder: libmp3lame
+GStreamer transcoding dependencies are available.
+  Launcher: /usr/bin/gst-launch-1.0
+  Video encoder: x264enc
+  AAC encoder: voaacenc or avenc_aac
+  MP3 encoder: lamemp3enc or avenc_mp3
 ```
 
 For a manual package installation on Ubuntu:
@@ -603,7 +621,6 @@ For a manual package installation on Ubuntu:
 sudo apt update
 sudo apt update
 sudo apt install -y \
-  ffmpeg \
   build-essential cmake pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev \
@@ -622,10 +639,10 @@ same way as on a native installation.
 After changing installed plugins, restart TVStreamer5 so the capability state
 shown in the web interface is refreshed.
 
-### FFmpeg transcoder process architecture
+### GStreamer transcoder process architecture
 
 When `transcode_enabled` is true, the transcoding path no longer uses a
-GStreamer `GstBin`. TVStreamer5 starts `ffmpeg` directly and lets FFmpeg handle
+the older in-process GStreamer `GstBin`. TVStreamer5 starts `gst-launch-1.0` directly and lets GStreamer handle
 input demuxing, decoding, scaling, encoding, audio copy/encoding, and output
 muxing:
 
@@ -634,7 +651,7 @@ input URL / file / network source
         |
         v
 +-------------------------------+
-| ffmpeg process                |
+| gst-launch-1.0 process        |
 |  demux/decode                 |
 |  scale/fps/yuv420p            |
 |  libx264 CBR                  |

@@ -976,26 +976,26 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
 
-    if (streamConfig.transcodeEnabled && FfmpegTranscoderProcess::isAvailable()) {
-        auto ffmpegTranscoder = std::make_unique<FfmpegTranscoderProcess>();
-        std::string ffmpegError;
-        if (!ffmpegTranscoder->start(streamConfig, ffmpegError)) {
-            std::cerr << "FFmpeg transcoder setup failed for " << streamConfig.id
-                      << ": " << ffmpegError << std::endl;
-            state->statusMessage = "ffmpeg transcoder failed: " + ffmpegError;
+    if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
+        auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
+        std::string gstError;
+        if (!gstTranscoder->start(streamConfig, gstError)) {
+            std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
+                      << ": " << gstError << std::endl;
+            state->statusMessage = "gstreamer transcoder failed: " + gstError;
             return false;
         }
 
         std::cerr << "Pipeline for stream '" << streamConfig.name
-                  << "': ffmpeg-transcoder input=" << streamConfig.inputUri
+                  << "': gstreamer-transcoder input=" << streamConfig.inputUri
                   << " transcode=" << streamConfig.transcodeResolution
                   << "@" << streamConfig.transcodeVideoBitrate
-                  << " outputs=" << ffmpegTranscoder->description() << std::endl;
+                  << " outputs=" << gstTranscoder->description() << std::endl;
 
-        state->ffmpegTranscoder = std::move(ffmpegTranscoder);
+        state->gstTranscoder = std::move(gstTranscoder);
         state->running = true;
         state->active = true;
-        state->statusMessage = "running via ffmpeg";
+        state->statusMessage = "running via gstreamer";
         state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
@@ -1011,8 +1011,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             }
         }
         if (duplicateStart) {
-            if (state && state->ffmpegTranscoder) {
-                state->ffmpegTranscoder->stop();
+            if (state && state->gstTranscoder) {
+                state->gstTranscoder->stop();
             }
             return false;
         }
@@ -1020,7 +1020,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             streamConfig,
             "🟢",
             telegramText(configManager, "Поток запущен", "Stream started"),
-            telegramText(configManager, "FFmpeg-транскодер", "FFmpeg transcoder") + "\nURL: " + streamConfig.inputUri);
+            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + streamConfig.inputUri);
         return true;
     }
 
@@ -1147,9 +1147,9 @@ bool StreamManager::stopStream(const std::string& id) {
     }
 
     auto& state = *statePtr;
-    if (state.ffmpegTranscoder) {
-        state.ffmpegTranscoder->stop();
-        state.ffmpegTranscoder.reset();
+    if (state.gstTranscoder) {
+        state.gstTranscoder->stop();
+        state.gstTranscoder.reset();
     }
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
@@ -1202,9 +1202,9 @@ void StreamManager::stopAll() {
 
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
-        if (state.ffmpegTranscoder) {
-            state.ffmpegTranscoder->stop();
-            state.ffmpegTranscoder.reset();
+        if (state.gstTranscoder) {
+            state.gstTranscoder->stop();
+            state.gstTranscoder.reset();
         }
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
@@ -1244,10 +1244,10 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     std::lock_guard<std::mutex> lock(managerMutex);
     std::map<std::string, StreamState*> result;
     for (auto& [id, statePtr] : streams) {
-        if (statePtr->ffmpegTranscoder && !statePtr->ffmpegTranscoder->isRunning()) {
+        if (statePtr->gstTranscoder && !statePtr->gstTranscoder->isRunning()) {
             statePtr->running = false;
             statePtr->active = false;
-            statePtr->statusMessage = "ffmpeg transcoder exited";
+            statePtr->statusMessage = "gstreamer transcoder exited";
         }
         if (statePtr->pipeline) {
             updateBitrateEstimates(statePtr.get());

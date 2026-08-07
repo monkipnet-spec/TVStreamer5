@@ -541,23 +541,16 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 
 TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     TranscoderCapabilities result;
-    std::string ffmpegPath;
-    if (executableInPath("ffmpeg", &ffmpegPath)) {
-        result.available = true;
-        result.videoEncoder = "ffmpeg/libx264";
-        result.aacEncoder = "ffmpeg/aac";
-        result.mp3Encoder = "ffmpeg/libmp3lame";
-        result.audioEncoder = result.aacEncoder;
-        result.deinterlaceAvailable = true;
-        result.message = "FFmpeg transcoder is available: " + ffmpegPath;
-        return result;
+    std::string gstLaunchPath;
+    if (!executableInPath("gst-launch-1.0", &gstLaunchPath)) {
+        result.missingElements.emplace_back("gst-launch-1.0");
     }
     const char* required[] = {
-        "parsebin", "decodebin", "queue", "fakesink",
+        "uridecodebin", "decodebin", "queue",
         "videoconvert", "deinterlace", "videoscale", "videorate", "capsfilter",
         "x264enc", "h264parse",
         "audioconvert", "audioresample",
-        "mpegtsmux", nullptr
+        "aacparse", "mpegtsmux", "udpsink", nullptr
     };
 
     for (const char** name = required; *name; ++name) {
@@ -574,7 +567,7 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     GstElementFactory* aacParser = gst_element_factory_find("aacparse");
     if (aacParser) {
         gst_object_unref(aacParser);
-        for (const char* name : {"fdkaacenc", "voaacenc", "avenc_aac"}) {
+        for (const char* name : {"voaacenc", "fdkaacenc", "avenc_aac"}) {
             GstElementFactory* factory = gst_element_factory_find(name);
             if (factory) {
                 result.aacEncoder = name;
@@ -602,7 +595,7 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     }
     result.available = result.missingElements.empty();
     result.message = result.available
-        ? "Software transcoding is available"
+        ? "GStreamer software transcoding is available: " + gstLaunchPath
         : "Transcoding is unavailable because required GStreamer elements are missing";
     return result;
 }

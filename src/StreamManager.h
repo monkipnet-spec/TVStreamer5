@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "ConfigManager.h"
-#include "FfmpegTranscoderProcess.h"
+#include "GstTranscoderProcess.h"
 #include "TelegramNotifier.h"
 #include "utils.h"
 
@@ -69,7 +69,7 @@ struct StreamState {
     std::vector<uint8_t> outputTsRemainder;
     std::mutex outputContinuityMutex;
     std::unique_ptr<RemapContext> sourceContext;
-    std::unique_ptr<FfmpegTranscoderProcess> ffmpegTranscoder;
+    std::unique_ptr<GstTranscoderProcess> gstTranscoder;
     std::vector<std::unique_ptr<RemapContext>> outputContexts;
 };
 

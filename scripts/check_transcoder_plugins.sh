@@ -1,75 +1,63 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if command -v ffmpeg >/dev/null 2>&1; then
-  echo "FFmpeg transcoder is available."
-  echo "  ffmpeg: $(command -v ffmpeg)"
-  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' libx264'; then
-    echo "  Video encoder: libx264"
-  else
-    echo "  WARNING: libx264 encoder was not reported by ffmpeg -encoders"
-  fi
-  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -qE ' aac| libfdk_aac'; then
-    echo "  AAC encoder: available"
-  else
-    echo "  WARNING: AAC encoder was not reported by ffmpeg -encoders"
-  fi
-  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' libmp3lame'; then
-    echo "  MP3 encoder: libmp3lame"
-  else
-    echo "  WARNING: libmp3lame encoder was not reported by ffmpeg -encoders"
-  fi
-  exit 0
-fi
-
 required=(
-  parsebin tsparse decodebin
-  videoconvert deinterlace videoscale videorate
-  x264enc h264parse
-  audioconvert audioresample
+  gst-launch-1.0
+  uridecodebin
+  queue
+  videoconvert
+  videoscale
+  videorate
+  x264enc
+  h264parse
+  audioconvert
+  audioresample
+  aacparse
   mpegtsmux
+  udpsink
 )
 
 missing=()
-for element in "${required[@]}"; do
+if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
+  missing+=("gst-launch-1.0")
+fi
+
+for element in "${required[@]:1}"; do
   if ! gst-inspect-1.0 "$element" >/dev/null 2>&1; then
     missing+=("$element")
   fi
 done
 
 aac_encoder=""
-if gst-inspect-1.0 aacparse >/dev/null 2>&1; then
-  for element in fdkaacenc voaacenc avenc_aac; do
-    if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
-      aac_encoder="$element"
-      break
-    fi
-  done
-fi
+for element in voaacenc fdkaacenc avenc_aac; do
+  if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+    aac_encoder="$element"
+    break
+  fi
+done
 
 mp3_encoder=""
-if gst-inspect-1.0 mpegaudioparse >/dev/null 2>&1; then
-  for element in lamemp3enc avenc_mp3; do
-    if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
-      mp3_encoder="$element"
-      break
-    fi
-  done
-fi
+for element in lamemp3enc avenc_mp3; do
+  if gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+    mp3_encoder="$element"
+    break
+  fi
+done
 
-if [[ -z "$aac_encoder" && -z "$mp3_encoder" ]]; then
-  missing+=("audio encoder/parser (AAC or MP3)")
+if [[ -z "$aac_encoder" ]]; then
+  missing+=("AAC encoder: fdkaacenc, voaacenc or avenc_aac")
 fi
 
 if ((${#missing[@]} > 0)); then
-  echo "Transcoding is unavailable. Missing ffmpeg and required GStreamer elements:"
+  echo "GStreamer transcoding is unavailable. Missing elements/tools:"
   printf '  - %s\n' "${missing[@]}"
-  echo "Install ffmpeg for the new no-GStreamer transcoder."
+  echo "Install GStreamer plugins base/good/bad/ugly and gstreamer1.0-libav."
   exit 1
 fi
 
-echo "Legacy GStreamer transcoding dependencies are available."
+echo "GStreamer transcoding dependencies are available."
+echo "  Launcher: $(command -v gst-launch-1.0)"
 echo "  Video encoder: x264enc"
-echo "  AAC encoder: ${aac_encoder:-not available}"
+echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
-echo "  Deinterlacing: deinterlace"
+echo "  UDP MPEG-TS mux/output: mpegtsmux + udpsink"
