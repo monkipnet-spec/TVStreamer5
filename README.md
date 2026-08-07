@@ -862,3 +862,23 @@ The transcoder core now only builds the common decode -> deinterlace -> scale ->
 For stable mode, audio is still re-encoded to AAC by default even when the UI says copy. This avoids the previous AAC passthrough caps/PMT/silent-audio failure mode.
 
 HTTP note: the external `gst-launch-1.0` transcoder cannot attach directly to TVStreamer5's in-process `multifdsink` HTTP session manager. For HTTP-mode transcoded output v45 starts a raw MPEG-TS TCP listener using `tcpserversink`. HLS remains available through TVStreamer5's `/hls/<id>/playlist.m3u8` file server.
+
+## v46 - modular protocol engine and HTTP relay for transcoded streams
+
+v46 splits the clean GStreamer transcoder protocol layer into explicit input and output modules:
+
+- input modules: HTTP, HLS, UDP, SRT, RTSP and RTMP URI handling;
+- output modules: UDP/UDP-CBR/UDP-VBR, HTTP TS, HLS, SRT, RTSP push, RTMP push and YouTube push;
+- common output helpers: MPEG-TS muxing, PID pad assignment, queue/sink buffering and deterministic mux bitrate.
+
+The transcoded HTTP output no longer tries to bind the public TVStreamer5 web port from `gst-launch-1.0`. Instead, the GStreamer process writes MPEG-TS to an internal localhost TCP relay port. The built-in HTTP server keeps the normal public URL:
+
+```text
+http://<server>:<http_port>/stream/<stream_id>.ts
+```
+
+and proxies that request to the internal transcoder relay. This fixes the previous case where a transcoded HTTP stream either did not start or had to be opened as raw `tcp://` instead of real HTTP.
+
+The output queues for HTTP, HLS, SRT and RTMP/YouTube are leaky downstream queues, so a slow or missing client cannot freeze the video encoder. UDP keeps the normal paced MPEG-TS path.
+
+RTSP output is implemented as RTSP push through `rtspclientsink`. It requires an external RTSP server target. RTSP server/listener mode is intentionally not exposed as a fake TCP stream.

@@ -3,10 +3,13 @@
 #include "UdpCbrOutput.h"
 #include "UdpInput.h"
 #include "UdpVbrOutput.h"
+#include "protocols/GstProtocolTypes.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -14,6 +17,9 @@
 
 #include <glib.h>
 #include <gio/gio.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
@@ -155,7 +161,7 @@ std::string outputType(const StreamConfig& cfg) {
     }
 
     if (type != "udp" && type != "udp-vbr" && type != "udp-cbr" &&
-        type != "srt" && type != "http" && type != "hls" && type != "rtmp" && type != "youtube") {
+        type != "srt" && type != "http" && type != "hls" && type != "rtsp" && type != "rtmp" && type != "youtube") {
         type = "udp";
     }
     return type;
@@ -250,6 +256,59 @@ std::vector<StreamConfig> pipelineOutputConfigs(const StreamConfig& cfg) {
     return outputs;
 }
 
+
+bool hasTranscodedHttpOutput(const StreamConfig& cfg) {
+    for (const auto& output : outputConfigs(cfg)) {
+        if (outputType(output) == "http") {
+            return true;
+        }
+    }
+    return false;
+}
+
+int connectLocalTcpWithRetry(uint16_t port, std::string& error) {
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            error = std::string("socket failed: ") + std::strerror(errno);
+            return -1;
+        }
+
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        if (::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
+            ::close(fd);
+            error = "inet_pton failed for 127.0.0.1";
+            return -1;
+        }
+
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+            return fd;
+        }
+
+        error = std::string("connect to transcoded HTTP relay tcp://127.0.0.1:") +
+            std::to_string(port) + " failed: " + std::strerror(errno);
+        ::close(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return -1;
+}
+
+bool writeAllToFd(int fd, const char* data, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        ssize_t written = ::write(fd, data + offset, size - offset);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (written == 0) return false;
+        offset += static_cast<size_t>(written);
+    }
+    return true;
+}
+
 std::string branchName(const std::string& base, size_t branchIndex) {
     return base + "_" + std::to_string(branchIndex);
 }
@@ -272,7 +331,7 @@ uint64_t transcodeAudioBitrateForStats(const StreamConfig& cfg) {
 }
 
 uint64_t transcodeMuxBitrateForStats(const StreamConfig& cfg) {
-    const uint64_t minimum = transcodeVideoBitrateForStats(cfg) + transcodeAudioBitrateForStats(cfg) + 800000;
+    const uint64_t minimum = transcodeVideoBitrateForStats(cfg) + transcodeAudioBitrateForStats(cfg) + 1200000;
     return cfg.targetBitrate > 0 ? std::max<uint64_t>(cfg.targetBitrate, minimum) : minimum;
 }
 
@@ -1310,7 +1369,43 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp) {
     std::lock_guard<std::mutex> lock(managerMutex);
     auto found = streams.find(id);
-    if (found == streams.end() || !found->second->pipeline) {
+    if (found == streams.end()) {
+        close(fd);
+        return false;
+    }
+
+    if (!found->second->pipeline && found->second->gstTranscoder && hasTranscodedHttpOutput(found->second->config)) {
+        const uint16_t relayPort = tvs::protocols::transcodedHttpInternalPort(found->second->config);
+        std::string relayError;
+        int upstreamFd = connectLocalTcpWithRetry(relayPort, relayError);
+        if (upstreamFd < 0) {
+            std::cerr << "Transcoded HTTP relay failed for stream " << id
+                      << ": " << relayError << std::endl;
+            close(fd);
+            return false;
+        }
+
+        httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts"};
+        std::thread([this, id, fd, upstreamFd]() {
+            std::array<char, 65536> buffer {};
+            while (true) {
+                ssize_t readBytes = ::read(upstreamFd, buffer.data(), buffer.size());
+                if (readBytes < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (readBytes == 0) break;
+                if (!writeAllToFd(fd, buffer.data(), static_cast<size_t>(readBytes))) break;
+            }
+            ::close(upstreamFd);
+            ::close(fd);
+            std::lock_guard<std::mutex> relayLock(managerMutex);
+            httpClients.erase(fd);
+        }).detach();
+        return true;
+    }
+
+    if (!found->second->pipeline) {
         close(fd);
         return false;
     }

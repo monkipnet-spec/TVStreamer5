@@ -14,6 +14,7 @@ enum class OutputKind {
     Srt,
     Http,
     Hls,
+    Rtsp,
     Rtmp,
     Youtube,
     Unknown
@@ -21,7 +22,8 @@ enum class OutputKind {
 
 enum class ContainerKind {
     MpegTs,
-    Flv
+    Flv,
+    Rtsp
 };
 
 std::string normalizedOutputType(const StreamConfig& cfg);
@@ -29,6 +31,7 @@ OutputKind outputKind(const StreamConfig& cfg);
 bool isUdpOutput(OutputKind kind);
 bool isTsOutput(OutputKind kind);
 bool isFlvOutput(OutputKind kind);
+bool isRtspOutput(OutputKind kind);
 
 StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg);
 StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig& output);
@@ -41,5 +44,7 @@ uint64_t muxBitrate(const StreamConfig& cfg);
 std::string srtOutputMode(const StreamConfig& cfg);
 std::string hlsDirectory(const StreamConfig& cfg);
 std::string rtmpOutputLocation(const StreamConfig& cfg);
+std::string rtspOutputLocation(const StreamConfig& cfg);
+uint16_t transcodedHttpInternalPort(const StreamConfig& cfg);
 
 } // namespace tvs::protocols

@@ -22,6 +22,7 @@ required=(
   hlssink
   flvmux
   rtmpsink
+  rtspclientsink
 )
 
 missing=()
@@ -74,3 +75,4 @@ echo "  SRT output: srtsink"
 echo "  HTTP raw TS output: tcpserversink"
 echo "  HLS output: hlssink"
 echo "  RTMP output: flvmux + rtmpsink"
+echo "  RTSP push output: rtspclientsink"

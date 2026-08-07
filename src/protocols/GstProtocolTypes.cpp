@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 
 namespace tvs::protocols {
 
@@ -27,6 +28,7 @@ OutputKind outputKind(const StreamConfig& cfg) {
     if (type == "srt") return OutputKind::Srt;
     if (type == "http") return OutputKind::Http;
     if (type == "hls") return OutputKind::Hls;
+    if (type == "rtsp") return OutputKind::Rtsp;
     if (type == "rtmp") return OutputKind::Rtmp;
     if (type == "youtube") return OutputKind::Youtube;
     return OutputKind::Unknown;
@@ -43,6 +45,10 @@ bool isTsOutput(OutputKind kind) {
 
 bool isFlvOutput(OutputKind kind) {
     return kind == OutputKind::Rtmp || kind == OutputKind::Youtube;
+}
+
+bool isRtspOutput(OutputKind kind) {
+    return kind == OutputKind::Rtsp;
 }
 
 StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
@@ -88,7 +94,7 @@ uint64_t safeAudioBitrate(const StreamConfig& cfg) {
 uint64_t muxBitrate(const StreamConfig& cfg) {
     const uint64_t video = safeVideoBitrate(cfg);
     const uint64_t audio = safeAudioBitrate(cfg);
-    const uint64_t minimum = video + audio + 1000000;
+    const uint64_t minimum = video + audio + 1200000;
     if (cfg.targetBitrate > 0) {
         return std::max<uint64_t>(cfg.targetBitrate, minimum);
     }
@@ -118,6 +124,23 @@ std::string rtmpOutputLocation(const StreamConfig& cfg) {
     }
     const std::string targetHost = host.empty() ? "127.0.0.1" : host;
     return "rtmp://" + targetHost + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
+}
+
+std::string rtspOutputLocation(const StreamConfig& cfg) {
+    const std::string host = cfg.outputHost;
+    const std::string hostLower = toLower(host);
+    if (hostLower.rfind("rtsp://", 0) == 0 || hostLower.rfind("rtsps://", 0) == 0) {
+        return host;
+    }
+    const std::string targetHost = host.empty() ? "127.0.0.1" : host;
+    const int port = cfg.outputPort > 0 ? cfg.outputPort : 8554;
+    return "rtsp://" + targetHost + ":" + std::to_string(port) + "/" + cfg.id;
+}
+
+uint16_t transcodedHttpInternalPort(const StreamConfig& cfg) {
+    const std::string key = cfg.id.empty() ? cfg.name : cfg.id;
+    const size_t hash = std::hash<std::string>{}(key);
+    return static_cast<uint16_t>(20000 + (hash % 20000));
 }
 
 } // namespace tvs::protocols

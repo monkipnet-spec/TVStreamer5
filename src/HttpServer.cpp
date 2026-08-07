@@ -178,7 +178,7 @@ std::string normalizedOutputType(const StreamConfig& cfg) {
     }
     if (type != "udp-vbr" && type != "udp-cbr" &&
         type != "srt" && type != "http" && type != "hls" &&
-        type != "rtmp" && type != "youtube") {
+        type != "rtsp" && type != "rtmp" && type != "youtube") {
         return "udp-vbr";
     }
     return type;
@@ -297,13 +297,13 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
             : "rtmp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
     }
     if (type == "http") {
-        if (cfg.transcodeEnabled) {
-            // External gst-launch based transcoder cannot attach to the in-process
-            // multifdsink HTTP session manager. Its HTTP-mode output is exposed
-            // as raw MPEG-TS over TCP. VLC can open this URL directly.
-            return "tcp://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort));
-        }
         return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/stream/" + cfg.id + ".ts";
+    }
+    if (type == "rtsp") {
+        const std::string hostLower = toLower(cfg.outputHost);
+        return hostLower.rfind("rtsp://", 0) == 0 || hostLower.rfind("rtsps://", 0) == 0
+            ? cfg.outputHost
+            : "rtsp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort > 0 ? cfg.outputPort : 8554) + "/" + cfg.id;
     }
     if (type == "hls") {
         return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/hls/" + cfg.id + "/playlist.m3u8";
@@ -2068,6 +2068,7 @@ function outputTypeOptions(selected) {
     ['srt', 'SRT'],
     ['http', 'HTTP TS'],
     ['hls', 'HLS'],
+    ['rtsp', 'RTSP Push'],
     ['rtmp', 'RTMP Push'],
     ['youtube', 'YouTube']
   ];
@@ -2359,6 +2360,12 @@ function updateOutputHints() {
       } else if (outputMode === 'caller' && (!host.value || host.value === '0.0.0.0' || host.value === '239.0.0.1')) {
         host.value = '127.0.0.1';
       }
+    } else if (type === 'rtsp') {
+      hostLabel.textContent = 'RTSP сервер';
+      portLabel.textContent = 'RTSP порт';
+      port.disabled = false;
+      host.placeholder = 'rtsp://server/app/name или IP сервера';
+      if (!host.value || host.value === '0.0.0.0' || host.value === '239.0.0.1') host.value = '127.0.0.1';
     } else if (type === 'youtube') {
       hostLabel.textContent = 'YouTube key / URL';
       portLabel.textContent = 'Порт';

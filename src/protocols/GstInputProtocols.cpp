@@ -1,16 +1,22 @@
 #include "protocols/GstInputProtocols.h"
 
-#include "utils.h"
+#include "protocols/inputs/GstHttpInputProtocol.h"
+#include "protocols/inputs/GstHlsInputProtocol.h"
+#include "protocols/inputs/GstRtmpInputProtocol.h"
+#include "protocols/inputs/GstRtspInputProtocol.h"
+#include "protocols/inputs/GstSrtInputProtocol.h"
+#include "protocols/inputs/GstUdpInputProtocol.h"
 
 namespace tvs::protocols {
 
 std::string inputUriForGstreamer(const StreamConfig& cfg) {
-    std::string input = cfg.inputUri;
-    const std::string lower = toLower(input);
-    if (lower.rfind("hls://", 0) == 0) {
-        input = "http://" + input.substr(6);
-    }
-    return input;
+    if (inputs::isHlsInput(cfg)) return inputs::hlsInputUri(cfg);
+    if (inputs::isSrtInput(cfg)) return inputs::srtInputUri(cfg);
+    if (inputs::isRtspInput(cfg)) return inputs::rtspInputUri(cfg);
+    if (inputs::isRtmpInput(cfg)) return inputs::rtmpInputUri(cfg);
+    if (inputs::isUdpInput(cfg)) return inputs::udpInputUri(cfg);
+    if (inputs::isHttpInput(cfg)) return inputs::httpInputUri(cfg);
+    return cfg.inputUri;
 }
 
 void appendDecodeInput(std::vector<std::string>& args, const StreamConfig& cfg) {

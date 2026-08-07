@@ -142,13 +142,14 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     TranscoderModule::resolutionSize(cfg.transcodeResolution, width, height);
     const uint64_t bitrateKbps = tvs::protocols::safeVideoBitrate(cfg) / 1000;
     const bool flv = spec.container == ContainerKind::Flv;
+    const bool rtsp = spec.container == ContainerKind::Rtsp;
 
     args.insert(args.end(), {"dec.", "!"});
     addQueue(args, "transcode_video_queue", 8000000000ULL);
     args.insert(args.end(), {
         "!", "video/x-raw",
         "!", "videoconvert",
-        "!", "deinterlace", "method=yadif",
+        "!", "deinterlace", "method=linear",
         "!", "videoscale", "add-borders=true",
         "!", "videorate", "drop-only=false",
         "!", "video/x-raw,format=I420,width=" + std::to_string(width) +
@@ -178,6 +179,7 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     const std::string audioCodec = toLower(cfg.transcodeAudioCodec);
     const uint64_t bitrate = tvs::protocols::safeAudioBitrate(cfg);
     const bool flv = spec.container == ContainerKind::Flv;
+    const bool rtsp = spec.container == ContainerKind::Rtsp;
 
     args.insert(args.end(), {"dec.", "!"});
     addQueue(args, "transcode_audio_queue", 8000000000ULL);
@@ -236,7 +238,7 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
             encoder,
             property("bitrate", std::to_string(bitrate)),
             "!", "aacparse",
-            "!", flv
+            "!", (flv || rtsp)
                 ? "audio/mpeg,mpegversion=4,stream-format=raw"
                 : "audio/mpeg,mpegversion=4,stream-format=adts"
         });
@@ -279,7 +281,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {
         encoder, property("bitrate", std::to_string(tvs::protocols::safeAudioBitrate(cfg))),
         "!", "aacparse", "!",
-        spec.container == ContainerKind::Flv
+        (spec.container == ContainerKind::Flv || spec.container == ContainerKind::Rtsp)
             ? "audio/mpeg,mpegversion=4,stream-format=raw"
             : "audio/mpeg,mpegversion=4,stream-format=adts",
         "!", spec.audioPad
