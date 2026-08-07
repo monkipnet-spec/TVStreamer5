@@ -150,6 +150,13 @@ uint16_t transcodedHttpInternalPort(const StreamConfig& cfg) {
     return static_cast<uint16_t>(20000 + (hash % 20000));
 }
 
+uint16_t transcodedSrtInternalPort(const StreamConfig& cfg) {
+    std::string key = cfg.id.empty() ? cfg.name : cfg.id;
+    key += ":srt:" + std::to_string(cfg.outputPort) + ":" + cfg.outputHost + ":" + cfg.outputMode;
+    const size_t hash = std::hash<std::string>{}(key);
+    return static_cast<uint16_t>(40000 + (hash % 20000));
+}
+
 std::string transcodedFifoRelayPath(const StreamConfig& cfg) {
     std::string key = cfg.id.empty() ? cfg.name : cfg.id;
     if (key.empty()) key = "stream";
