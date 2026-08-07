@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -78,8 +79,8 @@ public:
     explicit StreamManager(ConfigManager& cfg, TelegramNotifier& notifier);
     ~StreamManager();
 
-    bool startStream(const StreamConfig& streamConfig, std::string* error = nullptr);
-    bool restartStream(const StreamConfig& streamConfig, std::string* error = nullptr);
+    bool startStream(const StreamConfig& streamConfig);
+    bool restartStream(const StreamConfig& streamConfig);
     bool stopStream(const std::string& id);
     void stopAll();
     bool isStreamActive(const std::string& id);
@@ -121,6 +122,8 @@ private:
     static GstPadProbeReturn outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
     void pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::time_point now);
+    void monitorExternalSrtSessions();
+    void updateExternalSrtSessionsLocked(const std::map<std::string, std::set<std::string>>& sessionsByStream);
     static gboolean onSrtCallerConnecting(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
     static void onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
     static void onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
@@ -139,5 +142,7 @@ private:
     std::map<std::string, HttpClientSession> adHocSessions;
     mutable std::mutex managerMutex;
     std::atomic<uint64_t> nextSessionId{0};
+    std::atomic<bool> externalSrtSessionMonitorStop{false};
+    std::thread externalSrtSessionThread;
     static void onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData);
 };
