@@ -95,6 +95,11 @@ void appendOutputQueue(std::vector<std::string>& args, const std::string& name, 
     args.push_back("!");
 }
 
+void appendOutputQueueWithTime(std::vector<std::string>& args, const std::string& name, uint64_t maxTimeNs, bool leakyDownstream) {
+    addQueue(args, name, maxTimeNs, leakyDownstream);
+    args.push_back("!");
+}
+
 void assignTsPads(const StreamConfig& cfg, GstOutputSpec& spec) {
     if (!cfg.remapEnabled) {
         spec.videoPad = "mux.";

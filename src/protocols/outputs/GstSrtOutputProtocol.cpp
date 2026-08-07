@@ -6,8 +6,8 @@ namespace tvs::protocols::outputs {
 
 bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendTsSmoother(args, "transcode_srt_ts_smoother", 900000);
-    appendOutputQueue(args, "transcode_srt_output_queue", false);
+    appendTsSmoother(args, "transcode_srt_ts_smoother", 1800000);
+    appendOutputQueueWithTime(args, "transcode_srt_output_queue", 12000000000ULL, false);
 
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
@@ -25,14 +25,14 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     args.insert(args.end(), {
         "srtsink",
         "uri=" + uri,
-        "latency=1200",
-        "sync=true",
+        "latency=2500",
+        "sync=false",
         "async=false",
         "qos=false",
         "max-lateness=-1",
         "blocksize=1316",
         "wait-for-connection=false",
-        "poll-timeout=2000"
+        "poll-timeout=5000"
     });
 
     if (!cfg.interfaceAddress.empty() && cfg.interfaceAddress != "0.0.0.0" && cfg.interfaceAddress != "::") {

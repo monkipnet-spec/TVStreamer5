@@ -73,8 +73,8 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     // generic mux helper. This keeps PID/service remapping deterministic for
     // every newly generated segment.
     appendHlsMux(args, cfg, spec);
-    appendTsSmoother(args, "transcode_hls_ts_smoother", 300000);
-    appendOutputQueue(args, "transcode_hls_output_queue", false);
+    appendTsSmoother(args, "transcode_hls_ts_smoother", 1200000);
+    appendOutputQueueWithTime(args, "transcode_hls_output_queue", 12000000000ULL, false);
 
     // Remove an old playlist and stale .ts files before starting a new HLS
     // generation. Otherwise a client can briefly read segments from the
@@ -84,8 +84,8 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         "hlssink",
         "playlist-location=" + dir + "/playlist.m3u8",
         "location=" + dir + "/segment%05d.ts",
-        "target-duration=5",
-        "max-files=5",
+        "target-duration=6",
+        "max-files=6",
         "playlist-length=3"
     });
 

@@ -834,7 +834,22 @@ For live IPTV inputs the external GStreamer transcoder now disables `uridecodebi
 
 MPEG-TS muxrate padding is now reserved for `udp-cbr` output only. SRT, HTTP, HLS, RTP and UDP-VBR receive the encoded audio/video stream without forced UDP-CBR null-packet padding, which reduces burst delivery and periodic stalls on SRT clients, HTTP TS clients and HLS segment readers.
 
-If SRT still stutters, compare the client latency with the server latency. Recommended first test value on the receiver side is 1200-1500 ms.
+If SRT still stutters, compare the client latency with the server latency. Recommended first test value on the receiver side is 2500-3000 ms.
+
+
+### Live HTTP/HLS/SRT stability profile
+
+Release 2 uses a more buffered profile for file/TCP/SRT outputs after transcoding. HTTP, HLS and SRT do not use UDP-CBR null-packet padding; they use a larger MPEG-TS timestamp smoother and a 12 second output queue so short input jitter or receiver-side pauses do not immediately stop the live output.
+
+Current transcoded HTTP/HLS/SRT defaults:
+
+```text
+HTTP: tsparse smoothing-latency=1200000, output queue=12s, tcpserversink sync=false
+HLS:  tsparse smoothing-latency=1200000, output queue=12s, target-duration=6, playlist-length=3
+SRT:  tsparse smoothing-latency=1800000, output queue=12s, latency=2500, sync=false
+```
+
+If the SRT receiver has its own latency setting, set it to at least 2500 ms for the first test. Very low receiver latency values can still cause audio/video stutter even when the server sends a stable stream.
 
 ### Проверка GStreamer внутри Docker
 
@@ -880,7 +895,7 @@ The listening ports should belong to `TVStreamer` only; `gst-launch-1.0` should 
 
 - `Listener`: процесс слушает `srt://:<port>` на `0.0.0.0` либо на адресе выбранного выходного интерфейса. Поле `Адрес выхода` используется только как адрес, показываемый в ссылке клиенту, и не используется как bind-адрес.
 - `Caller`: `Адрес выхода` является адресом удалённого SRT-сервера, а выбранный выходной интерфейс применяется как локальный bind-адрес.
-- SRT получает MPEG-TS блоками по 1316 байт, latency 1200 мс и отправляется по clock (`sync=true`). Входной `uridecodebin` работает без внутреннего buffering, чтобы live UDP/SRT источники не вызывали rebuffer/stall всей внешней pipeline. Для SRT/HTTP/HLS/RTP/UDP-VBR внешний транскодер не включает UDP-CBR `mpegtsmux bitrate`, чтобы не добавлять лишние null-пакеты и burst-паузы в файловые/TCP/SRT выходы.
+- SRT получает MPEG-TS блоками по 1316 байт, latency 2500 мс и отправляется от live pipeline без дополнительного ожидания sink clock (`sync=false`). Входной `uridecodebin` работает без внутреннего buffering, чтобы live UDP/SRT источники не вызывали rebuffer/stall всей внешней pipeline. Для SRT/HTTP/HLS/RTP/UDP-VBR внешний транскодер не включает UDP-CBR `mpegtsmux bitrate`, чтобы не добавлять лишние null-пакеты и burst-паузы в файловые/TCP/SRT выходы.
 - Для совместимости с GStreamer 1.20.x на Ubuntu 22.04 внешний `gst-launch-1.0` не использует свойство `auto-reconnect` у `srtsink`, потому что в этой версии элемента такого свойства нет.
 - Если `gst-launch-1.0` завершается сразу из-за ошибки bind/URI/плагина, запуск потока теперь завершается ошибкой вместо ложного статуса `running`.
 
@@ -895,8 +910,8 @@ ps -eo pid,ppid,args | grep gst-launch | grep srtsink | grep -v grep
 
 ```text
 uridecodebin ... use-buffering=false
-tsparse ... smoothing-latency=900000
-srtsink ... latency=1200 sync=true blocksize=1316 wait-for-connection=false
+tsparse ... smoothing-latency=1800000
+srtsink ... latency=2500 sync=false blocksize=1316 wait-for-connection=false
 ```
 
 Для SRT Listener `wait-for-connection=false` оставляет live pipeline работающей даже до подключения клиента. Это уменьшает риск стартового клина и длинного rebuffer при подключении SRT-приёмника.
