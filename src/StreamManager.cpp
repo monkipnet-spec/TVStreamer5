@@ -11,11 +11,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cerrno>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <functional>
-#include <set>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -1064,164 +1062,23 @@ GstElement* makeCapsFilter(const char* capsDescription) {
     return filter;
 }
 
-
-struct ExternalSrtWatch {
-    std::string streamId;
-    int port = 0;
-    std::set<pid_t> pids;
-};
-
-std::string runCommandCapture(const char* command) {
-    std::string output;
-    FILE* pipe = ::popen(command, "r");
-    if (!pipe) {
-        return output;
-    }
-    char buffer[4096];
-    while (std::fgets(buffer, sizeof(buffer), pipe)) {
-        output += buffer;
-    }
-    ::pclose(pipe);
-    return output;
-}
-
-bool parseEndpoint(const std::string& endpoint, std::string& host, int& port) {
-    host.clear();
-    port = 0;
-    if (endpoint.empty() || endpoint == "*" || endpoint == "*:*") {
-        return false;
-    }
-
-    size_t portPos = std::string::npos;
-    if (endpoint.front() == '[') {
-        const size_t close = endpoint.find(']');
-        if (close == std::string::npos || close + 1 >= endpoint.size() || endpoint[close + 1] != ':') {
-            return false;
-        }
-        host = endpoint.substr(1, close - 1);
-        portPos = close + 2;
-    } else {
-        const size_t colon = endpoint.rfind(':');
-        if (colon == std::string::npos || colon + 1 >= endpoint.size()) {
-            return false;
-        }
-        host = endpoint.substr(0, colon);
-        portPos = colon + 1;
-    }
-
-    const std::string portText = endpoint.substr(portPos);
-    if (portText == "*" || portText.empty()) {
-        return false;
-    }
-    try {
-        port = std::stoi(portText);
-    } catch (const std::exception&) {
-        return false;
-    }
-
-    const size_t zone = host.find('%');
-    if (zone != std::string::npos) {
-        host = host.substr(0, zone);
-    }
-    host = normalizeIpAddress(host);
-    return !host.empty() && port > 0;
-}
-
-bool lineHasWatchedPid(const std::string& line, const std::set<pid_t>& pids) {
-    if (line.find("users:") == std::string::npos) {
-        return true;
-    }
-    if (pids.empty()) {
-        return line.find("gst-launch-1.0") != std::string::npos;
-    }
-    for (const pid_t pid : pids) {
-        if (pid <= 0) continue;
-        const std::string needle = "pid=" + std::to_string(pid);
-        if (line.find(needle) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::map<std::string, std::set<std::string>> detectExternalSrtSessions(const std::vector<ExternalSrtWatch>& watches) {
-    std::map<std::string, std::set<std::string>> sessions;
-    if (watches.empty()) {
-        return sessions;
-    }
-
-    const std::string ssOutput = runCommandCapture("ss -H -u -n -p 2>/dev/null");
-    std::istringstream lines(ssOutput);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (line.empty() || line.find(':') == std::string::npos) {
-            continue;
-        }
-
-        std::istringstream fields(line);
-        std::string state;
-        std::string recvQ;
-        std::string sendQ;
-        std::string localEndpoint;
-        std::string peerEndpoint;
-        if (!(fields >> state >> recvQ >> sendQ >> localEndpoint >> peerEndpoint)) {
-            continue;
-        }
-
-        std::string localHost;
-        int localPort = 0;
-        if (!parseEndpoint(localEndpoint, localHost, localPort)) {
-            continue;
-        }
-        std::string peerHost;
-        int peerPort = 0;
-        if (!parseEndpoint(peerEndpoint, peerHost, peerPort)) {
-            continue;
-        }
-        (void)peerPort;
-        if (peerHost == "0.0.0.0" || peerHost == "::" || peerHost == "*") {
-            continue;
-        }
-
-        for (const auto& watch : watches) {
-            if (watch.port != localPort) {
-                continue;
-            }
-            if (!lineHasWatchedPid(line, watch.pids)) {
-                continue;
-            }
-            sessions[watch.streamId].insert(peerHost);
-        }
-    }
-    return sessions;
-}
-
-bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
-    return tvs::protocols::outputKind(outputConfig) == tvs::protocols::OutputKind::Srt &&
-           tvs::protocols::srtOutputMode(outputConfig) != "caller" &&
-           outputConfig.outputPort > 0;
-}
-
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
     : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(gst_is_initialized()) {
-    externalSrtSessionThread = std::thread(&StreamManager::monitorExternalSrtSessions, this);
     std::cerr << "StreamManager constructed" << std::endl;
 }
 
 StreamManager::~StreamManager() {
-    externalSrtSessionMonitorStop = true;
-    if (externalSrtSessionThread.joinable()) {
-        externalSrtSessionThread.join();
-    }
     stopAll();
 }
 
-bool StreamManager::startStream(const StreamConfig& streamConfig) {
+bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
+    if (error) error->clear();
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         if (streams.count(streamConfig.id)) {
+            if (error) *error = "stream is already active: " + streamConfig.id;
             return false;
         }
 
@@ -1245,6 +1102,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
+            if (error) *error = gstError.empty() ? "GStreamer transcoder failed to start" : gstError;
             return false;
         }
 
@@ -1278,6 +1136,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             if (state && state->gstTranscoder) {
                 state->gstTranscoder->stop();
             }
+            if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
         }
         notifyStreamState(
@@ -1291,6 +1150,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
+        if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
         return false;
     }
 
@@ -1311,6 +1171,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING for stream: " << streamConfig.name << std::endl;
+        std::string playingError = "failed to set pipeline to PLAYING for stream: " + streamConfig.name;
         if (state->bus) {
             GstMessage* msg = gst_bus_timed_pop_filtered(
                 state->bus,
@@ -1323,6 +1184,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
                     gst_message_parse_error(msg, &err, &dbg);
                     std::cerr << "PLAYING error: " << (err ? err->message : "unknown")
                               << " debug=" << (dbg ? dbg : "") << std::endl;
+                    if (err && err->message) playingError = err->message;
+                    if (dbg && *dbg) playingError += std::string(" | ") + dbg;
                     if (err) g_error_free(err);
                     g_free(dbg);
                 } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_WARNING) {
@@ -1344,6 +1207,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             state->gstTranscoder.reset();
         }
         gst_object_unref(pipeline);
+        if (error) *error = playingError;
         return false;
     }
 
@@ -1371,6 +1235,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig) {
             gst_object_unref(state->pipeline);
             state->pipeline = nullptr;
         }
+        if (error) *error = "duplicate stream start detected: " + streamConfig.id;
         return false;
     }
     notifyStreamState(
@@ -1444,13 +1309,14 @@ bool StreamManager::stopStream(const std::string& id) {
     return true;
 }
 
-bool StreamManager::restartStream(const StreamConfig& streamConfig) {
+bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string* error) {
+    if (error) error->clear();
     std::cerr << "Hard restarting stream: " << streamConfig.id << std::endl;
     const bool stopped = stopStream(streamConfig.id);
     if (stopped) {
         std::this_thread::sleep_for(kSrtRestartRetryDelay);
     }
-    return startStream(streamConfig);
+    return startStream(streamConfig, error);
 }
 
 void StreamManager::stopAll() {
@@ -1669,72 +1535,6 @@ void StreamManager::pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::t
             it = adHocSessions.erase(it);
         } else {
             ++it;
-        }
-    }
-}
-
-void StreamManager::updateExternalSrtSessionsLocked(const std::map<std::string, std::set<std::string>>& sessionsByStream) {
-    for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
-        if (it->first.rfind("srt-ext:", 0) == 0) {
-            it = adHocSessions.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    for (const auto& [streamId, clientIps] : sessionsByStream) {
-        if (streamId.empty()) {
-            continue;
-        }
-        for (const auto& clientIp : clientIps) {
-            const std::string normalizedClientIp = normalizeIpAddress(clientIp);
-            if (normalizedClientIp.empty()) {
-                continue;
-            }
-            const std::string key = "srt-ext:" + streamId + ":" + normalizedClientIp;
-            adHocSessions[key] = {streamId, normalizedClientIp, "srt", now};
-        }
-    }
-}
-
-void StreamManager::monitorExternalSrtSessions() {
-    while (!externalSrtSessionMonitorStop.load()) {
-        std::vector<ExternalSrtWatch> watches;
-        {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            for (const auto& [streamId, state] : streams) {
-                if (!state || !state->active.load() || state->pipeline || !state->gstTranscoder) {
-                    continue;
-                }
-
-                std::set<pid_t> pids;
-                for (const auto pid : state->gstTranscoder->childPids()) {
-                    if (pid > 0) {
-                        pids.insert(pid);
-                    }
-                }
-                if (pids.empty()) {
-                    continue;
-                }
-
-                for (const auto& outputConfig : tvs::protocols::outputConfigs(state->config)) {
-                    if (!isExternalSrtListenerOutput(outputConfig)) {
-                        continue;
-                    }
-                    watches.push_back({streamId, outputConfig.outputPort, pids});
-                }
-            }
-        }
-
-        const auto sessionsByStream = detectExternalSrtSessions(watches);
-        {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            updateExternalSrtSessionsLocked(sessionsByStream);
-        }
-
-        for (int i = 0; i < 20 && !externalSrtSessionMonitorStop.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 }

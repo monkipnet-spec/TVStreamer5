@@ -928,23 +928,3 @@ journalctl -u tvstreamer5 -n 100 --no-pager | grep -Ei 'srt|GStreamer transcoder
 ```bash
 gst-launch-1.0 -v srtsrc uri="srt://SERVER_IP:SRT_PORT?mode=caller" ! tsparse ! fakesink sync=false
 ```
-
-### Active sessions for transcoded SRT
-
-Ordinary in-process SRT outputs receive `caller-added` and `caller-removed` callbacks directly from `srtsink`, so subscriber sessions are updated immediately.
-
-Transcoded SRT outputs are produced by an external `gst-launch-1.0` process. Because that process owns the SRT listener, TVStreamer5 cannot receive the GStreamer SRT callback directly. Release 2 therefore polls the system UDP socket table and matches active SRT client sockets by `gst-launch-1.0` PID and SRT listener port. Matched remote IP addresses are added to the subscriber session table as active SRT sessions.
-
-Check active SRT client sockets on the server:
-
-```bash
-ss -H -u -n -p | grep gst-launch | grep ':<SRT_PORT>'
-```
-
-When a receiver is connected, the line should include the remote client IP. That IP must match the subscriber primary or backup IP and the subscriber must be assigned to the stream. The Subscribers dialog then shows the subscriber as Online.
-
-If the server hides process information from non-root users, run TVStreamer5 as root or check with:
-
-```bash
-sudo ss -H -u -n -p | grep ':<SRT_PORT>'
-```
