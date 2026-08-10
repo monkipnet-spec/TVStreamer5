@@ -2928,16 +2928,20 @@ bool StreamManager::buildRemapPipeline(
     if (cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" && !cfg.transcodeEnabled) {
         // WISI mode is intentionally isolated from the normal UDP-CBR path.
         // Rebuild the incoming service into a fresh SPTS so PCR/PAT/PMT and
-        // elementary stream timestamps come from one mux clock. 20 Mbit/s is
-        // high enough for typical passthrough SD/HD services and avoids using
-        // the UI target bitrate as an accidental throttle.
-        constexpr guint64 kWisiCbrBitrate = 20000000ULL;
-        setUInt64PropertyIfPresent(mux, "bitrate", kWisiCbrBitrate);
+        // elementary stream timestamps come from one mux clock. The transport
+        // CBR rate is exactly the Target bitrate already configured by the user.
+        if (cfg.targetBitrate == 0) {
+            std::cerr << "WISI compatibility requires Target bitrate greater than zero" << std::endl;
+            return false;
+        }
+        const guint64 wisiCbrBitrate = static_cast<guint64>(cfg.targetBitrate);
+        setUInt64PropertyIfPresent(mux, "bitrate", wisiCbrBitrate);
         const uint32_t inputServiceId = cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId;
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
-        std::cerr << "WISI compatibility mux: bitrate=" << kWisiCbrBitrate
+        std::cerr << "WISI compatibility mux: bitrate=" << wisiCbrBitrate
+                  << " source=target_bitrate"
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " alignment=" << kTsPacketsPerUdpBuffer
