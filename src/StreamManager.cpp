@@ -2825,8 +2825,16 @@ bool StreamManager::buildOutputBranch(
     // Feed the same transcoded TS to every TS-capable protocol and only apply remap
     // to non-transcoded passthrough streams.
     const bool transcodedInput = state && state->config.transcodeEnabled;
-    const bool needsRemux = outputConfig.remapEnabled && !transcodedInput;
+    const bool wisiCompatibility = outputConfig.wisiCompatibility &&
+        outputType(outputConfig) == "udp-cbr" && !transcodedInput;
+    const bool needsRemux = (outputConfig.remapEnabled || wisiCompatibility) && !transcodedInput;
     if (needsRemux) {
+        if (wisiCompatibility) {
+            std::cerr << "WISI compatibility: rebuilding passthrough TS as a clean single-program CBR transport"
+                      << " service_id=" << outputConfig.serviceId
+                      << " video_pid=" << outputConfig.videoPid
+                      << " audio_pid=" << outputConfig.audioPid << std::endl;
+        }
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
     return buildPassthroughPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
@@ -2914,6 +2922,22 @@ bool StreamManager::buildRemapPipeline(
     configureOutputQueue(outputQueue, cfg);
     configureCbrPacer(pacer, cfg);
     configureTsMux(mux, cfg);
+
+    if (cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" && !cfg.transcodeEnabled) {
+        // WISI mode is intentionally isolated from the normal UDP-CBR path.
+        // Rebuild the incoming service into a fresh SPTS so PCR/PAT/PMT and
+        // elementary stream timestamps come from one mux clock. 20 Mbit/s is
+        // high enough for typical passthrough SD/HD services and avoids using
+        // the UI target bitrate as an accidental throttle.
+        constexpr guint64 kWisiCbrBitrate = 20000000ULL;
+        setUInt64PropertyIfPresent(mux, "bitrate", kWisiCbrBitrate);
+        if (cfg.serviceId > 0) {
+            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(cfg.serviceId));
+        }
+        std::cerr << "WISI compatibility mux: bitrate=" << kWisiCbrBitrate
+                  << " alignment=" << kTsPacketsPerUdpBuffer
+                  << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
+    }
     sendServiceDescription(mux, cfg);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
@@ -3004,6 +3028,40 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         return nullptr;
     }
     if (isUdpOutputType(type)) {
+        if (type == "udp-cbr" && cfg.wisiCompatibility && !cfg.transcodeEnabled) {
+            // Do not use the custom userspace UDP pacer in WISI mode. The
+            // clean CBR transport produced by mpegtsmux is clock-scheduled by
+            // GstBaseSink instead. This avoids the per-datagram busy wait that
+            // caused the CPU increase in the previous compatibility attempt.
+            if (!hasElementFactory("udpsink")) {
+                std::cerr << missingElementStatus("udpsink") << std::endl;
+                return nullptr;
+            }
+            GstElement* sink = gst_element_factory_make("udpsink", sinkName.c_str());
+            if (!sink || !addElementOrFail(pipeline, sink)) {
+                return nullptr;
+            }
+            const std::string host = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+            g_object_set(sink,
+                "host", host.c_str(),
+                "port", static_cast<gint>(cfg.outputPort),
+                "sync", TRUE,
+                "async", FALSE,
+                "qos", FALSE,
+                "auto-multicast", TRUE,
+                "ttl-mc", 32,
+                "buffer-size", 8 * 1024 * 1024,
+                nullptr);
+            setInt64PropertyIfPresent(sink, "max-lateness", -1);
+            if (!cfg.interfaceAddress.empty()) {
+                setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
+            }
+            std::cerr << "WISI compatibility UDP sink: gst-clock-paced host="
+                      << host << ":" << cfg.outputPort
+                      << " packetization=7x188 cpu-pacer=off" << std::endl;
+            return sink;
+        }
+
         std::string error;
         GstElement* sink = udpCbrOutputEnabled(cfg)
             ? UdpCbrOutput::createSink(pipeline, cfg, sinkName, error)
