@@ -2171,7 +2171,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, wisi_compatibility:false, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -2399,6 +2399,7 @@ function openStreamForm(stream) {
         <div class="form-row full" id="streamTranscodeControls" style="display:${(stream.transcode_enabled && transcoderAvailable)?'block':'none'}"><label>Параметры транскодирования</label><div class="row-inline compact-row"><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${Math.round((stream.transcode_video_bitrate||6000000)/1000)}" placeholder="6000" /><span>кбит/с CBR</span></div><div class="row-inline compact-row" style="margin-top:8px"><select id="streamTranscodeAudioCodec" onchange="updateTranscodeAudioControls()"><option value="copy" ${stream.transcode_audio_codec==='copy'?'selected':''}>Проброс оригинальной дорожки</option><option value="aac" ${(stream.transcode_audio_codec||'aac')==='aac'?'selected':''} ${transcoderInfo.aac_encoder?'':'disabled'}>AAC-LC${transcoderInfo.aac_encoder?'':' (недоступен)'}</option><option value="mp3" ${stream.transcode_audio_codec==='mp3'?'selected':''} ${transcoderInfo.mp3_encoder?'':'disabled'}>MP3${transcoderInfo.mp3_encoder?'':' (недоступен)'}</option></select><select id="streamTranscodeAudioBitrate" ${stream.transcode_audio_codec==='copy'?'disabled':''}><option value="96000" ${(stream.transcode_audio_bitrate||192000)===96000?'selected':''}>96 кбит/с</option><option value="128000" ${(stream.transcode_audio_bitrate||192000)===128000?'selected':''}>128 кбит/с</option><option value="160000" ${(stream.transcode_audio_bitrate||192000)===160000?'selected':''}>160 кбит/с</option><option value="192000" ${(stream.transcode_audio_bitrate||192000)===192000?'selected':''}>192 кбит/с</option><option value="256000" ${(stream.transcode_audio_bitrate||192000)===256000?'selected':''}>256 кбит/с</option><option value="320000" ${(stream.transcode_audio_bitrate||192000)===320000?'selected':''}>320 кбит/с</option></select><span>аудио</span></div><small>Видео всегда преобразуется в прогрессивный режим 25p. По умолчанию: Full HD — 6000 кбит/с, звук AAC 192 кбит/с. В режиме проброса исходная аудиодорожка не перекодируется.</small></div>
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
         <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
+        <div class="form-row full" id="streamWisiCompatibilityRow"><label>Совместимость WISI</label><div class="checkbox-inline"><input id="streamWisiCompatibility" type="checkbox" ${stream.wisi_compatibility ? 'checked' : ''} /><span>WISI CHAMELEON</span></div><small>Только для UDP-CBR без транскодирования. При включении исходный MPEG-TS передаётся с pacing по PCR; обычный режим UDP-CBR остаётся без изменений.</small></div>
         <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div></div>
       </div>
       <div class="modal-actions">
@@ -2431,6 +2432,7 @@ function updateTranscodeControls() {
     enabled.disabled = true;
   }
   if (controls) controls.style.display = available && enabled && enabled.checked ? 'block' : 'none';
+  updateOutputHints();
 }
 function updateTranscodeAudioControls() {
   const codec = document.getElementById('streamTranscodeAudioCodec');
@@ -2510,6 +2512,14 @@ function updateOutputHints() {
     cbrInput.disabled = udpMode;
     cbrRow.style.display = udpMode ? 'none' : '';
   }
+  const wisiRow = document.getElementById('streamWisiCompatibilityRow');
+  const wisiInput = document.getElementById('streamWisiCompatibility');
+  if (wisiRow && wisiInput) {
+    const primaryType = rows[0]?.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
+    const transcoding = document.getElementById('streamTranscodeEnabled')?.checked === true;
+    wisiRow.style.display = primaryType === 'udp-cbr' ? '' : 'none';
+    wisiInput.disabled = primaryType !== 'udp-cbr' || transcoding;
+  }
   syncOutputHostWithInterface();
 }
 function syncOutputHostWithInterface() {
@@ -2578,6 +2588,7 @@ function saveStream(id) {
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
     cbr: selectedCbr,
+    wisi_compatibility: document.getElementById('streamWisiCompatibility')?.checked === true,
     target_bitrate: Number(document.getElementById('streamBitrate').value) * 1000,
     transcode_enabled: state.transcoder?.available === true && document.getElementById('streamTranscodeEnabled').checked,
     transcode_resolution: document.getElementById('streamTranscodeResolution').value,

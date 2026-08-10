@@ -55,6 +55,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
     config.cbr = root.get("cbr", true).asBool();
+    config.wisiCompatibility = root.get("wisi_compatibility", false).asBool();
     config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();
     config.transcodeEnabled = root.get("transcode_enabled", false).asBool();
     config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();
@@ -109,6 +110,7 @@ Json::Value StreamConfig::toJson() const {
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;
     root["cbr"] = cbr;
+    root["wisi_compatibility"] = wisiCompatibility;
     root["target_bitrate"] = Json::UInt64(targetBitrate);
     root["transcode_enabled"] = transcodeEnabled;
     root["transcode_resolution"] = transcodeResolution;

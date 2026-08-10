@@ -1706,6 +1706,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " input_iface=" << (inputInterface.empty() ? "auto" : inputInterface)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
+         << " wisi=" << (cfg.wisiCompatibility ? "on" : "off")
          << " transcode=" << (cfg.transcodeEnabled ? cfg.transcodeResolution + "@" + std::to_string(cfg.transcodeVideoBitrate) : "off")
          << " outputs=";
     const auto outputs = outputConfigs(cfg);
