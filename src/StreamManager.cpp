@@ -2902,7 +2902,9 @@ bool StreamManager::buildRemapPipeline(
     GstElement* preDemuxQueue = gst_element_factory_make("queue", branchName("remap_pre_demux_queue", branchIndex).c_str());
     GstElement* demux = gst_element_factory_make("tsdemux", branchName("demux", branchIndex).c_str());
     GstElement* mux = gst_element_factory_make("mpegtsmux", branchName("mux", branchIndex).c_str());
-    const bool cbrActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
+    const bool wisiCbrPacing = cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" &&
+                               !cfg.transcodeEnabled && cfg.targetBitrate > 0;
+    const bool cbrActive = (!isUdpOutput(cfg) && cbrMuxEnabled(cfg)) || wisiCbrPacing;
     GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
     GstElement* pacer = cbrActive ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str()) : nullptr;
     GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
@@ -2922,7 +2924,29 @@ bool StreamManager::buildRemapPipeline(
 
     configureQueue(preDemuxQueue);
     configureOutputQueue(outputQueue, cfg);
-    configureCbrPacer(pacer, cfg);
+    if (wisiCbrPacing) {
+        // WISI needs byte-clock pacing rather than relying on MPEG-TS buffer
+        // timestamps alone. identity/datarate rewrites timestamps from the
+        // actual byte count and sync=true schedules every 7x188-byte buffer on
+        // the GStreamer clock. This is deliberately isolated from normal UDP.
+        g_object_set(pacer,
+            "sync", TRUE,
+            "silent", TRUE,
+            "single-segment", TRUE,
+            nullptr);
+        const uint64_t bytesPerSecond = cfg.targetBitrate / 8;
+        if (bytesPerSecond == 0 || bytesPerSecond > static_cast<uint64_t>(G_MAXINT)) {
+            std::cerr << "WISI compatibility Target bitrate is outside pacer range: "
+                      << cfg.targetBitrate << std::endl;
+            return false;
+        }
+        setIntPropertyIfPresent(pacer, "datarate", static_cast<gint>(bytesPerSecond));
+        std::cerr << "WISI compatibility CBR pacer: bitrate=" << cfg.targetBitrate
+                  << " datarate=" << bytesPerSecond
+                  << " bytes/s packetization=7x188 clock=gstreamer" << std::endl;
+    } else {
+        configureCbrPacer(pacer, cfg);
+    }
     configureTsMux(mux, cfg);
 
     if (cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" && !cfg.transcodeEnabled) {
@@ -3084,9 +3108,10 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
     if (isUdpOutputType(type)) {
         if (type == "udp-cbr" && cfg.wisiCompatibility && !cfg.transcodeEnabled) {
             // Do not use the custom userspace UDP pacer in WISI mode. The
-            // clean CBR transport produced by mpegtsmux is clock-scheduled by
-            // GstBaseSink instead. This avoids the per-datagram busy wait that
-            // caused the CPU increase in the previous compatibility attempt.
+            // clean CBR transport produced by mpegtsmux is paced upstream by
+            // identity/datarate on the GStreamer clock. udpsink only transmits
+            // already-paced buffers, avoiding both double scheduling and the
+            // per-datagram busy wait from the earlier compatibility attempt.
             if (!hasElementFactory("udpsink")) {
                 std::cerr << missingElementStatus("udpsink") << std::endl;
                 return nullptr;
@@ -3099,7 +3124,10 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
             g_object_set(sink,
                 "host", host.c_str(),
                 "port", static_cast<gint>(cfg.outputPort),
-                "sync", TRUE,
+                // The WISI branch is already clock-paced by identity/datarate.
+                // Keep udpsink unsynchronised so there is exactly one timing
+                // authority and no second timestamp-based scheduling stage.
+                "sync", FALSE,
                 "async", FALSE,
                 "qos", FALSE,
                 "auto-multicast", TRUE,
@@ -3110,9 +3138,10 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
             if (!cfg.interfaceAddress.empty()) {
                 setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
             }
-            std::cerr << "WISI compatibility UDP sink: gst-clock-paced host="
+            std::cerr << "WISI compatibility UDP sink: host="
                       << host << ":" << cfg.outputPort
-                      << " packetization=7x188 cpu-pacer=off" << std::endl;
+                      << " packetization=7x188 byte-clock-pacer=on sink-sync=off cpu-busywait=off"
+                      << std::endl;
             return sink;
         }
 
