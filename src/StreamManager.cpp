@@ -2936,10 +2936,10 @@ bool StreamManager::buildRemapPipeline(
     if (cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" && !cfg.transcodeEnabled) {
         // WISI mode is intentionally isolated from the normal UDP-CBR path.
         // mpegtsmux now produces only the real remuxed SPTS (bitrate=0). The
-        // dedicated WISI shaper downstream adds null packets at Target bitrate
-        // and generates PCR from the strict MPEG-TS transport byte clock.
-        // Linux UDP scheduler jitter is deliberately not copied into PCR.
-        // Elementary PTS/DTS remain unchanged; no identity/datarate stage is used.
+        // dedicated WISI shaper downstream adds null packets at Target bitrate,
+        // schedules the remuxed TS from GstBuffer PTS/DTS (not PCR packet density)
+        // and restamps PCR to the actual output clock. Elementary PTS/DTS remain
+        // unchanged; no identity/datarate stage is used.
         if (cfg.targetBitrate == 0) {
             std::cerr << "WISI compatibility requires Target bitrate greater than zero" << std::endl;
             return false;
@@ -2952,8 +2952,7 @@ bool StreamManager::buildRemapPipeline(
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " alignment=" << kTsPacketsPerUdpBuffer
-                  << " source_pcr_interval=1800 output_pcr_interval_ms=30"
-                  << " pcr_clock=transport-byte-clock pat_pmt_interval=9000" << std::endl;
+                  << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
     sendServiceDescription(mux, cfg);
 
