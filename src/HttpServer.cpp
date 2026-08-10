@@ -1798,6 +1798,7 @@ function streamTileStructureSignature(stream) {
     backup_input_uri: stream.backup_input_uri,
     backup_input_type: stream.backup_input_type,
     backup_file_loop: stream.backup_file_loop,
+    input_service_id: stream.input_service_id,
     service_id: stream.service_id,
     cbr: stream.cbr,
     outputs: outputConfigsForStream(stream),
@@ -2172,7 +2173,7 @@ function openStreamModal() {
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
     interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, wisi_compatibility:false, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
-    audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
+    audio_pid:0, video_pid:0, input_service_id:1, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
 function outputTypeOptions(selected) {
@@ -2391,8 +2392,9 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${outputOptions}</select></div>
         <div class="form-row full"><label>Выходные форматы</label><div id="streamOutputs" class="output-list">${renderOutputRows(outputs, links)}</div><button class="button-secondary" type="button" onclick="addStreamOutput()">+ Добавить формат</button></div>
-        <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
-        <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
+        <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamVideoPid" type="number" min="16" max="8190" value="${stream.video_pid||258}" placeholder="V-PID 258" /><input class="compact" id="streamAudioPid" type="number" min="16" max="8190" value="${stream.audio_pid||257}" placeholder="A-PID 257" /></div></div>
+        <div class="form-row"><label>SID входа</label><input class="compact" id="streamInputServiceId" type="number" min="1" max="65535" value="${stream.input_service_id||stream.service_id||1}" placeholder="1" /></div>
+        <div class="form-row"><label>SID выхода</label><input class="compact" id="streamServiceId" type="number" min="1" max="65535" value="${stream.service_id||1}" placeholder="1" /></div>
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
         <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
         <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${(stream.transcode_enabled && transcoderAvailable) ? 'checked' : ''} ${transcoderAvailable ? '' : 'disabled'} onchange="updateTranscodeControls()" /><span>Транскодировать видео в H.264 CBR, устранить черезстрочность и перекодировать звук</span></div><small style="color:${transcoderAvailable ? '#7ee2a8' : '#ff9f9f'}">${transcoderStatus}</small></div>
@@ -2400,7 +2402,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
         <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
         <div class="form-row full" id="streamWisiCompatibilityRow"><label>Совместимость WISI</label><div class="checkbox-inline"><input id="streamWisiCompatibility" type="checkbox" ${stream.wisi_compatibility ? 'checked' : ''} /><span>WISI CHAMELEON</span></div><small>Только для UDP-CBR без транскодирования. При включении сервис без перекодирования пересобирается в чистый SPTS CBR 20 Мбит/с и отправляется по системному GStreamer clock. Обычный UDP-CBR остаётся без изменений.</small></div>
-        <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div></div>
+        <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div><small>В режиме WISI: SID входа выбирает исходную программу, SID выхода задаёт новый SID в PAT/PMT/SDT. V-PID и A-PID задают выходные PID.</small></div>
       </div>
       <div class="modal-actions">
         <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -2597,6 +2599,7 @@ function saveStream(id) {
     transcode_audio_bitrate: Number(document.getElementById('streamTranscodeAudioBitrate').value),
     audio_pid: Number(document.getElementById('streamAudioPid').value),
     video_pid: Number(document.getElementById('streamVideoPid').value),
+    input_service_id: Number(document.getElementById('streamInputServiceId').value),
     service_id: Number(document.getElementById('streamServiceId').value),
     service_name: document.getElementById('streamServiceName').value,
     service_provider: document.getElementById('streamProvider').value

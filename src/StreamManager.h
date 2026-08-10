@@ -26,8 +26,15 @@ struct RemapContext {
     bool audioLinked = false;
     bool flvMux = false;
     bool programMapApplied = false;
+    GstPad* preallocatedVideoMuxPad = nullptr;
+    GstPad* preallocatedAudioMuxPad = nullptr;
     std::string videoPadName;
     std::string audioPadName;
+
+    ~RemapContext() {
+        if (preallocatedVideoMuxPad) gst_object_unref(preallocatedVideoMuxPad);
+        if (preallocatedAudioMuxPad) gst_object_unref(preallocatedAudioMuxPad);
+    }
 };
 
 

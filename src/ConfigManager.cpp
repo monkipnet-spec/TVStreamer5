@@ -70,6 +70,12 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.audioPid = root.get("audio_pid", 0).asUInt();
     config.videoPid = root.get("video_pid", 0).asUInt();
     config.serviceId = root.get("service_id", 1).asUInt();
+    // v74 separates the source program selector from the remapped output SID.
+    // Old configurations did not have input_service_id, so preserve their exact
+    // behaviour by using the previous service_id for both sides.
+    config.inputServiceId = root.isMember("input_service_id")
+        ? root.get("input_service_id", config.serviceId).asUInt()
+        : config.serviceId;
     config.serviceName = root.get("service_name", "").asString();
     config.serviceProvider = root.get("service_provider", "").asString();
     if (root.isMember("outputs") && root["outputs"].isArray() && root["outputs"].size() > 0) {
@@ -119,6 +125,7 @@ Json::Value StreamConfig::toJson() const {
     root["transcode_audio_bitrate"] = Json::UInt64(transcodeAudioBitrate);
     root["audio_pid"] = audioPid;
     root["video_pid"] = videoPid;
+    root["input_service_id"] = inputServiceId;
     root["service_id"] = serviceId;
     root["service_name"] = serviceName;
     root["service_provider"] = serviceProvider;

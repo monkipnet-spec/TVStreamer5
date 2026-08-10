@@ -1720,6 +1720,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     }
     desc
          << " iface=" << cfg.interfaceAddress
+         << " input_service_id=" << cfg.inputServiceId
          << " service_id=" << cfg.serviceId
          << " vpid=" << cfg.videoPid
          << " apid=" << cfg.audioPid;
@@ -2831,6 +2832,7 @@ bool StreamManager::buildOutputBranch(
     if (needsRemux) {
         if (wisiCompatibility) {
             std::cerr << "WISI compatibility: rebuilding passthrough TS as a clean single-program CBR transport"
+                      << " input_service_id=" << outputConfig.inputServiceId
                       << " service_id=" << outputConfig.serviceId
                       << " video_pid=" << outputConfig.videoPid
                       << " audio_pid=" << outputConfig.audioPid << std::endl;
@@ -2931,10 +2933,13 @@ bool StreamManager::buildRemapPipeline(
         // the UI target bitrate as an accidental throttle.
         constexpr guint64 kWisiCbrBitrate = 20000000ULL;
         setUInt64PropertyIfPresent(mux, "bitrate", kWisiCbrBitrate);
-        if (cfg.serviceId > 0) {
-            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(cfg.serviceId));
+        const uint32_t inputServiceId = cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId;
+        if (inputServiceId > 0) {
+            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
         std::cerr << "WISI compatibility mux: bitrate=" << kWisiCbrBitrate
+                  << " input_sid=" << inputServiceId
+                  << " output_sid=" << cfg.serviceId
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
@@ -2954,6 +2959,51 @@ bool StreamManager::buildRemapPipeline(
     context->mux = mux;
     context->sink = sink;
     context->config = cfg;
+
+    const bool wisiRemap = cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" &&
+                           !cfg.transcodeEnabled && cfg.remapEnabled;
+    if (wisiRemap) {
+        // Configure the complete output program map before any elementary data is
+        // linked into mpegtsmux. This avoids live prog-map replacement and makes
+        // WISI remapping deterministic: input SID only selects tsdemux, while
+        // serviceId is the new output program number.
+        if (cfg.serviceId == 0 || cfg.videoPid == 0 || cfg.audioPid == 0) {
+            std::cerr << "WISI remap requires non-zero output SID, V-PID and A-PID" << std::endl;
+            return false;
+        }
+
+        const std::string videoPadName = "sink_" + std::to_string(cfg.videoPid);
+        const std::string audioPadName = "sink_" + std::to_string(cfg.audioPid);
+        GstPad* videoPad = gst_element_request_pad_simple(mux, videoPadName.c_str());
+        GstPad* audioPad = gst_element_request_pad_simple(mux, audioPadName.c_str());
+        if (!videoPad || !audioPad) {
+            if (videoPad) gst_object_unref(videoPad);
+            if (audioPad) gst_object_unref(audioPad);
+            std::cerr << "WISI remap failed to reserve output PID pads: video="
+                      << cfg.videoPid << " audio=" << cfg.audioPid << std::endl;
+            return false;
+        }
+        context->preallocatedVideoMuxPad = videoPad;
+        context->preallocatedAudioMuxPad = audioPad;
+
+        GstStructure* programMap = gst_structure_new_empty("program_map");
+        gst_structure_set(programMap,
+            videoPadName.c_str(), G_TYPE_INT, static_cast<gint>(cfg.serviceId),
+            audioPadName.c_str(), G_TYPE_INT, static_cast<gint>(cfg.serviceId),
+            nullptr);
+        g_object_set(mux, "prog-map", programMap, nullptr);
+        gst_structure_free(programMap);
+
+        context->programMapApplied = true;
+        context->videoPadName = videoPadName;
+        context->audioPadName = audioPadName;
+        std::cerr << "WISI remap program map: input_sid="
+                  << (cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId)
+                  << " output_sid=" << cfg.serviceId
+                  << " video=" << videoPadName
+                  << " audio=" << audioPadName << std::endl;
+    }
+
     RemapContext* contextPtr = context.get();
     state->outputContexts.push_back(std::move(context));
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
@@ -3214,9 +3264,21 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     GstElement* muxSourceElement = capsfilter ? capsfilter : parser;
     GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
-    GstPad* muxSinkPad = ctx->flvMux
-        ? requestFlvMuxSinkPad(ctx->mux, isVideo)
-        : requestMuxSinkPad(ctx->mux, requestedPid);
+    GstPad* muxSinkPad = nullptr;
+    const bool wisiPreMapped = !ctx->flvMux && ctx->config.wisiCompatibility &&
+                               outputType(ctx->config) == "udp-cbr" &&
+                               !ctx->config.transcodeEnabled && ctx->config.remapEnabled &&
+                               ctx->programMapApplied;
+    if (wisiPreMapped) {
+        GstPad* reservedPad = isVideo ? ctx->preallocatedVideoMuxPad : ctx->preallocatedAudioMuxPad;
+        if (reservedPad) {
+            muxSinkPad = GST_PAD(gst_object_ref(reservedPad));
+        }
+    } else {
+        muxSinkPad = ctx->flvMux
+            ? requestFlvMuxSinkPad(ctx->mux, isVideo)
+            : requestMuxSinkPad(ctx->mux, requestedPid);
+    }
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
         if (muxSinkPad) gst_object_unref(muxSinkPad);
@@ -3227,7 +3289,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
         std::cerr << "remap linked " << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
-                  << " pid=" << requestedPid << std::endl;
+                  << " pid=" << requestedPid
+                  << (wisiPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
+                  << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {
             ctx->videoLinked = true;
