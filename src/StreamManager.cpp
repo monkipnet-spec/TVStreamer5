@@ -911,7 +911,7 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
     } else if (wisiExternalShaper) {
         // The WISI branch must not let mpegtsmux generate its own CBR padding.
         // A dedicated TS shaper after the mux inserts PID 0x1FFF packets at the
-        // configured output clock while leaving the real TS bytes untouched.
+        // configured output clock and restamps PCR to the actual CBR output clock.
         setUInt64PropertyIfPresent(mux, "bitrate", 0);
     }
 }
@@ -2937,7 +2937,8 @@ bool StreamManager::buildRemapPipeline(
         // WISI mode is intentionally isolated from the normal UDP-CBR path.
         // mpegtsmux now produces only the real remuxed SPTS (bitrate=0). The
         // dedicated WISI shaper downstream adds null packets at Target bitrate,
-        // so mux PCR/PTS bytes are not retimestamped by an identity/datarate stage.
+        // schedules real packets from source PCR and restamps PCR to the actual
+        // output clock. PTS/DTS are preserved; no identity/datarate stage is used.
         if (cfg.targetBitrate == 0) {
             std::cerr << "WISI compatibility requires Target bitrate greater than zero" << std::endl;
             return false;
@@ -3089,9 +3090,9 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
     if (isUdpOutputType(type)) {
         if (type == "udp-cbr" && cfg.wisiCompatibility && !cfg.transcodeEnabled) {
             // Dedicated WISI shaper. Normal UDP-CBR remains on UdpCbrOutput.
-            // The shaper adds PID 0x1FFF packets itself and uses absolute
-            // CLOCK_MONOTONIC sleeps, so there is no GStreamer double-pacing
-            // and no busy-wait loop.
+            // The shaper adds PID 0x1FFF packets, schedules payload from source
+            // PCR, restamps PCR to the actual output clock, and uses absolute
+            // CLOCK_MONOTONIC sleeps. There is no double-pacing or busy-wait.
             std::string error;
             GstElement* sink = WisiCbrOutput::createSink(pipeline, cfg, sinkName, error);
             if (!sink) {
