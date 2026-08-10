@@ -81,6 +81,7 @@ The web UI currently exposes:
 ```text
 udp-vbr   MPEG-TS over UDP
 udp-cbr   paced/CBR MPEG-TS over UDP
+rtp       MPEG-TS over RTP/UDP
 srt       MPEG-TS over SRT listener or caller
 http      MPEG-TS over HTTP
 hls       HLS playlist + MPEG-TS segments
@@ -89,7 +90,7 @@ rtmp      RTMP push
 youtube   RTMP push to YouTube Live
 ```
 
-RTP protocol modules exist in the codebase for MPEG-TS/RTP processing, but Release 2 does not expose RTP output as a selectable item in the current web UI.
+RTP MPEG-TS output is selectable in the web UI. It uses `rtpmp2tpay` over UDP; with MTU 1400 the payload fits 7 MPEG-TS packets (7 × 188 = 1316 bytes), which is suitable for IPTV headends.
 
 HTTP and HLS player URLs use the application HTTP server:
 

@@ -162,7 +162,7 @@ std::string outputType(const StreamConfig& cfg) {
         type = "udp-cbr";
     }
 
-    if (type != "udp" && type != "udp-vbr" && type != "udp-cbr" &&
+    if (type != "udp" && type != "udp-vbr" && type != "udp-cbr" && type != "rtp" &&
         type != "srt" && type != "http" && type != "hls" && type != "rtsp" && type != "rtmp" && type != "youtube") {
         type = "udp";
     }
@@ -174,7 +174,8 @@ bool isUdpOutputType(const std::string& type) {
 }
 
 bool isUdpOutput(const StreamConfig& cfg) {
-    return isUdpOutputType(outputType(cfg));
+    const std::string type = outputType(cfg);
+    return isUdpOutputType(type) || type == "rtp";
 }
 
 bool udpCbrOutputEnabled(const StreamConfig& cfg) {
@@ -773,6 +774,66 @@ void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
         "target-duration", 4,
         "max-files", 8,
         nullptr);
+}
+
+GstElement* createRtpMpegTsSink(const StreamConfig& cfg, const std::string& sinkName) {
+    if (!hasElementFactory("rtpmp2tpay") || !hasElementFactory("udpsink")) {
+        std::cerr << "missing RTP output elements: rtpmp2tpay or udpsink" << std::endl;
+        return nullptr;
+    }
+
+    GstElement* bin = gst_bin_new(sinkName.c_str());
+    GstElement* pay = gst_element_factory_make("rtpmp2tpay", "rtp_mpegts_pay");
+    GstElement* udp = gst_element_factory_make("udpsink", "rtp_udp_sink");
+    if (!bin || !pay || !udp) {
+        if (bin) gst_object_unref(bin);
+        if (pay) gst_object_unref(pay);
+        if (udp) gst_object_unref(udp);
+        return nullptr;
+    }
+
+    gst_bin_add_many(GST_BIN(bin), pay, udp, nullptr);
+    setUIntPropertyIfPresent(pay, "mtu", 1400);
+
+    const std::string host = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+    g_object_set(udp,
+        "host", host.c_str(),
+        "port", static_cast<gint>(cfg.outputPort),
+        "sync", TRUE,
+        "async", FALSE,
+        "qos", FALSE,
+        "auto-multicast", TRUE,
+        "ttl-mc", 32,
+        "buffer-size", 8 * 1024 * 1024,
+        nullptr);
+    setInt64PropertyIfPresent(udp, "max-lateness", -1);
+    if (!cfg.interfaceAddress.empty()) {
+        setStringPropertyIfPresent(udp, "bind-address", cfg.interfaceAddress);
+    }
+
+    if (!gst_element_link(pay, udp)) {
+        gst_object_unref(bin);
+        return nullptr;
+    }
+
+    GstPad* paySink = gst_element_get_static_pad(pay, "sink");
+    if (!paySink) {
+        gst_object_unref(bin);
+        return nullptr;
+    }
+    GstPad* ghostSink = gst_ghost_pad_new("sink", paySink);
+    gst_object_unref(paySink);
+    if (!ghostSink || !gst_element_add_pad(bin, ghostSink)) {
+        if (ghostSink) gst_object_unref(ghostSink);
+        gst_object_unref(bin);
+        return nullptr;
+    }
+
+    std::cerr << "RTP MPEG-TS output: rtp://" << host << ":" << cfg.outputPort
+              << " packetization=7x188 mtu=1400"
+              << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
+              << std::endl;
+    return bin;
 }
 
 void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
@@ -2948,6 +3009,14 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
             : UdpVbrOutput::createSink(pipeline, cfg, sinkName, error);
         if (!sink) {
             std::cerr << error << std::endl;
+        }
+        return sink;
+    }
+    if (type == "rtp") {
+        GstElement* sink = createRtpMpegTsSink(cfg, sinkName);
+        if (!sink || !addElementOrFail(pipeline, sink)) {
+            if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+            return nullptr;
         }
         return sink;
     }

@@ -42,6 +42,10 @@ constexpr uint64_t kMinPacedBitrate = 512000ULL;
 constexpr uint64_t kMaxPacedBitrate = 200000000ULL;
 constexpr uint64_t kPaceRiseLimitPercent = 125ULL;
 constexpr auto kMaxPaceSleep = std::chrono::milliseconds(20);
+constexpr auto kPacingWakeGuard = std::chrono::microseconds(120);
+constexpr uint64_t kStrictStartupMilliseconds = 250ULL;
+constexpr std::size_t kMinStrictStartupBytes = 64 * 1024;
+constexpr std::size_t kMaxStrictStartupBytes = 512 * 1024;
 constexpr auto kArrivalRateWindow = std::chrono::seconds(1);
 
 bool isMulticastHost(const std::string& host) {
@@ -149,6 +153,14 @@ public:
             ::setsockopt(socketFd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
         }
 
+        // Keep the kernel queue from turning a short userspace scheduling delay
+        // into a large wire-rate burst. SO_MAX_PACING_RATE is advisory and is
+        // effective on Linux when the selected qdisc supports socket pacing.
+        const uint64_t initialKernelRate = configuredBitrate > 0
+            ? configuredBitrate
+            : pacedBitrate.load(std::memory_order_relaxed);
+        applyKernelPacingRate(initialKernelRate);
+
         ready = true;
         senderThread = std::thread(&UdpTsSender::sendLoop, this);
     }
@@ -214,6 +226,48 @@ private:
             configuredBitrate > 0 &&
             !pacingConfig.updateFromPcr &&
             !pacingConfig.updateFromArrivalRate;
+    }
+
+    void applyKernelPacingRate(uint64_t bitrate) {
+#ifdef SO_MAX_PACING_RATE
+        if (socketFd < 0 || bitrate == 0) {
+            return;
+        }
+        // Add 12% headroom. Userspace remains the authoritative pacer; the kernel
+        // limiter only absorbs accidental micro-bursts after scheduler wakeups.
+        const uint64_t bytesPerSecond64 = (bitrate * 112ULL / 100ULL) / 8ULL;
+        const uint32_t bytesPerSecond = static_cast<uint32_t>(
+            std::min<uint64_t>(bytesPerSecond64, 0xFFFFFFFFULL));
+        ::setsockopt(socketFd, SOL_SOCKET, SO_MAX_PACING_RATE,
+                     &bytesPerSecond, sizeof(bytesPerSecond));
+#else
+        (void)bitrate;
+#endif
+    }
+
+    void waitUntilPacingDeadline(std::chrono::steady_clock::time_point deadline) {
+        auto now = std::chrono::steady_clock::now();
+        if (deadline <= now) {
+            return;
+        }
+
+        if (deadline - now > kPacingWakeGuard) {
+            std::this_thread::sleep_until(deadline - kPacingWakeGuard);
+        }
+        while (!stopping.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+    }
+
+    std::size_t strictStartupTargetBytes() const {
+        const uint64_t bytesForWindow = configuredBitrate > 0
+            ? configuredBitrate * kStrictStartupMilliseconds / 8000ULL
+            : kMinStrictStartupBytes;
+        return static_cast<std::size_t>(std::clamp<uint64_t>(
+            bytesForWindow,
+            kMinStrictStartupBytes,
+            kMaxStrictStartupBytes));
     }
 
     void sendLoop() {
@@ -286,7 +340,7 @@ private:
             }
 
             if (!transmissionStarted) {
-                if (!hasAlignedDatagram()) {
+                if (pending.size() < strictStartupTargetBytes() || !hasAlignedDatagram()) {
                     continue;
                 }
                 transmissionStarted = true;
@@ -296,7 +350,7 @@ private:
 
             auto now = std::chrono::steady_clock::now();
             if (now < nextSend) {
-                std::this_thread::sleep_until(nextSend);
+                waitUntilPacingDeadline(nextSend);
                 now = std::chrono::steady_clock::now();
             }
 
@@ -501,6 +555,7 @@ private:
         }
         currentBitrate = (currentBitrate * 7ULL + estimatedBitrate * 3ULL) / 10ULL;
         pacedBitrate.store(currentBitrate, std::memory_order_relaxed);
+        applyKernelPacingRate(currentBitrate);
     }
 
     void updatePacingFromArrival(std::size_t bytes) {
@@ -563,7 +618,7 @@ private:
         if (nextSend > now) {
             const auto wait = nextSend - now;
             if (wait <= kMaxPaceSleep) {
-                std::this_thread::sleep_until(nextSend);
+                waitUntilPacingDeadline(nextSend);
             } else {
                 nextSend = now;
             }

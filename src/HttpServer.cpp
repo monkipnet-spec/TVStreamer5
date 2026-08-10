@@ -177,7 +177,7 @@ std::string normalizedOutputType(const StreamConfig& cfg) {
     if (type == "udp") {
         return cfg.cbr ? "udp-cbr" : "udp-vbr";
     }
-    if (type != "udp-vbr" && type != "udp-cbr" &&
+    if (type != "udp-vbr" && type != "udp-cbr" && type != "rtp" &&
         type != "srt" && type != "http" && type != "hls" &&
         type != "rtsp" && type != "rtmp" && type != "youtube") {
         return "udp-vbr";
@@ -280,6 +280,9 @@ void closeInheritedFileDescriptors() {
 
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = normalizedOutputType(cfg);
+    if (type == "rtp") {
+        return "rtp://" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
+    }
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
         const bool listener = toLower(cfg.outputMode) != "caller";
@@ -2176,6 +2179,7 @@ function outputTypeOptions(selected) {
   const options = [
     ['udp-vbr', 'UDP MPEG-TS VBR'],
     ['udp-cbr', 'UDP MPEG-TS CBR'],
+    ['rtp', 'RTP MPEG-TS'],
     ['srt', 'SRT'],
     ['http', 'HTTP TS'],
     ['hls', 'HLS'],
@@ -2461,6 +2465,11 @@ function updateOutputHints() {
       port.disabled = false;
       port.placeholder = String(state.http_port || 9000);
       host.placeholder = 'IP интерфейса или DNS';
+    } else if (type === 'rtp') {
+      hostLabel.textContent = 'RTP IP / мультикаст';
+      portLabel.textContent = 'RTP порт';
+      port.disabled = false;
+      host.placeholder = '239.0.0.1';
     } else if (type === 'srt') {
       hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';
       portLabel.textContent = 'SRT порт';
