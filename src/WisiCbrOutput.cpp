@@ -43,7 +43,7 @@ constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
 constexpr uint64_t kPcrTicksModulus = kPcrBaseModulus * 300ULL;
-constexpr uint64_t kPeriodicPcrIntervalNanoseconds = 20ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kPeriodicPcrIntervalNanoseconds = 30ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kStatsIntervalNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampBackwardToleranceNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -402,7 +402,7 @@ private:
             updateRateController(now);
 
             std::array<guint8, kUdpPayloadSize> datagram {};
-            const FillCounts filled = fillDatagram(datagram.data(), nextSendNanoseconds);
+            const FillCounts filled = fillDatagram(datagram.data());
             sendDatagram(datagram.data(), datagram.size());
             totalDatagrams.fetch_add(1, std::memory_order_relaxed);
             totalRealPackets.fetch_add(filled.real, std::memory_order_relaxed);
@@ -654,7 +654,7 @@ private:
         std::size_t periodicPcr = 0;
     };
 
-    FillCounts fillDatagram(guint8* destination, uint64_t datagramDeadlineNanoseconds) {
+    FillCounts fillDatagram(guint8* destination) {
         FillCounts counts;
         if (!destination) {
             return counts;
@@ -662,26 +662,39 @@ private:
 
         const uint64_t pace = realPaceBitrate.load(std::memory_order_relaxed);
         for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
-            const uint64_t slotOffset = multiplyDivide(
-                slot * kTsPacketSize * 8ULL, 1000000000ULL, targetBitrate);
-            const uint64_t slotTime = datagramDeadlineNanoseconds + slotOffset;
+            const uint64_t currentTransportSlot = transportSlotIndex++;
             guint8* outputPacket = destination + slot * kTsPacketSize;
 
             // Accumulate useful-data entitlement on every transport slot,
             // including slots reserved for periodic PCR-only packets.
             realTokenAccumulator += pace;
 
-            if (periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
-                makePeriodicPcrPacket(outputPacket, slotTime);
+            uint64_t transportElapsedNanoseconds = 0;
+            if (periodicPcrInitialized && currentTransportSlot >= periodicPcrOriginTransportSlot) {
+                transportElapsedNanoseconds = multiplyDivide(
+                    (currentTransportSlot - periodicPcrOriginTransportSlot) *
+                        kTsPacketSize * 8ULL,
+                    1000000000ULL, targetBitrate);
+            }
+
+            // PCR belongs to the MPEG-TS transport byte clock, not to Linux
+            // wall-clock send jitter.  Reserve the first transport slot whose
+            // byte position reaches each 30 ms PCR boundary.  This is the key
+            // difference from v83, which advanced PCR from the actual
+            // clock_nanosleep/send deadline and therefore copied scheduler
+            // lateness into PCR.
+            if (periodicPcrInitialized &&
+                transportElapsedNanoseconds >= nextPeriodicPcrTransportNanoseconds) {
+                makePeriodicPcrPacket(outputPacket, transportElapsedNanoseconds);
                 ++counts.periodicPcr;
 
                 uint64_t skipped = 0;
                 do {
-                    nextPeriodicPcrNanoseconds += kPeriodicPcrIntervalNanoseconds;
-                    if (nextPeriodicPcrNanoseconds <= slotTime) {
+                    nextPeriodicPcrTransportNanoseconds += kPeriodicPcrIntervalNanoseconds;
+                    if (nextPeriodicPcrTransportNanoseconds <= transportElapsedNanoseconds) {
                         ++skipped;
                     }
-                } while (nextPeriodicPcrNanoseconds <= slotTime);
+                } while (nextPeriodicPcrTransportNanoseconds <= transportElapsedNanoseconds);
                 if (skipped > 0) {
                     missedPeriodicPcrIntervals.fetch_add(skipped, std::memory_order_relaxed);
                 }
@@ -711,9 +724,9 @@ private:
                         // generated independently of source packet bursts.
                         periodicPcrPid = packet.pid;
                         periodicPcrOriginTicks = packet.sourcePcrTicks;
-                        periodicPcrOriginNanoseconds = slotTime;
-                        nextPeriodicPcrNanoseconds =
-                            slotTime + kPeriodicPcrIntervalNanoseconds;
+                        periodicPcrOriginTransportSlot = currentTransportSlot;
+                        nextPeriodicPcrTransportNanoseconds =
+                            kPeriodicPcrIntervalNanoseconds;
                         periodicPcrInitialized = true;
                         writePcr(packet.bytes, periodicPcrOriginTicks);
                         ++rewrittenPcrPackets;
@@ -747,7 +760,7 @@ private:
         pcrPidContinuityValid = true;
     }
 
-    void makePeriodicPcrPacket(guint8* destination, uint64_t slotTimeNanoseconds) {
+    void makePeriodicPcrPacket(guint8* destination, uint64_t transportElapsedNanoseconds) {
         std::array<guint8, kTsPacketSize> packet {};
         packet.fill(0xFF);
         packet[0] = 0x47;
@@ -760,12 +773,9 @@ private:
         packet[4] = 183;
         packet[5] = 0x10; // PCR flag
 
-        const uint64_t elapsedNanoseconds =
-            slotTimeNanoseconds >= periodicPcrOriginNanoseconds
-                ? slotTimeNanoseconds - periodicPcrOriginNanoseconds
-                : 0;
         const uint64_t pcrTicks =
-            (periodicPcrOriginTicks + nanosecondsToPcrTicks(elapsedNanoseconds)) %
+            (periodicPcrOriginTicks +
+             nanosecondsToPcrTicks(transportElapsedNanoseconds)) %
             kPcrTicksModulus;
         writePcr(packet, pcrTicks);
         std::copy(packet.begin(), packet.end(), destination);
@@ -818,7 +828,7 @@ private:
                   << " pcr_source_stripped=" << strippedSourcePcrPackets.load(std::memory_order_relaxed)
                   << " pcr_missed_intervals=" << missedPeriodicPcrIntervals.load(std::memory_order_relaxed)
                   << " pcr_pid=" << periodicPcrPid
-                  << " timing=reservoir_rate_controller_periodic_pcr"
+                  << " timing=reservoir_rate_controller_transport_pcr"
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
                   << " low_water_events=" << lowWatermarkEvents.load(std::memory_order_relaxed)
@@ -868,8 +878,9 @@ private:
     bool periodicPcrInitialized = false;
     uint16_t periodicPcrPid = 0x1FFF;
     uint64_t periodicPcrOriginTicks = 0;
-    uint64_t periodicPcrOriginNanoseconds = 0;
-    uint64_t nextPeriodicPcrNanoseconds = 0;
+    uint64_t periodicPcrOriginTransportSlot = 0;
+    uint64_t nextPeriodicPcrTransportNanoseconds = 0;
+    uint64_t transportSlotIndex = 0;
     guint8 pcrPidContinuityCounter = 0;
     bool pcrPidContinuityValid = false;
     guint8 nullContinuityCounter = 0;
@@ -971,8 +982,8 @@ GstElement* createSink(
               << " packetization=7x188 startup_reservoir_ms=2000"
               << " target_reservoir_ms=1200 low_watermark_ms=350"
               << " null_pid=0x1fff source_timing=reservoir-rate-controller"
-              << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
-              << " pcr_restamp=output-clock"
+              << " pcr_mode=periodic-pcr-only-30ms pcr_clock=transport-byte-clock source_pcr=stripped-after-lock"
+              << " pcr_restamp=transport-byte-clock"
               << " clock=clock_nanosleep-abstime busywait=off"
               << std::endl;
     return sink;
