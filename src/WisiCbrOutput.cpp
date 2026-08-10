@@ -43,7 +43,6 @@ constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
 constexpr uint64_t kPcrTicksModulus = kPcrBaseModulus * 300ULL;
-constexpr uint64_t kPeriodicPcrIntervalNanoseconds = 20ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kStatsIntervalNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampBackwardToleranceNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -124,7 +123,6 @@ struct TimedChunk {
 
 struct TimedTsPacket {
     std::array<guint8, kTsPacketSize> bytes {};
-    uint16_t pid = 0x1FFF;
     bool hasPcr = false;
     bool discontinuity = false;
     uint64_t sourcePcrTicks = 0;
@@ -181,36 +179,6 @@ void writePcr(std::array<guint8, kTsPacketSize>& packet, uint64_t pcrTicks) {
     packet[10] = static_cast<guint8>(((base & 0x01) << 7) | 0x7E |
         ((extension >> 8) & 0x01));
     packet[11] = static_cast<guint8>(extension & 0xFF);
-}
-
-uint16_t packetPid(const std::array<guint8, kTsPacketSize>& packet) {
-    return static_cast<uint16_t>(
-        (static_cast<uint16_t>(packet[1] & 0x1F) << 8) |
-        static_cast<uint16_t>(packet[2]));
-}
-
-bool packetHasPayload(const std::array<guint8, kTsPacketSize>& packet) {
-    const guint8 adaptationFieldControl =
-        static_cast<guint8>((packet[3] >> 4) & 0x03);
-    return adaptationFieldControl == 1 || adaptationFieldControl == 3;
-}
-
-void clearPcrFlag(std::array<guint8, kTsPacketSize>& packet) {
-    if (packet[0] != 0x47) {
-        return;
-    }
-    const guint8 adaptationFieldControl =
-        static_cast<guint8>((packet[3] >> 4) & 0x03);
-    if (adaptationFieldControl != 2 && adaptationFieldControl != 3) {
-        return;
-    }
-    const std::size_t adaptationLength = packet[4];
-    if (adaptationLength < 1 || 5 + adaptationLength > kTsPacketSize) {
-        return;
-    }
-    // Keep the adaptation-field size unchanged; the old PCR bytes simply
-    // become stuffing after the PCR flag is cleared.
-    packet[5] = static_cast<guint8>(packet[5] & ~0x10U);
 }
 
 class WisiCbrSender {
@@ -402,15 +370,12 @@ private:
             updateRateController(now);
 
             std::array<guint8, kUdpPayloadSize> datagram {};
-            const FillCounts filled = fillDatagram(datagram.data(), nextSendNanoseconds);
+            const std::size_t realPackets = fillDatagram(datagram.data(), nextSendNanoseconds);
             sendDatagram(datagram.data(), datagram.size());
             totalDatagrams.fetch_add(1, std::memory_order_relaxed);
-            totalRealPackets.fetch_add(filled.real, std::memory_order_relaxed);
-            const std::size_t occupied = filled.real + filled.periodicPcr;
-            totalNullPackets.fetch_add(
-                occupied < kTsPacketsPerDatagram ? kTsPacketsPerDatagram - occupied : 0,
-                std::memory_order_relaxed);
-            if (filled.real > 0) {
+            totalRealPackets.fetch_add(realPackets, std::memory_order_relaxed);
+            totalNullPackets.fetch_add(kTsPacketsPerDatagram - realPackets, std::memory_order_relaxed);
+            if (realPackets > 0) {
                 queueSpace.notify_all();
             }
 
@@ -524,7 +489,6 @@ private:
 
             TimedTsPacket packet;
             std::copy_n(chunk.bytes.data() + offset, kTsPacketSize, packet.bytes.data());
-            packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             realPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
@@ -649,17 +613,12 @@ private:
         reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
     }
 
-    struct FillCounts {
-        std::size_t real = 0;
-        std::size_t periodicPcr = 0;
-    };
-
-    FillCounts fillDatagram(guint8* destination, uint64_t datagramDeadlineNanoseconds) {
-        FillCounts counts;
+    std::size_t fillDatagram(guint8* destination, uint64_t datagramDeadlineNanoseconds) {
         if (!destination) {
-            return counts;
+            return 0;
         }
 
+        std::size_t realCount = 0;
         const uint64_t pace = realPaceBitrate.load(std::memory_order_relaxed);
         for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
             const uint64_t slotOffset = multiplyDivide(
@@ -667,27 +626,7 @@ private:
             const uint64_t slotTime = datagramDeadlineNanoseconds + slotOffset;
             guint8* outputPacket = destination + slot * kTsPacketSize;
 
-            // Accumulate useful-data entitlement on every transport slot,
-            // including slots reserved for periodic PCR-only packets.
             realTokenAccumulator += pace;
-
-            if (periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
-                makePeriodicPcrPacket(outputPacket, slotTime);
-                ++counts.periodicPcr;
-
-                uint64_t skipped = 0;
-                do {
-                    nextPeriodicPcrNanoseconds += kPeriodicPcrIntervalNanoseconds;
-                    if (nextPeriodicPcrNanoseconds <= slotTime) {
-                        ++skipped;
-                    }
-                } while (nextPeriodicPcrNanoseconds <= slotTime);
-                if (skipped > 0) {
-                    missedPeriodicPcrIntervals.fetch_add(skipped, std::memory_order_relaxed);
-                }
-                continue;
-            }
-
             bool sendReal = false;
             if (realTokenAccumulator >= targetBitrate) {
                 realTokenAccumulator -= targetBitrate;
@@ -703,73 +642,37 @@ private:
             if (sendReal) {
                 TimedTsPacket packet = std::move(realPackets.front());
                 realPackets.pop_front();
-
                 if (packet.hasPcr) {
-                    if (!periodicPcrInitialized) {
-                        // Lock the generated PCR clock to the first PCR emitted
-                        // by mpegtsmux. From this point onward PCR cadence is
-                        // generated independently of source packet bursts.
-                        periodicPcrPid = packet.pid;
-                        periodicPcrOriginTicks = packet.sourcePcrTicks;
-                        periodicPcrOriginNanoseconds = slotTime;
-                        nextPeriodicPcrNanoseconds =
-                            slotTime + kPeriodicPcrIntervalNanoseconds;
-                        periodicPcrInitialized = true;
-                        writePcr(packet.bytes, periodicPcrOriginTicks);
-                        ++rewrittenPcrPackets;
-                    } else {
-                        // Original PCR-bearing packets are still useful TS
-                        // packets, but their irregular PCR occurrences would
-                        // reintroduce 80-100+ ms gaps. Keep the packet and turn
-                        // the PCR bytes into adaptation stuffing.
-                        clearPcrFlag(packet.bytes);
-                        ++strippedSourcePcrPackets;
-                    }
+                    restampPcr(packet, slotTime);
                 }
-
-                observePcrPidContinuity(packet);
                 std::copy(packet.bytes.begin(), packet.bytes.end(), outputPacket);
                 bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
-                ++counts.real;
+                ++realCount;
             } else {
                 makeNullPacket(outputPacket);
             }
         }
-        return counts;
+        return realCount;
     }
 
-    void observePcrPidContinuity(const TimedTsPacket& packet) {
-        if (!periodicPcrInitialized || packet.pid != periodicPcrPid ||
-            !packetHasPayload(packet.bytes)) {
+    void restampPcr(TimedTsPacket& packet, uint64_t slotTimeNanoseconds) {
+        if (!packet.hasPcr) {
             return;
         }
-        pcrPidContinuityCounter = static_cast<guint8>(packet.bytes[3] & 0x0F);
-        pcrPidContinuityValid = true;
-    }
 
-    void makePeriodicPcrPacket(guint8* destination, uint64_t slotTimeNanoseconds) {
-        std::array<guint8, kTsPacketSize> packet {};
-        packet.fill(0xFF);
-        packet[0] = 0x47;
-        packet[1] = static_cast<guint8>((periodicPcrPid >> 8) & 0x1F);
-        packet[2] = static_cast<guint8>(periodicPcrPid & 0xFF);
-        // Adaptation-only packets do not advance the payload continuity
-        // counter. Reuse the most recent payload CC observed on the PCR PID.
-        packet[3] = static_cast<guint8>(
-            0x20 | (pcrPidContinuityValid ? (pcrPidContinuityCounter & 0x0F) : 0));
-        packet[4] = 183;
-        packet[5] = 0x10; // PCR flag
+        if (!outputPcrInitialized || packet.discontinuity ||
+            slotTimeNanoseconds < outputPcrOriginNanoseconds) {
+            outputPcrOriginTicks = packet.sourcePcrTicks;
+            outputPcrOriginNanoseconds = slotTimeNanoseconds;
+            outputPcrInitialized = true;
+        }
 
-        const uint64_t elapsedNanoseconds =
-            slotTimeNanoseconds >= periodicPcrOriginNanoseconds
-                ? slotTimeNanoseconds - periodicPcrOriginNanoseconds
-                : 0;
-        const uint64_t pcrTicks =
-            (periodicPcrOriginTicks + nanosecondsToPcrTicks(elapsedNanoseconds)) %
-            kPcrTicksModulus;
-        writePcr(packet, pcrTicks);
-        std::copy(packet.begin(), packet.end(), destination);
-        ++insertedPeriodicPcrPackets;
+        const uint64_t elapsedNanoseconds = slotTimeNanoseconds - outputPcrOriginNanoseconds;
+        const uint64_t elapsedTicks = nanosecondsToPcrTicks(elapsedNanoseconds);
+        const uint64_t rewrittenTicks =
+            (outputPcrOriginTicks + elapsedTicks) % kPcrTicksModulus;
+        writePcr(packet.bytes, rewrittenTicks);
+        ++rewrittenPcrPackets;
     }
 
     void makeNullPacket(guint8* packet) {
@@ -814,11 +717,7 @@ private:
                   << " target_buffer=" << targetReservoirBytes.load(std::memory_order_relaxed) << "B"
                   << " null_packets=" << nulls
                   << " pcr_rewritten=" << rewrittenPcrPackets.load(std::memory_order_relaxed)
-                  << " pcr_inserted=" << insertedPeriodicPcrPackets.load(std::memory_order_relaxed)
-                  << " pcr_source_stripped=" << strippedSourcePcrPackets.load(std::memory_order_relaxed)
-                  << " pcr_missed_intervals=" << missedPeriodicPcrIntervals.load(std::memory_order_relaxed)
-                  << " pcr_pid=" << periodicPcrPid
-                  << " timing=reservoir_rate_controller_periodic_pcr"
+                  << " timing=reservoir_rate_controller"
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
                   << " low_water_events=" << lowWatermarkEvents.load(std::memory_order_relaxed)
@@ -865,13 +764,9 @@ private:
     uint64_t lastRateSampleBytes = 0;
     uint64_t lastControllerUpdateNanoseconds = 0;
 
-    bool periodicPcrInitialized = false;
-    uint16_t periodicPcrPid = 0x1FFF;
-    uint64_t periodicPcrOriginTicks = 0;
-    uint64_t periodicPcrOriginNanoseconds = 0;
-    uint64_t nextPeriodicPcrNanoseconds = 0;
-    guint8 pcrPidContinuityCounter = 0;
-    bool pcrPidContinuityValid = false;
+    bool outputPcrInitialized = false;
+    uint64_t outputPcrOriginTicks = 0;
+    uint64_t outputPcrOriginNanoseconds = 0;
     guint8 nullContinuityCounter = 0;
 
     uint64_t statsStartedNanoseconds = 0;
@@ -885,9 +780,6 @@ private:
     std::atomic<uint64_t> totalRealPackets{0};
     std::atomic<uint64_t> totalNullPackets{0};
     std::atomic<uint64_t> rewrittenPcrPackets{0};
-    std::atomic<uint64_t> insertedPeriodicPcrPackets{0};
-    std::atomic<uint64_t> strippedSourcePcrPackets{0};
-    std::atomic<uint64_t> missedPeriodicPcrIntervals{0};
     std::atomic<uint64_t> validTimestampChunks{0};
     std::atomic<uint64_t> missingTimestampChunks{0};
     std::atomic<uint64_t> startupReservoirBytes{0};
@@ -966,12 +858,11 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
-    std::cerr << "WISI compatibility periodic-PCR reservoir TS shaper: target_bitrate="
+    std::cerr << "WISI compatibility rate-smoothed reservoir TS shaper: target_bitrate="
               << config.targetBitrate
               << " packetization=7x188 startup_reservoir_ms=2000"
               << " target_reservoir_ms=1200 low_watermark_ms=350"
               << " null_pid=0x1fff source_timing=reservoir-rate-controller"
-              << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
               << " pcr_restamp=output-clock"
               << " clock=clock_nanosleep-abstime busywait=off"
               << std::endl;
