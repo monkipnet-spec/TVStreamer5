@@ -37,7 +37,8 @@ constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
 constexpr std::size_t kMaxBufferedBytes = 16 * 1024 * 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
-constexpr uint64_t kPrebufferNanoseconds = 400ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kStartupReservoirNanoseconds = 2000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kAdaptiveLowWatermarkNanoseconds = 250ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
@@ -115,7 +116,7 @@ uint64_t nanosecondsToPcrTicks(uint64_t nanoseconds) {
 
 struct TimedChunk {
     std::vector<guint8> bytes;
-    uint64_t eligibleAtNanoseconds = 0;
+    uint64_t arrivalNanoseconds = 0;
     bool timestampValid = false;
     uint64_t mediaTimestampNanoseconds = 0;
 };
@@ -300,12 +301,11 @@ public:
             chunk.mediaTimestampNanoseconds = static_cast<uint64_t>(timestamp);
         }
 
-        // Keep a fixed sender-side reservoir. The original GstBuffer PTS/DTS is
-        // preserved and later mapped onto the strict CBR transport clock. This
-        // avoids treating packet density between two PCR packets as an
-        // instantaneous source bitrate (the cause of the v78 false 50-70 Mbit/s
-        // peaks and the continuously growing late_real counter).
-        chunk.eligibleAtNanoseconds = monotonicNanoseconds() + kPrebufferNanoseconds;
+        // Record the real arrival time. The sender builds one real startup
+        // reservoir instead of delaying every buffer independently. Delaying
+        // every buffer by the same amount preserves source jitter and therefore
+        // does not create a usable jitter reservoir.
+        chunk.arrivalNanoseconds = monotonicNanoseconds();
 
         std::unique_lock<std::mutex> lock(queueMutex);
         queueSpace.wait(lock, [&]() {
@@ -317,6 +317,9 @@ public:
         }
 
         bufferedBytes.fetch_add(chunk.bytes.size(), std::memory_order_relaxed);
+        if (firstChunkArrivalNanoseconds == 0) {
+            firstChunkArrivalNanoseconds = chunk.arrivalNanoseconds;
+        }
         queuedChunks.push_back(std::move(chunk));
         lock.unlock();
         queueReady.notify_one();
@@ -355,7 +358,7 @@ private:
                 ++schedulerResets;
             }
 
-            moveEligibleChunks(nextSendNanoseconds);
+            moveAvailableChunks(nextSendNanoseconds);
 
             std::array<guint8, kUdpPayloadSize> datagram {};
             const std::size_t realPackets = fillDatagram(datagram.data(), nextSendNanoseconds);
@@ -380,46 +383,55 @@ private:
 
     bool waitForInitialPackets() {
         while (!stopping.load(std::memory_order_relaxed)) {
+            uint64_t firstArrival = 0;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                if (firstChunkArrivalNanoseconds == 0 || queuedChunks.empty()) {
+                    queueReady.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+                        return stopping.load(std::memory_order_relaxed) ||
+                               (!queuedChunks.empty() && firstChunkArrivalNanoseconds != 0);
+                    });
+                }
+                if (stopping.load(std::memory_order_relaxed)) {
+                    return false;
+                }
+                firstArrival = firstChunkArrivalNanoseconds;
+            }
+
             const uint64_t now = monotonicNanoseconds();
-            moveEligibleChunks(now);
+            const uint64_t startAt = firstArrival + kStartupReservoirNanoseconds;
+            if (now < startAt) {
+                sleepUntilMonotonic(std::min<uint64_t>(
+                    startAt, now + 20ULL * 1000ULL * 1000ULL));
+                continue;
+            }
+
+            moveAvailableChunks(now);
             if (!scheduledPackets.empty()) {
+                startupReservoirBytes.store(
+                    bufferedBytes.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
                 return true;
             }
 
-            std::unique_lock<std::mutex> lock(queueMutex);
-            if (queuedChunks.empty()) {
-                queueReady.wait_for(lock, std::chrono::milliseconds(10), [&]() {
-                    return stopping.load(std::memory_order_relaxed) || !queuedChunks.empty();
-                });
-            } else {
-                const uint64_t eligibleAt = queuedChunks.front().eligibleAtNanoseconds;
-                lock.unlock();
-                const uint64_t current = monotonicNanoseconds();
-                if (eligibleAt > current) {
-                    sleepUntilMonotonic(std::min<uint64_t>(eligibleAt, current + 10ULL * 1000ULL * 1000ULL));
-                } else {
-                    sleepUntilMonotonic(current + 1000000ULL);
-                }
-                continue;
-            }
+            sleepUntilMonotonic(now + 1000000ULL);
         }
         return false;
     }
 
-    void moveEligibleChunks(uint64_t deadlineNanoseconds) {
-        std::deque<TimedChunk> eligible;
+    void moveAvailableChunks(uint64_t deadlineNanoseconds) {
+        std::deque<TimedChunk> available;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
-            while (!queuedChunks.empty() &&
-                   queuedChunks.front().eligibleAtNanoseconds <= deadlineNanoseconds) {
-                eligible.push_back(std::move(queuedChunks.front()));
+            while (!queuedChunks.empty()) {
+                available.push_back(std::move(queuedChunks.front()));
                 queuedChunks.pop_front();
             }
         }
 
-        while (!eligible.empty()) {
-            scheduleChunk(std::move(eligible.front()), deadlineNanoseconds);
-            eligible.pop_front();
+        while (!available.empty()) {
+            scheduleChunk(std::move(available.front()), deadlineNanoseconds);
+            available.pop_front();
         }
     }
 
@@ -451,8 +463,6 @@ private:
 
         if (backwards || hugeForwardJump ||
             chunk.mediaTimestampNanoseconds < mediaOriginTimestampNanoseconds) {
-            // Input timestamp discontinuity: keep output CBR monotonic and start
-            // a new media-to-wall mapping without flushing or bursting.
             const uint64_t rebaseWall = std::max<uint64_t>(
                 nowNanoseconds,
                 lastScheduledDueNanoseconds > 0
@@ -469,7 +479,26 @@ private:
             lastMediaTimestampNanoseconds, chunk.mediaTimestampNanoseconds);
         const uint64_t mediaDelta =
             chunk.mediaTimestampNanoseconds - mediaOriginTimestampNanoseconds;
-        return wallOriginNanoseconds + mediaDelta;
+        uint64_t nominalDue = wallOriginNanoseconds + mediaDelta;
+
+        const uint64_t minimumDue =
+            chunk.arrivalNanoseconds + kAdaptiveLowWatermarkNanoseconds;
+        if (nominalDue < minimumDue) {
+            const uint64_t adjustment = minimumDue - nominalDue;
+            wallOriginNanoseconds += adjustment;
+            nominalDue += adjustment;
+            adaptiveDelayNanoseconds.fetch_add(adjustment, std::memory_order_relaxed);
+            ++adaptiveDelayAdjustments;
+
+            uint64_t previous =
+                peakAdaptiveAdjustmentNanoseconds.load(std::memory_order_relaxed);
+            while (adjustment > previous &&
+                   !peakAdaptiveAdjustmentNanoseconds.compare_exchange_weak(
+                       previous, adjustment, std::memory_order_relaxed)) {
+            }
+        }
+
+        return nominalDue;
     }
 
     void scheduleChunk(TimedChunk chunk, uint64_t nowNanoseconds) {
@@ -634,7 +663,15 @@ private:
                   << " buffered=" << bufferedBytes.load(std::memory_order_relaxed)
                   << "B null_packets=" << nulls
                   << " pcr_rewritten=" << rewrittenPcrPackets.load(std::memory_order_relaxed)
-                  << " timing=buffer_pts"
+                  << " timing=buffer_pts_adaptive"
+                  << " startup_reservoir="
+                  << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
+                  << " adaptive_delay_ms="
+                  << (adaptiveDelayNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
+                  << " delay_adjustments="
+                  << adaptiveDelayAdjustments.load(std::memory_order_relaxed)
+                  << " peak_adjust_us="
+                  << (peakAdaptiveAdjustmentNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_resets=" << timestampResets.load(std::memory_order_relaxed)
@@ -670,6 +707,7 @@ private:
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
     std::deque<TimedTsPacket> scheduledPackets;
+    uint64_t firstChunkArrivalNanoseconds = 0;
 
     bool mediaTimelineInitialized = false;
     uint64_t mediaOriginTimestampNanoseconds = 0;
@@ -691,6 +729,10 @@ private:
     std::atomic<uint64_t> validTimestampChunks{0};
     std::atomic<uint64_t> missingTimestampChunks{0};
     std::atomic<uint64_t> timestampResets{0};
+    std::atomic<uint64_t> startupReservoirBytes{0};
+    std::atomic<uint64_t> adaptiveDelayNanoseconds{0};
+    std::atomic<uint64_t> adaptiveDelayAdjustments{0};
+    std::atomic<uint64_t> peakAdaptiveAdjustmentNanoseconds{0};
     std::atomic<uint64_t> lateRealPackets{0};
     std::atomic<uint64_t> peakRealLatenessNanoseconds{0};
     std::atomic<uint64_t> schedulerResets{0};
@@ -765,9 +807,10 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
-    std::cerr << "WISI compatibility timestamp-aware TS shaper: target_bitrate="
+    std::cerr << "WISI compatibility adaptive-reservoir TS shaper: target_bitrate="
               << config.targetBitrate
-              << " packetization=7x188 prebuffer_ms=400"
+              << " packetization=7x188 startup_reservoir_ms=2000"
+              << " low_watermark_ms=250"
               << " null_pid=0x1fff source_timing=gst-buffer-pts-dts"
               << " pcr_restamp=output-clock"
               << " clock=clock_nanosleep-abstime busywait=off"
