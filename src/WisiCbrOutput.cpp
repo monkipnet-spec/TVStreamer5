@@ -352,9 +352,16 @@ private:
             const uint64_t now = monotonicNanoseconds();
             const uint64_t lateResetThreshold = intervalNanoseconds * kLateResetIntervals;
             if (now > nextSendNanoseconds && now - nextSendNanoseconds > lateResetThreshold) {
-                // Never catch up a host-scheduler stall with a UDP burst.
+                // Never catch up a host-scheduler stall with a UDP burst. Move
+                // the media scheduling timeline forward by the same amount so
+                // a single Linux scheduling hiccup cannot leave every future
+                // real TS packet permanently "late".
+                const uint64_t shiftNanoseconds = now - nextSendNanoseconds;
+                shiftScheduledTimeline(shiftNanoseconds);
                 nextSendNanoseconds = now;
                 scheduleRemainder = 0;
+                schedulerTimelineShiftNanoseconds.fetch_add(
+                    shiftNanoseconds, std::memory_order_relaxed);
                 ++schedulerResets;
             }
 
@@ -542,15 +549,31 @@ private:
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             packet.dueNanoseconds = chunkDue + packetIndex * packetIntervalNanoseconds;
 
-            // Preserve FIFO ordering when several mux buffers carry the same PTS.
-            // The CBR slot clock is the hard lower bound, never an excuse to
-            // transmit packets back-to-back outside the configured bitrate.
-            if (lastScheduledDueNanoseconds > 0 &&
-                packet.dueNanoseconds < lastScheduledDueNanoseconds) {
-                packet.dueNanoseconds = lastScheduledDueNanoseconds;
+            // Gst mpegtsmux commonly emits several adjacent buffers with the
+            // same PTS/DTS. FIFO ordering alone is not enough here: allowing
+            // the first packet of the next buffer to reuse the previous due
+            // time compresses real TS packets into bursts and makes almost
+            // every following packet late. Serialize *all* real TS packets on
+            // the same packet clock as the configured output CBR. Media PTS/DTS
+            // remains a lower bound; the transport clock is the hard rate cap.
+            if (lastScheduledDueNanoseconds > 0) {
+                const uint64_t serializedDue =
+                    lastScheduledDueNanoseconds + packetIntervalNanoseconds;
+                if (packet.dueNanoseconds < serializedDue) {
+                    const uint64_t adjustment = serializedDue - packet.dueNanoseconds;
+                    packet.dueNanoseconds = serializedDue;
+                    ++serializationAdjustments;
+                    serializationDelayNanoseconds.fetch_add(
+                        adjustment, std::memory_order_relaxed);
+                    uint64_t previous =
+                        peakSerializationAdjustmentNanoseconds.load(std::memory_order_relaxed);
+                    while (adjustment > previous &&
+                           !peakSerializationAdjustmentNanoseconds.compare_exchange_weak(
+                               previous, adjustment, std::memory_order_relaxed)) {
+                    }
+                }
             }
-            lastScheduledDueNanoseconds = std::max<uint64_t>(
-                lastScheduledDueNanoseconds, packet.dueNanoseconds);
+            lastScheduledDueNanoseconds = packet.dueNanoseconds;
 
             scheduledPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
@@ -562,6 +585,22 @@ private:
             bufferedBytes.fetch_sub(trailing, std::memory_order_relaxed);
             resyncDiscardedBytes.fetch_add(trailing, std::memory_order_relaxed);
             queueSpace.notify_all();
+        }
+    }
+
+    void shiftScheduledTimeline(uint64_t shiftNanoseconds) {
+        if (shiftNanoseconds == 0) {
+            return;
+        }
+
+        if (mediaTimelineInitialized) {
+            wallOriginNanoseconds += shiftNanoseconds;
+        }
+        if (lastScheduledDueNanoseconds > 0) {
+            lastScheduledDueNanoseconds += shiftNanoseconds;
+        }
+        for (auto& packet : scheduledPackets) {
+            packet.dueNanoseconds += shiftNanoseconds;
         }
     }
 
@@ -672,6 +711,14 @@ private:
                   << adaptiveDelayAdjustments.load(std::memory_order_relaxed)
                   << " peak_adjust_us="
                   << (peakAdaptiveAdjustmentNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
+                  << " serialize_adjustments="
+                  << serializationAdjustments.load(std::memory_order_relaxed)
+                  << " serialize_delay_ms="
+                  << (serializationDelayNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
+                  << " peak_serialize_us="
+                  << (peakSerializationAdjustmentNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
+                  << " timeline_shift_ms="
+                  << (schedulerTimelineShiftNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_resets=" << timestampResets.load(std::memory_order_relaxed)
@@ -733,6 +780,10 @@ private:
     std::atomic<uint64_t> adaptiveDelayNanoseconds{0};
     std::atomic<uint64_t> adaptiveDelayAdjustments{0};
     std::atomic<uint64_t> peakAdaptiveAdjustmentNanoseconds{0};
+    std::atomic<uint64_t> serializationAdjustments{0};
+    std::atomic<uint64_t> serializationDelayNanoseconds{0};
+    std::atomic<uint64_t> peakSerializationAdjustmentNanoseconds{0};
+    std::atomic<uint64_t> schedulerTimelineShiftNanoseconds{0};
     std::atomic<uint64_t> lateRealPackets{0};
     std::atomic<uint64_t> peakRealLatenessNanoseconds{0};
     std::atomic<uint64_t> schedulerResets{0};
@@ -807,7 +858,7 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
-    std::cerr << "WISI compatibility adaptive-reservoir TS shaper: target_bitrate="
+    std::cerr << "WISI compatibility serialized adaptive-reservoir TS shaper: target_bitrate="
               << config.targetBitrate
               << " packetization=7x188 startup_reservoir_ms=2000"
               << " low_watermark_ms=250"
