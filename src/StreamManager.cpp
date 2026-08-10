@@ -2937,8 +2937,9 @@ bool StreamManager::buildRemapPipeline(
         // WISI mode is intentionally isolated from the normal UDP-CBR path.
         // mpegtsmux now produces only the real remuxed SPTS (bitrate=0). The
         // dedicated WISI shaper downstream adds null packets at Target bitrate,
-        // schedules real packets from source PCR and restamps PCR to the actual
-        // output clock. PTS/DTS are preserved; no identity/datarate stage is used.
+        // schedules the remuxed TS from GstBuffer PTS/DTS (not PCR packet density)
+        // and restamps PCR to the actual output clock. Elementary PTS/DTS remain
+        // unchanged; no identity/datarate stage is used.
         if (cfg.targetBitrate == 0) {
             std::cerr << "WISI compatibility requires Target bitrate greater than zero" << std::endl;
             return false;

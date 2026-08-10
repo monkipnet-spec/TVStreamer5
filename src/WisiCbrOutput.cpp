@@ -42,8 +42,9 @@ constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
 constexpr uint64_t kPcrTicksModulus = kPcrBaseModulus * 300ULL;
-constexpr uint64_t kMaxReasonablePcrGapTicks = 2ULL * kPcrClockHz;
 constexpr uint64_t kStatsIntervalNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kTimestampBackwardToleranceNanoseconds = 100ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
@@ -108,34 +109,22 @@ uint64_t multiplyDivide(uint64_t value, uint64_t multiplier, uint64_t divisor) {
 #endif
 }
 
-uint64_t pcrTicksToNanoseconds(uint64_t ticks) {
-    return multiplyDivide(ticks, 1000000000ULL, kPcrClockHz);
-}
-
 uint64_t nanosecondsToPcrTicks(uint64_t nanoseconds) {
     return multiplyDivide(nanoseconds, kPcrClockHz, 1000000000ULL);
-}
-
-uint64_t forwardPcrDelta(uint64_t from, uint64_t to) {
-    from %= kPcrTicksModulus;
-    to %= kPcrTicksModulus;
-    return to >= from ? to - from : (kPcrTicksModulus - from) + to;
 }
 
 struct TimedChunk {
     std::vector<guint8> bytes;
     uint64_t eligibleAtNanoseconds = 0;
+    bool timestampValid = false;
+    uint64_t mediaTimestampNanoseconds = 0;
 };
 
-struct TsPacket {
+struct TimedTsPacket {
     std::array<guint8, kTsPacketSize> bytes {};
     bool hasPcr = false;
     bool discontinuity = false;
-    uint64_t pcrTicks = 0;
-};
-
-struct ScheduledPacket {
-    TsPacket packet;
+    uint64_t sourcePcrTicks = 0;
     uint64_t dueNanoseconds = 0;
 };
 
@@ -302,9 +291,20 @@ public:
             return GST_FLOW_OK;
         }
 
-        // Fixed sender-side de-jitter delay. Unlike v77, the packets are not
-        // emitted simply because they became eligible. After this delay the
-        // PCR scheduler decides their real CBR slot.
+        GstClockTime timestamp = GST_BUFFER_PTS(buffer);
+        if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
+            timestamp = GST_BUFFER_DTS(buffer);
+        }
+        if (GST_CLOCK_TIME_IS_VALID(timestamp)) {
+            chunk.timestampValid = true;
+            chunk.mediaTimestampNanoseconds = static_cast<uint64_t>(timestamp);
+        }
+
+        // Keep a fixed sender-side reservoir. The original GstBuffer PTS/DTS is
+        // preserved and later mapped onto the strict CBR transport clock. This
+        // avoids treating packet density between two PCR packets as an
+        // instantaneous source bitrate (the cause of the v78 false 50-70 Mbit/s
+        // peaks and the continuously growing late_real counter).
         chunk.eligibleAtNanoseconds = monotonicNanoseconds() + kPrebufferNanoseconds;
 
         std::unique_lock<std::mutex> lock(queueMutex);
@@ -330,18 +330,12 @@ private:
 
         while (!stopping.load(std::memory_order_relaxed)) {
             if (nextSendNanoseconds == 0) {
-                // Do not start the UDP clock until at least two PCR anchors are
-                // available after the 400 ms de-jitter delay. This prevents a
-                // startup burst followed by null-only gaps.
-                if (!waitForInitialSchedule()) {
+                if (!waitForInitialPackets()) {
                     break;
                 }
                 nextSendNanoseconds = monotonicNanoseconds();
-                if (!scheduledPackets.empty()) {
-                    const uint64_t firstDue = scheduledPackets.front().dueNanoseconds;
-                    if (firstDue > nextSendNanoseconds) {
-                        nextSendNanoseconds = firstDue;
-                    }
+                if (!scheduledPackets.empty() && scheduledPackets.front().dueNanoseconds > nextSendNanoseconds) {
+                    nextSendNanoseconds = scheduledPackets.front().dueNanoseconds;
                 }
                 statsStartedNanoseconds = nextSendNanoseconds;
                 lastStatsNanoseconds = nextSendNanoseconds;
@@ -355,16 +349,13 @@ private:
             const uint64_t now = monotonicNanoseconds();
             const uint64_t lateResetThreshold = intervalNanoseconds * kLateResetIntervals;
             if (now > nextSendNanoseconds && now - nextSendNanoseconds > lateResetThreshold) {
-                // Do not compensate a scheduler stall with an Ethernet burst.
-                // Re-anchor only the wall-clock send cadence; PCR is restamped
-                // from the actual output clock below.
+                // Never catch up a host-scheduler stall with a UDP burst.
                 nextSendNanoseconds = now;
                 scheduleRemainder = 0;
                 ++schedulerResets;
             }
 
             moveEligibleChunks(nextSendNanoseconds);
-            scheduleAvailablePackets(nextSendNanoseconds);
 
             std::array<guint8, kUdpPayloadSize> datagram {};
             const std::size_t realPackets = fillDatagram(datagram.data(), nextSendNanoseconds);
@@ -387,11 +378,11 @@ private:
         }
     }
 
-    bool waitForInitialSchedule() {
+    bool waitForInitialPackets() {
         while (!stopping.load(std::memory_order_relaxed)) {
             const uint64_t now = monotonicNanoseconds();
             moveEligibleChunks(now);
-            if (scheduleAvailablePackets(now) && !scheduledPackets.empty()) {
+            if (!scheduledPackets.empty()) {
                 return true;
             }
 
@@ -427,221 +418,121 @@ private:
         }
 
         while (!eligible.empty()) {
-            auto& bytes = eligible.front().bytes;
-            parserBytes.insert(parserBytes.end(), bytes.begin(), bytes.end());
+            scheduleChunk(std::move(eligible.front()), deadlineNanoseconds);
             eligible.pop_front();
         }
-        parseAvailableTsPackets();
     }
 
-    void parseAvailableTsPackets() {
-        while (parserBytes.size() - parserOffset >= kTsPacketSize) {
-            if (parserBytes[parserOffset] != 0x47) {
-                ++parserOffset;
+    uint64_t mapChunkTimestampToWallClock(const TimedChunk& chunk, uint64_t nowNanoseconds) {
+        if (!chunk.timestampValid) {
+            ++missingTimestampChunks;
+            const uint64_t fallback = lastScheduledDueNanoseconds > 0
+                ? lastScheduledDueNanoseconds + packetIntervalNanoseconds
+                : nowNanoseconds;
+            return std::max<uint64_t>(fallback, nowNanoseconds);
+        }
+
+        ++validTimestampChunks;
+        if (!mediaTimelineInitialized) {
+            mediaOriginTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
+            wallOriginNanoseconds = nowNanoseconds;
+            lastMediaTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
+            mediaTimelineInitialized = true;
+            return wallOriginNanoseconds;
+        }
+
+        const bool backwards =
+            chunk.mediaTimestampNanoseconds + kTimestampBackwardToleranceNanoseconds <
+            lastMediaTimestampNanoseconds;
+        const bool hugeForwardJump =
+            chunk.mediaTimestampNanoseconds > lastMediaTimestampNanoseconds &&
+            chunk.mediaTimestampNanoseconds - lastMediaTimestampNanoseconds >
+                kTimestampForwardJumpNanoseconds;
+
+        if (backwards || hugeForwardJump ||
+            chunk.mediaTimestampNanoseconds < mediaOriginTimestampNanoseconds) {
+            // Input timestamp discontinuity: keep output CBR monotonic and start
+            // a new media-to-wall mapping without flushing or bursting.
+            const uint64_t rebaseWall = std::max<uint64_t>(
+                nowNanoseconds,
+                lastScheduledDueNanoseconds > 0
+                    ? lastScheduledDueNanoseconds + packetIntervalNanoseconds
+                    : nowNanoseconds);
+            mediaOriginTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
+            wallOriginNanoseconds = rebaseWall;
+            lastMediaTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
+            ++timestampResets;
+            return rebaseWall;
+        }
+
+        lastMediaTimestampNanoseconds = std::max<uint64_t>(
+            lastMediaTimestampNanoseconds, chunk.mediaTimestampNanoseconds);
+        const uint64_t mediaDelta =
+            chunk.mediaTimestampNanoseconds - mediaOriginTimestampNanoseconds;
+        return wallOriginNanoseconds + mediaDelta;
+    }
+
+    void scheduleChunk(TimedChunk chunk, uint64_t nowNanoseconds) {
+        if (chunk.bytes.empty()) {
+            return;
+        }
+
+        std::size_t offset = 0;
+        while (offset < chunk.bytes.size() && chunk.bytes[offset] != 0x47) {
+            ++offset;
+        }
+        if (offset > 0) {
+            const std::size_t discarded = offset;
+            bufferedBytes.fetch_sub(discarded, std::memory_order_relaxed);
+            resyncDiscardedBytes.fetch_add(discarded, std::memory_order_relaxed);
+            queueSpace.notify_all();
+        }
+
+        const uint64_t chunkDue = mapChunkTimestampToWallClock(chunk, nowNanoseconds);
+        std::size_t packetIndex = 0;
+        while (offset + kTsPacketSize <= chunk.bytes.size()) {
+            if (chunk.bytes[offset] != 0x47) {
+                ++offset;
                 bufferedBytes.fetch_sub(1, std::memory_order_relaxed);
                 ++resyncDiscardedBytes;
                 queueSpace.notify_all();
                 continue;
             }
 
-            // If another complete packet is already available, verify the next
-            // sync byte before committing to this alignment.
-            if (parserBytes.size() - parserOffset >= kTsPacketSize * 2 &&
-                parserBytes[parserOffset + kTsPacketSize] != 0x47) {
-                ++parserOffset;
+            if (offset + kTsPacketSize * 2 <= chunk.bytes.size() &&
+                chunk.bytes[offset + kTsPacketSize] != 0x47) {
+                ++offset;
                 bufferedBytes.fetch_sub(1, std::memory_order_relaxed);
                 ++resyncDiscardedBytes;
                 queueSpace.notify_all();
                 continue;
             }
 
-            TsPacket packet;
-            std::copy_n(parserBytes.data() + parserOffset, kTsPacketSize, packet.bytes.data());
-            packet.hasPcr = parsePcr(packet.bytes, packet.pcrTicks, packet.discontinuity);
-            unscheduledPackets.push_back(std::move(packet));
-            parserOffset += kTsPacketSize;
-        }
+            TimedTsPacket packet;
+            std::copy_n(chunk.bytes.data() + offset, kTsPacketSize, packet.bytes.data());
+            packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
+            packet.dueNanoseconds = chunkDue + packetIndex * packetIntervalNanoseconds;
 
-        if (parserOffset > 0 &&
-            (parserOffset >= 64 * 1024 || parserOffset * 2 >= parserBytes.size())) {
-            parserBytes.erase(parserBytes.begin(),
-                parserBytes.begin() + static_cast<std::ptrdiff_t>(parserOffset));
-            parserOffset = 0;
-        }
-    }
-
-    bool scheduleAvailablePackets(uint64_t nowNanoseconds) {
-        bool scheduledAnything = false;
-
-        while (!stopping.load(std::memory_order_relaxed)) {
-            if (!timelineInitialized) {
-                const auto anchors = findFirstTwoPcrAnchors();
-                if (anchors.first == kNoIndex || anchors.second == kNoIndex) {
-                    break;
-                }
-
-                const std::size_t firstIndex = anchors.first;
-                const std::size_t secondIndex = anchors.second;
-                const TsPacket first = unscheduledPackets[firstIndex];
-                const TsPacket second = unscheduledPackets[secondIndex];
-                const uint64_t deltaTicks = forwardPcrDelta(first.pcrTicks, second.pcrTicks);
-                if (!isUsablePcrDelta(first, second, deltaTicks, secondIndex - firstIndex)) {
-                    // Keep moving until a sane pair is found. A discontinuity
-                    // marker is a valid new origin, so drop only the unusable
-                    // prefix from the scheduling model, not from the TS output.
-                    schedulePrefixAtTransportRate(nowNanoseconds, secondIndex);
-                    scheduledAnything = true;
-                    continue;
-                }
-
-                const uint64_t deltaNs = pcrTicksToNanoseconds(deltaTicks);
-                const std::size_t packetDistance = secondIndex - firstIndex;
-                const uint64_t sourcePacketSpacing = std::max<uint64_t>(1, deltaNs / packetDistance);
-                const uint64_t startNs = std::max<uint64_t>(nowNanoseconds, monotonicNanoseconds());
-                const uint64_t firstAnchorDue = startNs + firstIndex * sourcePacketSpacing;
-                const uint64_t secondAnchorDue = firstAnchorDue + deltaNs;
-
-                for (std::size_t index = 0; index < secondIndex; ++index) {
-                    uint64_t due = startNs;
-                    if (index <= firstIndex) {
-                        due = startNs + index * sourcePacketSpacing;
-                    } else {
-                        due = firstAnchorDue + multiplyDivide(
-                            index - firstIndex, deltaNs, packetDistance);
-                    }
-                    moveFrontToScheduled(due);
-                }
-
-                anchorPcrTicks = second.pcrTicks;
-                anchorDueNanoseconds = secondAnchorDue;
-                timelineInitialized = true;
-                scheduledAnything = true;
-                updateSegmentPeak(packetDistance, deltaTicks);
-                continue;
+            // Preserve FIFO ordering when several mux buffers carry the same PTS.
+            // The CBR slot clock is the hard lower bound, never an excuse to
+            // transmit packets back-to-back outside the configured bitrate.
+            if (lastScheduledDueNanoseconds > 0 &&
+                packet.dueNanoseconds < lastScheduledDueNanoseconds) {
+                packet.dueNanoseconds = lastScheduledDueNanoseconds;
             }
+            lastScheduledDueNanoseconds = std::max<uint64_t>(
+                lastScheduledDueNanoseconds, packet.dueNanoseconds);
 
-            if (unscheduledPackets.empty()) {
-                break;
-            }
-
-            // The previous pass always retains its second PCR anchor at the
-            // front. If a malformed/discontinuous sequence breaks that
-            // invariant, safely restart the source-PCR scheduler.
-            if (!unscheduledPackets.front().hasPcr) {
-                timelineInitialized = false;
-                continue;
-            }
-
-            const std::size_t nextPcrIndex = findNextPcrIndex(1);
-            if (nextPcrIndex == kNoIndex) {
-                break;
-            }
-
-            const TsPacket first = unscheduledPackets.front();
-            const TsPacket second = unscheduledPackets[nextPcrIndex];
-            const uint64_t deltaTicks = forwardPcrDelta(first.pcrTicks, second.pcrTicks);
-            if (!isUsablePcrDelta(first, second, deltaTicks, nextPcrIndex)) {
-                // The TS explicitly changed clock or the PCR gap is implausible.
-                // Preserve every packet, but bridge this one segment at the
-                // configured transport rate. PCR restamping will establish a
-                // clean new output clock on the discontinuity packet.
-                const uint64_t start = std::max<uint64_t>(anchorDueNanoseconds, nowNanoseconds);
-                for (std::size_t index = 0; index < nextPcrIndex; ++index) {
-                    moveFrontToScheduled(start + index * packetIntervalNanoseconds);
-                }
-                anchorPcrTicks = second.pcrTicks;
-                anchorDueNanoseconds = start + nextPcrIndex * packetIntervalNanoseconds;
-                ++pcrTimelineResets;
-                scheduledAnything = true;
-                continue;
-            }
-
-            const uint64_t deltaNs = pcrTicksToNanoseconds(deltaTicks);
-            const uint64_t secondAnchorDue = anchorDueNanoseconds + deltaNs;
-            for (std::size_t index = 0; index < nextPcrIndex; ++index) {
-                const uint64_t due = anchorDueNanoseconds +
-                    multiplyDivide(index, deltaNs, nextPcrIndex);
-                moveFrontToScheduled(due);
-            }
-            anchorPcrTicks = second.pcrTicks;
-            anchorDueNanoseconds = secondAnchorDue;
-            scheduledAnything = true;
-            updateSegmentPeak(nextPcrIndex, deltaTicks);
+            scheduledPackets.push_back(std::move(packet));
+            offset += kTsPacketSize;
+            ++packetIndex;
         }
 
-        return scheduledAnything;
-    }
-
-    static constexpr std::size_t kNoIndex = std::numeric_limits<std::size_t>::max();
-
-    std::pair<std::size_t, std::size_t> findFirstTwoPcrAnchors() const {
-        std::size_t first = kNoIndex;
-        for (std::size_t index = 0; index < unscheduledPackets.size(); ++index) {
-            if (!unscheduledPackets[index].hasPcr) {
-                continue;
-            }
-            if (first == kNoIndex) {
-                first = index;
-            } else {
-                return {first, index};
-            }
-        }
-        return {kNoIndex, kNoIndex};
-    }
-
-    std::size_t findNextPcrIndex(std::size_t startIndex) const {
-        for (std::size_t index = startIndex; index < unscheduledPackets.size(); ++index) {
-            if (unscheduledPackets[index].hasPcr) {
-                return index;
-            }
-        }
-        return kNoIndex;
-    }
-
-    bool isUsablePcrDelta(const TsPacket& first,
-                          const TsPacket& second,
-                          uint64_t deltaTicks,
-                          std::size_t packetDistance) const {
-        if (packetDistance == 0 || deltaTicks == 0 || deltaTicks > kMaxReasonablePcrGapTicks) {
-            return false;
-        }
-        if (second.discontinuity) {
-            return false;
-        }
-        (void)first;
-        return true;
-    }
-
-    void schedulePrefixAtTransportRate(uint64_t nowNanoseconds, std::size_t count) {
-        const uint64_t start = std::max<uint64_t>(nowNanoseconds, monotonicNanoseconds());
-        for (std::size_t index = 0; index < count && !unscheduledPackets.empty(); ++index) {
-            moveFrontToScheduled(start + index * packetIntervalNanoseconds);
-        }
-        timelineInitialized = false;
-        ++pcrTimelineResets;
-    }
-
-    void moveFrontToScheduled(uint64_t dueNanoseconds) {
-        if (unscheduledPackets.empty()) {
-            return;
-        }
-        ScheduledPacket scheduled;
-        scheduled.packet = std::move(unscheduledPackets.front());
-        scheduled.dueNanoseconds = dueNanoseconds;
-        unscheduledPackets.pop_front();
-        scheduledPackets.push_back(std::move(scheduled));
-    }
-
-    void updateSegmentPeak(std::size_t packetDistance, uint64_t deltaTicks) {
-        if (packetDistance == 0 || deltaTicks == 0) {
-            return;
-        }
-        const uint64_t bits = static_cast<uint64_t>(packetDistance) * kTsPacketSize * 8ULL;
-        const uint64_t segmentBitrate = multiplyDivide(bits, kPcrClockHz, deltaTicks);
-        uint64_t previous = peakPcrSegmentBitrate.load(std::memory_order_relaxed);
-        while (segmentBitrate > previous &&
-               !peakPcrSegmentBitrate.compare_exchange_weak(
-                   previous, segmentBitrate, std::memory_order_relaxed)) {
+        if (offset < chunk.bytes.size()) {
+            const std::size_t trailing = chunk.bytes.size() - offset;
+            bufferedBytes.fetch_sub(trailing, std::memory_order_relaxed);
+            resyncDiscardedBytes.fetch_add(trailing, std::memory_order_relaxed);
+            queueSpace.notify_all();
         }
     }
 
@@ -659,18 +550,24 @@ private:
 
             if (!scheduledPackets.empty() &&
                 scheduledPackets.front().dueNanoseconds <= slotTime) {
-                ScheduledPacket packet = std::move(scheduledPackets.front());
+                TimedTsPacket packet = std::move(scheduledPackets.front());
                 scheduledPackets.pop_front();
 
-                if (packet.packet.hasPcr) {
-                    restampPcr(packet.packet, slotTime);
+                if (packet.hasPcr) {
+                    restampPcr(packet, slotTime);
                 }
-                std::copy(packet.packet.bytes.begin(), packet.packet.bytes.end(), outputPacket);
+                std::copy(packet.bytes.begin(), packet.bytes.end(), outputPacket);
                 bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
                 ++realPackets;
 
                 if (slotTime > packet.dueNanoseconds + packetIntervalNanoseconds * 2ULL) {
                     ++lateRealPackets;
+                    const uint64_t lateness = slotTime - packet.dueNanoseconds;
+                    uint64_t previous = peakRealLatenessNanoseconds.load(std::memory_order_relaxed);
+                    while (lateness > previous &&
+                           !peakRealLatenessNanoseconds.compare_exchange_weak(
+                               previous, lateness, std::memory_order_relaxed)) {
+                    }
                 }
             } else {
                 makeNullPacket(outputPacket);
@@ -679,20 +576,22 @@ private:
         return realPackets;
     }
 
-    void restampPcr(TsPacket& packet, uint64_t slotTimeNanoseconds) {
+    void restampPcr(TimedTsPacket& packet, uint64_t slotTimeNanoseconds) {
         if (!packet.hasPcr) {
             return;
         }
 
-        if (!outputPcrInitialized || packet.discontinuity || slotTimeNanoseconds < outputPcrOriginNanoseconds) {
-            outputPcrOriginTicks = packet.pcrTicks;
+        if (!outputPcrInitialized || packet.discontinuity ||
+            slotTimeNanoseconds < outputPcrOriginNanoseconds) {
+            outputPcrOriginTicks = packet.sourcePcrTicks;
             outputPcrOriginNanoseconds = slotTimeNanoseconds;
             outputPcrInitialized = true;
         }
 
         const uint64_t elapsedNanoseconds = slotTimeNanoseconds - outputPcrOriginNanoseconds;
         const uint64_t elapsedTicks = nanosecondsToPcrTicks(elapsedNanoseconds);
-        const uint64_t rewrittenTicks = (outputPcrOriginTicks + elapsedTicks) % kPcrTicksModulus;
+        const uint64_t rewrittenTicks =
+            (outputPcrOriginTicks + elapsedTicks) % kPcrTicksModulus;
         writePcr(packet.bytes, rewrittenTicks);
         ++rewrittenPcrPackets;
     }
@@ -735,10 +634,15 @@ private:
                   << " buffered=" << bufferedBytes.load(std::memory_order_relaxed)
                   << "B null_packets=" << nulls
                   << " pcr_rewritten=" << rewrittenPcrPackets.load(std::memory_order_relaxed)
-                  << " pcr_segment_peak=" << peakPcrSegmentBitrate.load(std::memory_order_relaxed)
+                  << " timing=buffer_pts"
+                  << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
+                  << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
+                  << " ts_resets=" << timestampResets.load(std::memory_order_relaxed)
                   << " late_real=" << lateRealPackets.load(std::memory_order_relaxed)
+                  << " peak_late_us=" <<
+                      (peakRealLatenessNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
                   << " clock_resets=" << schedulerResets.load(std::memory_order_relaxed)
-                  << " pcr_resets=" << pcrTimelineResets.load(std::memory_order_relaxed)
+                  << " resync_bytes=" << resyncDiscardedBytes.load(std::memory_order_relaxed)
                   << std::endl;
     }
 
@@ -765,15 +669,13 @@ private:
     std::condition_variable queueReady;
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
+    std::deque<TimedTsPacket> scheduledPackets;
 
-    std::vector<guint8> parserBytes;
-    std::size_t parserOffset = 0;
-    std::deque<TsPacket> unscheduledPackets;
-    std::deque<ScheduledPacket> scheduledPackets;
-
-    bool timelineInitialized = false;
-    uint64_t anchorPcrTicks = 0;
-    uint64_t anchorDueNanoseconds = 0;
+    bool mediaTimelineInitialized = false;
+    uint64_t mediaOriginTimestampNanoseconds = 0;
+    uint64_t wallOriginNanoseconds = 0;
+    uint64_t lastMediaTimestampNanoseconds = 0;
+    uint64_t lastScheduledDueNanoseconds = 0;
 
     bool outputPcrInitialized = false;
     uint64_t outputPcrOriginTicks = 0;
@@ -786,10 +688,12 @@ private:
     std::atomic<uint64_t> totalRealPackets{0};
     std::atomic<uint64_t> totalNullPackets{0};
     std::atomic<uint64_t> rewrittenPcrPackets{0};
-    std::atomic<uint64_t> peakPcrSegmentBitrate{0};
+    std::atomic<uint64_t> validTimestampChunks{0};
+    std::atomic<uint64_t> missingTimestampChunks{0};
+    std::atomic<uint64_t> timestampResets{0};
     std::atomic<uint64_t> lateRealPackets{0};
+    std::atomic<uint64_t> peakRealLatenessNanoseconds{0};
     std::atomic<uint64_t> schedulerResets{0};
-    std::atomic<uint64_t> pcrTimelineResets{0};
     std::atomic<uint64_t> resyncDiscardedBytes{0};
 };
 
@@ -861,9 +765,11 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
-    std::cerr << "WISI compatibility PCR-aware TS shaper: target_bitrate=" << config.targetBitrate
+    std::cerr << "WISI compatibility timestamp-aware TS shaper: target_bitrate="
+              << config.targetBitrate
               << " packetization=7x188 prebuffer_ms=400"
-              << " null_pid=0x1fff pcr_schedule=source pcr_restamp=output-clock"
+              << " null_pid=0x1fff source_timing=gst-buffer-pts-dts"
+              << " pcr_restamp=output-clock"
               << " clock=clock_nanosleep-abstime busywait=off"
               << std::endl;
     return sink;
