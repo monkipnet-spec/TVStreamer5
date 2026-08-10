@@ -299,13 +299,13 @@ public:
         if (GST_CLOCK_TIME_IS_VALID(timestamp)) {
             chunk.timestampValid = true;
             chunk.mediaTimestampNanoseconds = static_cast<uint64_t>(timestamp);
+            ++validTimestampChunks;
+        } else {
+            ++missingTimestampChunks;
         }
 
-        // Record the real arrival time. The sender builds one real startup
-        // reservoir instead of delaying every buffer independently. Delaying
-        // every buffer by the same amount preserves source jitter and therefore
-        // does not create a usable jitter reservoir.
         chunk.arrivalNanoseconds = monotonicNanoseconds();
+        inputBytesReceived.fetch_add(chunk.bytes.size(), std::memory_order_relaxed);
 
         std::unique_lock<std::mutex> lock(queueMutex);
         queueSpace.wait(lock, [&]() {
@@ -327,6 +327,12 @@ public:
     }
 
 private:
+    static constexpr uint64_t kRateSampleNanoseconds = 500ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kControllerUpdateNanoseconds = 100ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kTargetReservoirNanoseconds = 1200ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kLowReservoirNanoseconds = 350ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kCorrectionHorizonNanoseconds = 4ULL * 1000ULL * 1000ULL * 1000ULL;
+
     void sendLoop() {
         uint64_t nextSendNanoseconds = 0;
         uint64_t scheduleRemainder = 0;
@@ -337,11 +343,11 @@ private:
                     break;
                 }
                 nextSendNanoseconds = monotonicNanoseconds();
-                if (!scheduledPackets.empty() && scheduledPackets.front().dueNanoseconds > nextSendNanoseconds) {
-                    nextSendNanoseconds = scheduledPackets.front().dueNanoseconds;
-                }
                 statsStartedNanoseconds = nextSendNanoseconds;
                 lastStatsNanoseconds = nextSendNanoseconds;
+                lastRateSampleNanoseconds = nextSendNanoseconds;
+                lastRateSampleBytes = inputBytesReceived.load(std::memory_order_relaxed);
+                lastControllerUpdateNanoseconds = nextSendNanoseconds;
             }
 
             sleepUntilMonotonic(nextSendNanoseconds);
@@ -352,12 +358,7 @@ private:
             const uint64_t now = monotonicNanoseconds();
             const uint64_t lateResetThreshold = intervalNanoseconds * kLateResetIntervals;
             if (now > nextSendNanoseconds && now - nextSendNanoseconds > lateResetThreshold) {
-                // Never catch up a host-scheduler stall with a UDP burst. Move
-                // the media scheduling timeline forward by the same amount so
-                // a single Linux scheduling hiccup cannot leave every future
-                // real TS packet permanently "late".
                 const uint64_t shiftNanoseconds = now - nextSendNanoseconds;
-                shiftScheduledTimeline(shiftNanoseconds);
                 nextSendNanoseconds = now;
                 scheduleRemainder = 0;
                 schedulerTimelineShiftNanoseconds.fetch_add(
@@ -365,7 +366,8 @@ private:
                 ++schedulerResets;
             }
 
-            moveAvailableChunks(nextSendNanoseconds);
+            moveAvailableChunks();
+            updateRateController(now);
 
             std::array<guint8, kUdpPayloadSize> datagram {};
             const std::size_t realPackets = fillDatagram(datagram.data(), nextSendNanoseconds);
@@ -413,11 +415,21 @@ private:
                 continue;
             }
 
-            moveAvailableChunks(now);
-            if (!scheduledPackets.empty()) {
-                startupReservoirBytes.store(
-                    bufferedBytes.load(std::memory_order_relaxed),
-                    std::memory_order_relaxed);
+            moveAvailableChunks();
+            if (!realPackets.empty()) {
+                const uint64_t startupBytes = bufferedBytes.load(std::memory_order_relaxed);
+                startupReservoirBytes.store(startupBytes, std::memory_order_relaxed);
+                const uint64_t elapsed = std::max<uint64_t>(1ULL, now - firstArrival);
+                estimatedInputBitrate = multiplyDivide(
+                    startupBytes * 8ULL, 1000000000ULL, elapsed);
+                if (estimatedInputBitrate == 0) {
+                    estimatedInputBitrate = std::min<uint64_t>(targetBitrate, 1000000ULL);
+                }
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+                currentRealPaceBitrate = std::min<uint64_t>(
+                    estimatedInputBitrate,
+                    maxRealPaceBitrate());
+                realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
                 return true;
             }
 
@@ -426,7 +438,7 @@ private:
         return false;
     }
 
-    void moveAvailableChunks(uint64_t deadlineNanoseconds) {
+    void moveAvailableChunks() {
         std::deque<TimedChunk> available;
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -437,78 +449,12 @@ private:
         }
 
         while (!available.empty()) {
-            scheduleChunk(std::move(available.front()), deadlineNanoseconds);
+            queueChunk(std::move(available.front()));
             available.pop_front();
         }
     }
 
-    uint64_t mapChunkTimestampToWallClock(const TimedChunk& chunk, uint64_t nowNanoseconds) {
-        if (!chunk.timestampValid) {
-            ++missingTimestampChunks;
-            const uint64_t fallback = lastScheduledDueNanoseconds > 0
-                ? lastScheduledDueNanoseconds + packetIntervalNanoseconds
-                : nowNanoseconds;
-            return std::max<uint64_t>(fallback, nowNanoseconds);
-        }
-
-        ++validTimestampChunks;
-        if (!mediaTimelineInitialized) {
-            mediaOriginTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
-            wallOriginNanoseconds = nowNanoseconds;
-            lastMediaTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
-            mediaTimelineInitialized = true;
-            return wallOriginNanoseconds;
-        }
-
-        const bool backwards =
-            chunk.mediaTimestampNanoseconds + kTimestampBackwardToleranceNanoseconds <
-            lastMediaTimestampNanoseconds;
-        const bool hugeForwardJump =
-            chunk.mediaTimestampNanoseconds > lastMediaTimestampNanoseconds &&
-            chunk.mediaTimestampNanoseconds - lastMediaTimestampNanoseconds >
-                kTimestampForwardJumpNanoseconds;
-
-        if (backwards || hugeForwardJump ||
-            chunk.mediaTimestampNanoseconds < mediaOriginTimestampNanoseconds) {
-            const uint64_t rebaseWall = std::max<uint64_t>(
-                nowNanoseconds,
-                lastScheduledDueNanoseconds > 0
-                    ? lastScheduledDueNanoseconds + packetIntervalNanoseconds
-                    : nowNanoseconds);
-            mediaOriginTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
-            wallOriginNanoseconds = rebaseWall;
-            lastMediaTimestampNanoseconds = chunk.mediaTimestampNanoseconds;
-            ++timestampResets;
-            return rebaseWall;
-        }
-
-        lastMediaTimestampNanoseconds = std::max<uint64_t>(
-            lastMediaTimestampNanoseconds, chunk.mediaTimestampNanoseconds);
-        const uint64_t mediaDelta =
-            chunk.mediaTimestampNanoseconds - mediaOriginTimestampNanoseconds;
-        uint64_t nominalDue = wallOriginNanoseconds + mediaDelta;
-
-        const uint64_t minimumDue =
-            chunk.arrivalNanoseconds + kAdaptiveLowWatermarkNanoseconds;
-        if (nominalDue < minimumDue) {
-            const uint64_t adjustment = minimumDue - nominalDue;
-            wallOriginNanoseconds += adjustment;
-            nominalDue += adjustment;
-            adaptiveDelayNanoseconds.fetch_add(adjustment, std::memory_order_relaxed);
-            ++adaptiveDelayAdjustments;
-
-            uint64_t previous =
-                peakAdaptiveAdjustmentNanoseconds.load(std::memory_order_relaxed);
-            while (adjustment > previous &&
-                   !peakAdaptiveAdjustmentNanoseconds.compare_exchange_weak(
-                       previous, adjustment, std::memory_order_relaxed)) {
-            }
-        }
-
-        return nominalDue;
-    }
-
-    void scheduleChunk(TimedChunk chunk, uint64_t nowNanoseconds) {
+    void queueChunk(TimedChunk chunk) {
         if (chunk.bytes.empty()) {
             return;
         }
@@ -518,14 +464,11 @@ private:
             ++offset;
         }
         if (offset > 0) {
-            const std::size_t discarded = offset;
-            bufferedBytes.fetch_sub(discarded, std::memory_order_relaxed);
-            resyncDiscardedBytes.fetch_add(discarded, std::memory_order_relaxed);
+            bufferedBytes.fetch_sub(offset, std::memory_order_relaxed);
+            resyncDiscardedBytes.fetch_add(offset, std::memory_order_relaxed);
             queueSpace.notify_all();
         }
 
-        const uint64_t chunkDue = mapChunkTimestampToWallClock(chunk, nowNanoseconds);
-        std::size_t packetIndex = 0;
         while (offset + kTsPacketSize <= chunk.bytes.size()) {
             if (chunk.bytes[offset] != 0x47) {
                 ++offset;
@@ -547,37 +490,8 @@ private:
             TimedTsPacket packet;
             std::copy_n(chunk.bytes.data() + offset, kTsPacketSize, packet.bytes.data());
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
-            packet.dueNanoseconds = chunkDue + packetIndex * packetIntervalNanoseconds;
-
-            // Gst mpegtsmux commonly emits several adjacent buffers with the
-            // same PTS/DTS. FIFO ordering alone is not enough here: allowing
-            // the first packet of the next buffer to reuse the previous due
-            // time compresses real TS packets into bursts and makes almost
-            // every following packet late. Serialize *all* real TS packets on
-            // the same packet clock as the configured output CBR. Media PTS/DTS
-            // remains a lower bound; the transport clock is the hard rate cap.
-            if (lastScheduledDueNanoseconds > 0) {
-                const uint64_t serializedDue =
-                    lastScheduledDueNanoseconds + packetIntervalNanoseconds;
-                if (packet.dueNanoseconds < serializedDue) {
-                    const uint64_t adjustment = serializedDue - packet.dueNanoseconds;
-                    packet.dueNanoseconds = serializedDue;
-                    ++serializationAdjustments;
-                    serializationDelayNanoseconds.fetch_add(
-                        adjustment, std::memory_order_relaxed);
-                    uint64_t previous =
-                        peakSerializationAdjustmentNanoseconds.load(std::memory_order_relaxed);
-                    while (adjustment > previous &&
-                           !peakSerializationAdjustmentNanoseconds.compare_exchange_weak(
-                               previous, adjustment, std::memory_order_relaxed)) {
-                    }
-                }
-            }
-            lastScheduledDueNanoseconds = packet.dueNanoseconds;
-
-            scheduledPackets.push_back(std::move(packet));
+            realPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
-            ++packetIndex;
         }
 
         if (offset < chunk.bytes.size()) {
@@ -588,20 +502,115 @@ private:
         }
     }
 
-    void shiftScheduledTimeline(uint64_t shiftNanoseconds) {
-        if (shiftNanoseconds == 0) {
-            return;
+    uint64_t maxRealPaceBitrate() const {
+        if (targetBitrate <= 100000ULL) {
+            return targetBitrate;
+        }
+        return targetBitrate - 100000ULL;
+    }
+
+    uint64_t bytesForDuration(uint64_t bitrate, uint64_t durationNanoseconds) const {
+        return multiplyDivide(bitrate, durationNanoseconds, 8ULL * 1000000000ULL);
+    }
+
+    void updateRateController(uint64_t nowNanoseconds) {
+        if (lastRateSampleNanoseconds == 0) {
+            lastRateSampleNanoseconds = nowNanoseconds;
+            lastRateSampleBytes = inputBytesReceived.load(std::memory_order_relaxed);
         }
 
-        if (mediaTimelineInitialized) {
-            wallOriginNanoseconds += shiftNanoseconds;
+        if (nowNanoseconds >= lastRateSampleNanoseconds &&
+            nowNanoseconds - lastRateSampleNanoseconds >= kRateSampleNanoseconds) {
+            const uint64_t bytesNow = inputBytesReceived.load(std::memory_order_relaxed);
+            const uint64_t deltaBytes = bytesNow >= lastRateSampleBytes
+                ? bytesNow - lastRateSampleBytes : 0;
+            const uint64_t deltaTime = nowNanoseconds - lastRateSampleNanoseconds;
+            const uint64_t instantBitrate = deltaTime > 0
+                ? multiplyDivide(deltaBytes * 8ULL, 1000000000ULL, deltaTime)
+                : 0;
+
+            if (instantBitrate > 0) {
+                if (estimatedInputBitrate == 0) {
+                    estimatedInputBitrate = instantBitrate;
+                } else {
+                    // 8-sample EWMA: reacts to real service-rate changes without
+                    // following the short mpegtsmux output bursts that upset WISI.
+                    estimatedInputBitrate =
+                        (estimatedInputBitrate * 7ULL + instantBitrate) / 8ULL;
+                }
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            }
+
+            lastRateSampleNanoseconds = nowNanoseconds;
+            lastRateSampleBytes = bytesNow;
         }
-        if (lastScheduledDueNanoseconds > 0) {
-            lastScheduledDueNanoseconds += shiftNanoseconds;
+
+        if (lastControllerUpdateNanoseconds != 0 &&
+            nowNanoseconds - lastControllerUpdateNanoseconds < kControllerUpdateNanoseconds) {
+            return;
         }
-        for (auto& packet : scheduledPackets) {
-            packet.dueNanoseconds += shiftNanoseconds;
+        lastControllerUpdateNanoseconds = nowNanoseconds;
+
+        const uint64_t estimate = std::max<uint64_t>(1ULL, estimatedInputBitrate);
+        const uint64_t bufferNow = bufferedBytes.load(std::memory_order_relaxed);
+        const uint64_t targetBufferBytes = std::max<uint64_t>(
+            kUdpPayloadSize * 32ULL,
+            bytesForDuration(estimate, kTargetReservoirNanoseconds));
+        const uint64_t lowBufferBytes = std::max<uint64_t>(
+            kUdpPayloadSize * 8ULL,
+            bytesForDuration(estimate, kLowReservoirNanoseconds));
+
+        int64_t errorBytes = 0;
+        if (bufferNow >= targetBufferBytes) {
+            const uint64_t diff = bufferNow - targetBufferBytes;
+            errorBytes = diff > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+                ? std::numeric_limits<int64_t>::max()
+                : static_cast<int64_t>(diff);
+        } else {
+            const uint64_t diff = targetBufferBytes - bufferNow;
+            errorBytes = diff > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+                ? std::numeric_limits<int64_t>::min() + 1
+                : -static_cast<int64_t>(diff);
         }
+
+        // Drain/refill the occupancy error slowly over four seconds. This is a
+        // leaky-bucket controller, not a timestamp scheduler: it keeps a real
+        // jitter reservoir while spreading useful TS packets uniformly through
+        // the configured CBR slots.
+        int64_t correctionBitrate = 0;
+#if defined(__SIZEOF_INT128__)
+        const __int128 numerator = static_cast<__int128>(errorBytes) * 8 * 1000000000LL;
+        correctionBitrate = static_cast<int64_t>(numerator / kCorrectionHorizonNanoseconds);
+#else
+        const long double correction = static_cast<long double>(errorBytes) * 8.0L * 1000000000.0L /
+            static_cast<long double>(kCorrectionHorizonNanoseconds);
+        correctionBitrate = static_cast<int64_t>(correction);
+#endif
+
+        int64_t desired = static_cast<int64_t>(std::min<uint64_t>(
+            estimate, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))) + correctionBitrate;
+
+        if (bufferNow < lowBufferBytes) {
+            // Refill rather than chasing an upstream gap. The output remains
+            // strict CBR because the freed transport slots become NULL packets.
+            desired = std::min<int64_t>(desired,
+                static_cast<int64_t>(estimate * 85ULL / 100ULL));
+            ++lowWatermarkEvents;
+        }
+
+        const uint64_t maximum = maxRealPaceBitrate();
+        if (desired < 0) {
+            desired = 0;
+        }
+        currentRealPaceBitrate = std::min<uint64_t>(
+            static_cast<uint64_t>(desired), maximum);
+        realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
+        targetReservoirBytes.store(targetBufferBytes, std::memory_order_relaxed);
+
+        const uint64_t bufferMs = estimate > 0
+            ? multiplyDivide(bufferNow * 8ULL, 1000ULL, estimate)
+            : 0;
+        reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
     }
 
     std::size_t fillDatagram(guint8* destination, uint64_t datagramDeadlineNanoseconds) {
@@ -609,39 +618,41 @@ private:
             return 0;
         }
 
-        std::size_t realPackets = 0;
+        std::size_t realCount = 0;
+        const uint64_t pace = realPaceBitrate.load(std::memory_order_relaxed);
         for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
             const uint64_t slotOffset = multiplyDivide(
                 slot * kTsPacketSize * 8ULL, 1000000000ULL, targetBitrate);
             const uint64_t slotTime = datagramDeadlineNanoseconds + slotOffset;
             guint8* outputPacket = destination + slot * kTsPacketSize;
 
-            if (!scheduledPackets.empty() &&
-                scheduledPackets.front().dueNanoseconds <= slotTime) {
-                TimedTsPacket packet = std::move(scheduledPackets.front());
-                scheduledPackets.pop_front();
+            realTokenAccumulator += pace;
+            bool sendReal = false;
+            if (realTokenAccumulator >= targetBitrate) {
+                realTokenAccumulator -= targetBitrate;
+                sendReal = !realPackets.empty();
+                if (!sendReal) {
+                    ++realUnderflowSlots;
+                    // Do not accumulate a catch-up burst after an upstream gap.
+                    realTokenAccumulator = std::min<uint64_t>(
+                        realTokenAccumulator, targetBitrate - 1ULL);
+                }
+            }
 
+            if (sendReal) {
+                TimedTsPacket packet = std::move(realPackets.front());
+                realPackets.pop_front();
                 if (packet.hasPcr) {
                     restampPcr(packet, slotTime);
                 }
                 std::copy(packet.bytes.begin(), packet.bytes.end(), outputPacket);
                 bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
-                ++realPackets;
-
-                if (slotTime > packet.dueNanoseconds + packetIntervalNanoseconds * 2ULL) {
-                    ++lateRealPackets;
-                    const uint64_t lateness = slotTime - packet.dueNanoseconds;
-                    uint64_t previous = peakRealLatenessNanoseconds.load(std::memory_order_relaxed);
-                    while (lateness > previous &&
-                           !peakRealLatenessNanoseconds.compare_exchange_weak(
-                               previous, lateness, std::memory_order_relaxed)) {
-                    }
-                }
+                ++realCount;
             } else {
                 makeNullPacket(outputPacket);
             }
         }
-        return realPackets;
+        return realCount;
     }
 
     void restampPcr(TimedTsPacket& packet, uint64_t slotTimeNanoseconds) {
@@ -699,32 +710,22 @@ private:
 
         std::cerr << "WISI shaper stats: target=" << targetBitrate
                   << " real=" << realBitrate
-                  << " buffered=" << bufferedBytes.load(std::memory_order_relaxed)
-                  << "B null_packets=" << nulls
+                  << " input_est=" << inputBitrateEstimate.load(std::memory_order_relaxed)
+                  << " real_pace=" << realPaceBitrate.load(std::memory_order_relaxed)
+                  << " buffered=" << bufferedBytes.load(std::memory_order_relaxed) << "B"
+                  << " buffer_ms=" << reservoirMilliseconds.load(std::memory_order_relaxed)
+                  << " target_buffer=" << targetReservoirBytes.load(std::memory_order_relaxed) << "B"
+                  << " null_packets=" << nulls
                   << " pcr_rewritten=" << rewrittenPcrPackets.load(std::memory_order_relaxed)
-                  << " timing=buffer_pts_adaptive"
+                  << " timing=reservoir_rate_controller"
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
-                  << " adaptive_delay_ms="
-                  << (adaptiveDelayNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
-                  << " delay_adjustments="
-                  << adaptiveDelayAdjustments.load(std::memory_order_relaxed)
-                  << " peak_adjust_us="
-                  << (peakAdaptiveAdjustmentNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
-                  << " serialize_adjustments="
-                  << serializationAdjustments.load(std::memory_order_relaxed)
-                  << " serialize_delay_ms="
-                  << (serializationDelayNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
-                  << " peak_serialize_us="
-                  << (peakSerializationAdjustmentNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
-                  << " timeline_shift_ms="
-                  << (schedulerTimelineShiftNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
+                  << " low_water_events=" << lowWatermarkEvents.load(std::memory_order_relaxed)
+                  << " underflow_slots=" << realUnderflowSlots.load(std::memory_order_relaxed)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
-                  << " ts_resets=" << timestampResets.load(std::memory_order_relaxed)
-                  << " late_real=" << lateRealPackets.load(std::memory_order_relaxed)
-                  << " peak_late_us=" <<
-                      (peakRealLatenessNanoseconds.load(std::memory_order_relaxed) / 1000ULL)
+                  << " timeline_shift_ms="
+                  << (schedulerTimelineShiftNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
                   << " clock_resets=" << schedulerResets.load(std::memory_order_relaxed)
                   << " resync_bytes=" << resyncDiscardedBytes.load(std::memory_order_relaxed)
                   << std::endl;
@@ -753,14 +754,15 @@ private:
     std::condition_variable queueReady;
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
-    std::deque<TimedTsPacket> scheduledPackets;
+    std::deque<TimedTsPacket> realPackets;
     uint64_t firstChunkArrivalNanoseconds = 0;
 
-    bool mediaTimelineInitialized = false;
-    uint64_t mediaOriginTimestampNanoseconds = 0;
-    uint64_t wallOriginNanoseconds = 0;
-    uint64_t lastMediaTimestampNanoseconds = 0;
-    uint64_t lastScheduledDueNanoseconds = 0;
+    uint64_t estimatedInputBitrate = 0;
+    uint64_t currentRealPaceBitrate = 0;
+    uint64_t realTokenAccumulator = 0;
+    uint64_t lastRateSampleNanoseconds = 0;
+    uint64_t lastRateSampleBytes = 0;
+    uint64_t lastControllerUpdateNanoseconds = 0;
 
     bool outputPcrInitialized = false;
     uint64_t outputPcrOriginTicks = 0;
@@ -769,23 +771,21 @@ private:
 
     uint64_t statsStartedNanoseconds = 0;
     uint64_t lastStatsNanoseconds = 0;
+    std::atomic<uint64_t> inputBytesReceived{0};
+    std::atomic<uint64_t> inputBitrateEstimate{0};
+    std::atomic<uint64_t> realPaceBitrate{0};
+    std::atomic<uint64_t> reservoirMilliseconds{0};
+    std::atomic<uint64_t> targetReservoirBytes{0};
     std::atomic<uint64_t> totalDatagrams{0};
     std::atomic<uint64_t> totalRealPackets{0};
     std::atomic<uint64_t> totalNullPackets{0};
     std::atomic<uint64_t> rewrittenPcrPackets{0};
     std::atomic<uint64_t> validTimestampChunks{0};
     std::atomic<uint64_t> missingTimestampChunks{0};
-    std::atomic<uint64_t> timestampResets{0};
     std::atomic<uint64_t> startupReservoirBytes{0};
-    std::atomic<uint64_t> adaptiveDelayNanoseconds{0};
-    std::atomic<uint64_t> adaptiveDelayAdjustments{0};
-    std::atomic<uint64_t> peakAdaptiveAdjustmentNanoseconds{0};
-    std::atomic<uint64_t> serializationAdjustments{0};
-    std::atomic<uint64_t> serializationDelayNanoseconds{0};
-    std::atomic<uint64_t> peakSerializationAdjustmentNanoseconds{0};
+    std::atomic<uint64_t> lowWatermarkEvents{0};
+    std::atomic<uint64_t> realUnderflowSlots{0};
     std::atomic<uint64_t> schedulerTimelineShiftNanoseconds{0};
-    std::atomic<uint64_t> lateRealPackets{0};
-    std::atomic<uint64_t> peakRealLatenessNanoseconds{0};
     std::atomic<uint64_t> schedulerResets{0};
     std::atomic<uint64_t> resyncDiscardedBytes{0};
 };
@@ -858,11 +858,11 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
-    std::cerr << "WISI compatibility serialized adaptive-reservoir TS shaper: target_bitrate="
+    std::cerr << "WISI compatibility rate-smoothed reservoir TS shaper: target_bitrate="
               << config.targetBitrate
               << " packetization=7x188 startup_reservoir_ms=2000"
-              << " low_watermark_ms=250"
-              << " null_pid=0x1fff source_timing=gst-buffer-pts-dts"
+              << " target_reservoir_ms=1200 low_watermark_ms=350"
+              << " null_pid=0x1fff source_timing=reservoir-rate-controller"
               << " pcr_restamp=output-clock"
               << " clock=clock_nanosleep-abstime busywait=off"
               << std::endl;
