@@ -36,6 +36,7 @@ add_executable(TVStreamer
     src/UdpTsOutput.cpp
     src/UdpVbrOutput.cpp
     src/UdpCbrOutput.cpp
+    src/WisiCbrOutput.cpp
     src/UdpOutput.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
