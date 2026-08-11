@@ -210,6 +210,19 @@ bool cbrMuxEnabled(const StreamConfig& cfg) {
     return cfg.cbr && cfg.targetBitrate > 0;
 }
 
+uint64_t stableUdpInternalMuxBitrate(const StreamConfig& cfg) {
+    if (!usesStableUdpShaper(cfg) || !udpCbrOutputEnabled(cfg) || cfg.targetBitrate <= 100000ULL) {
+        return 0;
+    }
+
+    // StableUdpOutput intentionally reserves 100 kbit/s of the configured CBR
+    // transport for its periodic PCR-only packets and final NULL stuffing.
+    // Let mpegtsmux build a packet-position-aware CBR timeline inside that
+    // useful-data budget instead of emitting an unpadded VBR TS in large
+    // video/audio bursts.
+    return static_cast<uint64_t>(cfg.targetBitrate) - 100000ULL;
+}
+
 std::string srtOutputMode(const StreamConfig& cfg);
 
 StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
@@ -918,10 +931,16 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         nullptr);
     const bool externalUdpShaper = usesStableUdpShaper(cfg);
     if (externalUdpShaper) {
-        // All UDP MPEG-TS outputs now use the same reservoir/shaper path. Keep
-        // mpegtsmux unpadded so the sender can build either strict CBR or
-        // source-rate-following VBR from one clean SPTS timeline.
-        setUInt64PropertyIfPresent(mux, "bitrate", 0);
+        const uint64_t internalMuxBitrate = stableUdpInternalMuxBitrate(cfg);
+        // For UDP-CBR, ask mpegtsmux to insert its own NULL packet positions at
+        // target-100 kbit/s. This gives the mux a real transport byte clock for
+        // interleaving low-bitrate AAC with H.264 instead of outputting audio in
+        // large bursts. StableUdpOutput still performs the final wall-clock
+        // pacing at the configured target bitrate, replaces PCR cadence, and
+        // uses the remaining 100 kbit/s for periodic PCR/NULL headroom.
+        //
+        // UDP-VBR remains unpadded (bitrate=0).
+        setUInt64PropertyIfPresent(mux, "bitrate", internalMuxBitrate);
     } else if (cbrMuxEnabled(cfg)) {
         setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
@@ -3098,20 +3117,6 @@ bool StreamManager::buildRemapPipeline(
     configureTsMux(mux, cfg);
 
     if (usesStableUdpShaper(cfg)) {
-        // Keep tsdemux at its GStreamer 1.20 smooth-demux default. Output
-        // captures show that the video PID is continuous while AAC can arrive
-        // to the remux path in bursts separated by several hundred ms.
-        constexpr gint kStableUdpDemuxLatencyMs = 700;
-
-        // mpegtsmux is a GstAggregator. Give it enough live look-ahead to wait
-        // for temporarily late AAC and interleave it by timestamp instead of
-        // emitting a long run of video first. The measured AAC gaps were up to
-        // ~440 ms, so 700 ms leaves useful margin without touching A/V PTS.
-        constexpr guint64 kStableUdpMuxLatencyNs = 700 * GST_MSECOND;
-
-        setIntPropertyIfPresent(demux, "latency", kStableUdpDemuxLatencyMs);
-        setUInt64PropertyIfPresent(mux, "latency", kStableUdpMuxLatencyNs);
-
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
             return false;
@@ -3120,13 +3125,13 @@ bool StreamManager::buildRemapPipeline(
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
-        std::cerr << "Unified UDP mux: bitrate=0 mode="
-                  << (udpCbrOutputEnabled(cfg) ? "CBR" : "VBR")
+        const uint64_t internalMuxBitrate = stableUdpInternalMuxBitrate(cfg);
+        std::cerr << "Unified UDP mux: bitrate=" << internalMuxBitrate
+                  << " mode=" << (udpCbrOutputEnabled(cfg) ? "CBR" : "VBR")
                   << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
+                  << " mux_headroom=100000"
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
-                  << " demux_latency_ms=" << kStableUdpDemuxLatencyMs
-                  << " mux_latency_ms=700"
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
