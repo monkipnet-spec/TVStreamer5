@@ -110,24 +110,6 @@ void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, con
     });
 }
 
-void appendCbrReservoir(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name, uint64_t minTimeNs, uint64_t maxTimeNs) {
-    // Keep a real TS reservoir in front of the clocked pacer.  UDP already has
-    // StableUdpOutput for this job; HTTP/HLS/SRT/RTP need the same startup
-    // protection so a newly started transcoder cannot expose a half-filled mux
-    // or drain in bursts before the CBR clock has settled.
-    args.insert(args.end(), {
-        "queue",
-        "name=" + name + "_reservoir",
-        "max-size-buffers=0",
-        "max-size-bytes=0",
-        "max-size-time=" + std::to_string(maxTimeNs),
-        "min-threshold-time=" + std::to_string(minTimeNs),
-        "leaky=no",
-        "!"
-    });
-    appendCbrPacer(args, cfg, name + "_pacer");
-}
-
 void appendOutputQueue(std::vector<std::string>& args, const std::string& name, bool leakyDownstream) {
     addQueue(args, name, leakyDownstream ? 2000000000ULL : 5000000000ULL, leakyDownstream);
     args.push_back("!");

@@ -136,7 +136,7 @@ private:
     static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     void monitorExternalSrtBus(const std::string& id, size_t outputIndex);
-    GstElement* createTranscodedUdpRelayPipeline(StreamState* state, std::string& error);
+    GstElement* createTranscodedStableTsRelayPipeline(StreamState* state, std::string& error);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);

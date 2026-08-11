@@ -15,7 +15,6 @@ std::string listenerBindHost(const StreamConfig& cfg);
 void appendMpegTsMux(std::vector<std::string>& args, const StreamConfig& cfg);
 void appendTsSmoother(std::vector<std::string>& args, const std::string& name, uint32_t smoothingLatencyUs = 200000);
 void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name);
-void appendCbrReservoir(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name, uint64_t minTimeNs = 2500000000ULL, uint64_t maxTimeNs = 8000000000ULL);
 void appendOutputQueue(std::vector<std::string>& args, const std::string& name, bool leakyDownstream = false);
 void appendOutputQueueWithTime(std::vector<std::string>& args, const std::string& name, uint64_t maxTimeNs, bool leakyDownstream = false);
 void assignTsPads(const StreamConfig& cfg, GstOutputSpec& spec);
