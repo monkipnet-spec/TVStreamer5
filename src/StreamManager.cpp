@@ -30,6 +30,7 @@ namespace {
 constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
+constexpr guint64 kStableUdpInputSmoothingLatency = 700 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
@@ -3096,8 +3097,21 @@ bool StreamManager::buildRemapPipeline(
     configureOutputQueue(outputQueue, cfg);
     configureCbrPacer(pacer, cfg);
     configureTsMux(mux, cfg);
+    configureTsPacketAlignment(tsparse);
 
     if (usesStableUdpShaper(cfg)) {
+        // Non-transcoded UDP-CBR/VBR is demuxed and remuxed before it reaches
+        // StableUdpOutput. In v92 this pre-demux tsparse did not rebuild/smooth
+        // timestamps, so short PCR/input-arrival irregularities could reach the
+        // compressed audio elementary stream as discontinuous timing while video
+        // remained visually fine. Smooth the INPUT TS clock before tsdemux.
+        setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
+        setUInt64PropertyIfPresent(
+            tsparse, "smoothing-latency", kStableUdpInputSmoothingLatency);
+        // Keep extra non-leaky headroom before tsdemux. This queue never drops
+        // audio/video packets; it only absorbs short live-input bursts.
+        configureQueue(preDemuxQueue, 8000000000ULL);
+
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
             return false;
@@ -3112,6 +3126,8 @@ bool StreamManager::buildRemapPipeline(
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " alignment=" << kTsPacketsPerUdpBuffer
+                  << " input_ts_smoothing_ms=700"
+                  << " pre_demux_buffer_ms=8000"
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
     sendServiceDescription(mux, cfg);
