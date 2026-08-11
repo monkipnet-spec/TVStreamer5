@@ -34,10 +34,10 @@ namespace {
 constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kTsPacketsPerDatagram = 7;
 constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
-constexpr std::size_t kMaxBufferedBytes = 16 * 1024 * 1024;
+constexpr std::size_t kMaxBufferedBytes = 32 * 1024 * 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
-constexpr uint64_t kStartupReservoirNanoseconds = 2000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kStartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kAdaptiveLowWatermarkNanoseconds = 250ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -361,9 +361,9 @@ public:
 private:
     static constexpr uint64_t kRateSampleNanoseconds = 500ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kControllerUpdateNanoseconds = 100ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kTargetReservoirNanoseconds = 1200ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kLowReservoirNanoseconds = 350ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kCorrectionHorizonNanoseconds = 4ULL * 1000ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kTargetReservoirNanoseconds = 2500ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kLowReservoirNanoseconds = 800ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kCorrectionHorizonNanoseconds = 6ULL * 1000ULL * 1000ULL * 1000ULL;
 
     void sendLoop() {
         uint64_t nextSendNanoseconds = 0;
@@ -451,9 +451,24 @@ private:
             }
 
             moveAvailableChunks();
-            if (!realPackets.empty()) {
+
+            // Do not expose a half-initialized transport to WISI. On some
+            // starts mpegtsmux needs a short settling period before a stable
+            // PCR sequence is present in the buffered SPTS.
+            std::size_t startupPcrPackets = 0;
+            for (const auto& packet : realPackets) {
+                if (packet.hasPcr) {
+                    ++startupPcrPackets;
+                    if (startupPcrPackets >= 5) {
+                        break;
+                    }
+                }
+            }
+
+            if (!realPackets.empty() && startupPcrPackets >= 5) {
                 const uint64_t startupBytes = bufferedBytes.load(std::memory_order_relaxed);
                 startupReservoirBytes.store(startupBytes, std::memory_order_relaxed);
+                startupPcrSamples.store(startupPcrPackets, std::memory_order_relaxed);
                 const uint64_t elapsed = std::max<uint64_t>(1ULL, now - firstArrival);
                 estimatedInputBitrate = multiplyDivide(
                     startupBytes * 8ULL, 1000000000ULL, elapsed);
@@ -821,6 +836,8 @@ private:
                   << " timing=reservoir_rate_controller_periodic_pcr"
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
+                  << " startup_pcr_samples="
+                  << startupPcrSamples.load(std::memory_order_relaxed)
                   << " low_water_events=" << lowWatermarkEvents.load(std::memory_order_relaxed)
                   << " underflow_slots=" << realUnderflowSlots.load(std::memory_order_relaxed)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
@@ -891,6 +908,7 @@ private:
     std::atomic<uint64_t> validTimestampChunks{0};
     std::atomic<uint64_t> missingTimestampChunks{0};
     std::atomic<uint64_t> startupReservoirBytes{0};
+    std::atomic<uint64_t> startupPcrSamples{0};
     std::atomic<uint64_t> lowWatermarkEvents{0};
     std::atomic<uint64_t> realUnderflowSlots{0};
     std::atomic<uint64_t> schedulerTimelineShiftNanoseconds{0};
@@ -968,8 +986,8 @@ GstElement* createSink(
 
     std::cerr << "WISI compatibility periodic-PCR reservoir TS shaper: target_bitrate="
               << config.targetBitrate
-              << " packetization=7x188 startup_reservoir_ms=2000"
-              << " target_reservoir_ms=1200 low_watermark_ms=350"
+              << " packetization=7x188 startup_reservoir_ms=5000"
+              << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing=reservoir-rate-controller"
               << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
               << " pcr_restamp=output-clock"
