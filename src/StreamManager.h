@@ -22,7 +22,6 @@ struct RemapContext {
     GstElement* mux = nullptr;
     GstElement* sink = nullptr;
     StreamConfig config;
-    std::vector<uint32_t> detectedInputServiceIds;
     bool videoLinked = false;
     bool audioLinked = false;
     bool flvMux = false;
@@ -60,6 +59,9 @@ struct StreamState {
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;
+    // Runtime PAT result used only when input_service_id=0 (Auto).
+    // The configured value remains 0; effective selection is kept in state->config.
+    std::vector<uint32_t> detectedInputServiceIds;
     std::atomic<uint64_t> inputBitrate{0};
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};
