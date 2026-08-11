@@ -560,46 +560,100 @@ private:
             return;
         }
 
-        std::size_t offset = 0;
-        while (offset < chunk.bytes.size() && chunk.bytes[offset] != 0x47) {
-            ++offset;
-        }
-        if (offset > 0) {
-            bufferedBytes.fetch_sub(offset, std::memory_order_relaxed);
-            resyncDiscardedBytes.fetch_add(offset, std::memory_order_relaxed);
-            queueSpace.notify_all();
-        }
+        // GstBuffer boundaries are NOT MPEG-TS packet boundaries.  This is
+        // especially important when the source is a named FIFO: filesrc may
+        // return arbitrary read sizes (for example 4096 bytes), so the last
+        // part of one 188-byte TS packet can be delivered at the start of the
+        // next GstBuffer.  The old implementation discarded that tail on every
+        // buffer and then searched for the next 0x47 byte.  On a transcoded
+        // FIFO this created continuity gaps and occasional false sync inside
+        // PES payload, which could leave downstream HTTP/HLS/SRT/RTP with data
+        // but no decodable PMT/codecs.
+        tsReassembly.insert(tsReassembly.end(), chunk.bytes.begin(), chunk.bytes.end());
 
-        while (offset + kTsPacketSize <= chunk.bytes.size()) {
-            if (chunk.bytes[offset] != 0x47) {
-                ++offset;
-                bufferedBytes.fetch_sub(1, std::memory_order_relaxed);
-                ++resyncDiscardedBytes;
-                queueSpace.notify_all();
-                continue;
+        std::size_t offset = 0;
+        std::size_t discarded = 0;
+
+        auto syncCandidateIsValid = [&](std::size_t pos) -> bool {
+            if (pos >= tsReassembly.size() || tsReassembly[pos] != 0x47) {
+                return false;
+            }
+            // Never lock from a single 0x47 byte: that value is common inside
+            // PES payload.  Wait until the next expected TS sync byte is also
+            // available and matches.  If a third packet start is available,
+            // validate it as well.
+            if (pos + kTsPacketSize >= tsReassembly.size() ||
+                tsReassembly[pos + kTsPacketSize] != 0x47) {
+                return false;
+            }
+            if (pos + kTsPacketSize * 2 < tsReassembly.size() &&
+                tsReassembly[pos + kTsPacketSize * 2] != 0x47) {
+                return false;
+            }
+            return true;
+        };
+
+        while (offset + kTsPacketSize <= tsReassembly.size()) {
+            if (!tsSyncLocked) {
+                std::size_t candidate = offset;
+                bool found = false;
+                while (candidate + kTsPacketSize <= tsReassembly.size()) {
+                    if (syncCandidateIsValid(candidate)) {
+                        found = true;
+                        break;
+                    }
+                    ++candidate;
+                }
+
+                if (!found) {
+                    // Keep a short suffix for the next GstBuffer instead of
+                    // throwing away a possible split TS packet.  We only need
+                    // at most 2*188-1 bytes to validate the next sync sequence.
+                    const std::size_t keep = std::min<std::size_t>(
+                        tsReassembly.size() - offset, kTsPacketSize * 2 - 1);
+                    const std::size_t drop = tsReassembly.size() - offset - keep;
+                    discarded += drop;
+                    offset += drop;
+                    break;
+                }
+
+                if (candidate > offset) {
+                    discarded += candidate - offset;
+                    offset = candidate;
+                }
+                tsSyncLocked = true;
             }
 
-            if (offset + kTsPacketSize * 2 <= chunk.bytes.size() &&
-                chunk.bytes[offset + kTsPacketSize] != 0x47) {
+            if (offset + kTsPacketSize > tsReassembly.size()) {
+                break;
+            }
+
+            if (tsReassembly[offset] != 0x47 ||
+                (offset + kTsPacketSize < tsReassembly.size() &&
+                 tsReassembly[offset + kTsPacketSize] != 0x47)) {
+                // Lost alignment.  Drop only one byte, unlock, and search for
+                // a new multi-packet sync pattern on the next iteration.
                 ++offset;
-                bufferedBytes.fetch_sub(1, std::memory_order_relaxed);
-                ++resyncDiscardedBytes;
-                queueSpace.notify_all();
+                ++discarded;
+                tsSyncLocked = false;
                 continue;
             }
 
             TimedTsPacket packet;
-            std::copy_n(chunk.bytes.data() + offset, kTsPacketSize, packet.bytes.data());
+            std::copy_n(tsReassembly.data() + offset, kTsPacketSize, packet.bytes.data());
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             realPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
         }
 
-        if (offset < chunk.bytes.size()) {
-            const std::size_t trailing = chunk.bytes.size() - offset;
-            bufferedBytes.fetch_sub(trailing, std::memory_order_relaxed);
-            resyncDiscardedBytes.fetch_add(trailing, std::memory_order_relaxed);
+        if (offset > 0) {
+            tsReassembly.erase(tsReassembly.begin(), tsReassembly.begin() + static_cast<std::ptrdiff_t>(offset));
+        }
+
+        if (discarded > 0) {
+            bufferedBytes.fetch_sub(discarded, std::memory_order_relaxed);
+            resyncDiscardedBytes.fetch_add(discarded, std::memory_order_relaxed);
             queueSpace.notify_all();
         }
     }
@@ -947,6 +1001,10 @@ private:
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
     std::deque<TimedTsPacket> realPackets;
+    // Byte carry-over between GstBuffers.  Never assume FIFO/filesrc buffers
+    // start or end on a 188-byte MPEG-TS packet boundary.
+    std::vector<guint8> tsReassembly;
+    bool tsSyncLocked = false;
     uint64_t firstChunkArrivalNanoseconds = 0;
 
     uint64_t estimatedInputBitrate = 0;

@@ -1436,7 +1436,12 @@ GstElement* StreamManager::createTranscodedLocalCbrPipeline(StreamState* state, 
         return nullptr;
     }
 
-    g_object_set(src, "location", fifoPath.c_str(), nullptr);
+    g_object_set(src,
+        "location", fifoPath.c_str(),
+        // Helpful for efficiency only; StableUdpOutput now reassembles split
+        // 188-byte packets correctly even when the kernel returns short reads.
+        "blocksize", static_cast<guint>(1316 * 32),
+        nullptr);
     configureQueue(queue, 10000000000ULL);
 
     StreamConfig localConfig = transcodeLocalCbrConfig(state->config);
