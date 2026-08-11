@@ -13,7 +13,7 @@
 namespace tvs::protocols {
 
 std::vector<std::string> requiredOutputElements() {
-    return {"mpegtsmux", "tsparse", "identity", "udpsink", "rtpmp2tpay", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
+    return {"mpegtsmux", "tsparse", "identity", "clocksync", "udpsink", "rtpmp2tpay", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
 }
 
 std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
@@ -26,9 +26,9 @@ std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
         case OutputKind::Rtp:
             return {"mpegtsmux", "tsparse", "identity", "rtpmp2tpay", "udpsink"};
         case OutputKind::Srt:
-            return {"mpegtsmux", "tsparse", "identity", "srtsink", "udpsink"};
+            return {"mpegtsmux", "tsparse", "identity", "clocksync", "srtsink", "udpsink"};
         case OutputKind::Http:
-            return {"mpegtsmux", "tsparse", "identity", "tcpserversink"};
+            return {"mpegtsmux", "tsparse", "identity", "clocksync", "tcpserversink"};
         case OutputKind::Hls:
             return {"mpegtsmux", "tsparse", "identity", "hlssink"};
         case OutputKind::Rtsp:
