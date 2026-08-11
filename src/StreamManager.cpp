@@ -155,6 +155,30 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
     }
 }
 
+void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
+    (void)userData;
+    if (!queue) {
+        return;
+    }
+
+    // queue::running fires once the configured startup threshold is satisfied.
+    // Drop min-threshold-time to zero at that point so the reservoir is a
+    // startup prebuffer only. Leaving min-threshold-time enabled permanently
+    // makes queue re-block every time its level later falls below the threshold,
+    // which matches the observed rare audio stalls after 30-40 seconds.
+    if (g_object_get_data(G_OBJECT(queue), "tvs-audio-reservoir-started")) {
+        return;
+    }
+
+    g_object_set_data(
+        G_OBJECT(queue), "tvs-audio-reservoir-started", GINT_TO_POINTER(1));
+    setUInt64PropertyIfPresent(queue, "min-threshold-time", 0);
+
+    std::cerr << "Stable UDP audio reservoir startup complete: "
+              << "startup_reservoir_ms=1500 min_threshold_ms=0 "
+              << "steady_state=clocksync-only" << std::endl;
+}
+
 std::string outputType(const StreamConfig& cfg) {
     std::string type = toLower(cfg.outputType);
     if (type == "udp_vbr" || type == "udpvbr") {
@@ -3114,6 +3138,7 @@ bool StreamManager::buildRemapPipeline(
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1500 : 0)
+                  << " audio_reservoir_mode=" << (udpCbrOutputEnabled(cfg) ? "startup-only" : "off")
                   << " audio_pacer=" << (udpCbrOutputEnabled(cfg) ? "clocksync" : "off")
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
@@ -3391,14 +3416,19 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     configureQueue(queue);
 
     if (stableUdpAudioReservoir) {
-        // Compressed AAC is not decoded or modified. We only keep a 1500 ms
-        // reserve and release parsed AAC buffers according to their original
-        // timestamps. This prevents the remuxer from seeing long audio bursts
-        // while leaving the H.264 branch completely unchanged.
+        // Compressed AAC is not decoded or modified. Build a 1500 ms startup
+        // reserve, then release parsed AAC buffers according to their original
+        // timestamps. The queue threshold is disabled after the initial fill so
+        // it cannot periodically re-buffer and create later audio stalls.
         configureQueue(audioReservoirQueue, kStableUdpAudioReservoirMax);
         setUInt64PropertyIfPresent(
             audioReservoirQueue, "min-threshold-time", kStableUdpAudioReservoir);
         setIntPropertyIfPresent(audioReservoirQueue, "leaky", 0);
+        g_signal_connect(
+            audioReservoirQueue,
+            "running",
+            G_CALLBACK(onStableUdpAudioReservoirRunning),
+            nullptr);
 
         setBooleanPropertyIfPresent(audioClockSync, "sync", TRUE);
         setBooleanPropertyIfPresent(audioClockSync, "sync-to-first", TRUE);
@@ -3484,7 +3514,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << " pid=" << requestedPid
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
                   << (stableUdpAudioReservoir
-                      ? " audio_reservoir_ms=1500 audio_pacer=clocksync(sync-to-first)"
+                      ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=clocksync(sync-to-first)"
                       : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
