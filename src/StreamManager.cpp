@@ -31,6 +31,8 @@ constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
+constexpr guint64 kStableUdpAudioReservoir = 700 * GST_MSECOND;
+constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
@@ -208,19 +210,6 @@ bool cbrMuxEnabled(const StreamConfig& cfg) {
         return cfg.targetBitrate > 0;
     }
     return cfg.cbr && cfg.targetBitrate > 0;
-}
-
-uint64_t stableUdpInternalMuxBitrate(const StreamConfig& cfg) {
-    if (!usesStableUdpShaper(cfg) || !udpCbrOutputEnabled(cfg) || cfg.targetBitrate <= 100000ULL) {
-        return 0;
-    }
-
-    // StableUdpOutput intentionally reserves 100 kbit/s of the configured CBR
-    // transport for its periodic PCR-only packets and final NULL stuffing.
-    // Let mpegtsmux build a packet-position-aware CBR timeline inside that
-    // useful-data budget instead of emitting an unpadded VBR TS in large
-    // video/audio bursts.
-    return static_cast<uint64_t>(cfg.targetBitrate) - 100000ULL;
 }
 
 std::string srtOutputMode(const StreamConfig& cfg);
@@ -931,16 +920,10 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         nullptr);
     const bool externalUdpShaper = usesStableUdpShaper(cfg);
     if (externalUdpShaper) {
-        const uint64_t internalMuxBitrate = stableUdpInternalMuxBitrate(cfg);
-        // For UDP-CBR, ask mpegtsmux to insert its own NULL packet positions at
-        // target-100 kbit/s. This gives the mux a real transport byte clock for
-        // interleaving low-bitrate AAC with H.264 instead of outputting audio in
-        // large bursts. StableUdpOutput still performs the final wall-clock
-        // pacing at the configured target bitrate, replaces PCR cadence, and
-        // uses the remaining 100 kbit/s for periodic PCR/NULL headroom.
-        //
-        // UDP-VBR remains unpadded (bitrate=0).
-        setUInt64PropertyIfPresent(mux, "bitrate", internalMuxBitrate);
+        // All UDP MPEG-TS outputs now use the same reservoir/shaper path. Keep
+        // mpegtsmux unpadded so the sender can build either strict CBR or
+        // source-rate-following VBR from one clean SPTS timeline.
+        setUInt64PropertyIfPresent(mux, "bitrate", 0);
     } else if (cbrMuxEnabled(cfg)) {
         setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
@@ -3125,13 +3108,13 @@ bool StreamManager::buildRemapPipeline(
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
-        const uint64_t internalMuxBitrate = stableUdpInternalMuxBitrate(cfg);
-        std::cerr << "Unified UDP mux: bitrate=" << internalMuxBitrate
-                  << " mode=" << (udpCbrOutputEnabled(cfg) ? "CBR" : "VBR")
+        std::cerr << "Unified UDP mux: bitrate=0 mode="
+                  << (udpCbrOutputEnabled(cfg) ? "CBR" : "VBR")
                   << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
-                  << " mux_headroom=100000"
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
+                  << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 700 : 0)
+                  << " audio_pacer=" << (udpCbrOutputEnabled(cfg) ? "clocksync" : "off")
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
@@ -3357,11 +3340,30 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
-    if (!queue || !parser) {
-        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString << std::endl;
+    const bool stableUdpAudioReservoir =
+        isAudio && !ctx->flvMux &&
+        usesStableUdpShaper(ctx->config) &&
+        udpCbrOutputEnabled(ctx->config);
+
+    GstElement* audioReservoirQueue = stableUdpAudioReservoir
+        ? gst_element_factory_make("queue", nullptr)
+        : nullptr;
+    GstElement* audioClockSync = stableUdpAudioReservoir
+        ? gst_element_factory_make("clocksync", nullptr)
+        : nullptr;
+
+    if (!queue || !parser ||
+        (stableUdpAudioReservoir && (!audioReservoirQueue || !audioClockSync))) {
+        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString;
+        if (stableUdpAudioReservoir && !audioClockSync) {
+            std::cerr << " (clocksync unavailable for Stable UDP audio reservoir)";
+        }
+        std::cerr << std::endl;
         if (queue) gst_object_unref(queue);
         if (parser) gst_object_unref(parser);
         if (capsfilter) gst_object_unref(capsfilter);
+        if (audioReservoirQueue) gst_object_unref(audioReservoirQueue);
+        if (audioClockSync) gst_object_unref(audioClockSync);
         drainDynamicPad(ctx->mux, pad);
         return;
     }
@@ -3374,15 +3376,33 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     if (!gst_bin_add(GST_BIN(pipeline), queue) ||
         !gst_bin_add(GST_BIN(pipeline), parser) ||
-        (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter))) {
+        (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter)) ||
+        (audioReservoirQueue && !gst_bin_add(GST_BIN(pipeline), audioReservoirQueue)) ||
+        (audioClockSync && !gst_bin_add(GST_BIN(pipeline), audioClockSync))) {
         if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
         if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
         if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
+        if (audioReservoirQueue && !GST_OBJECT_PARENT(audioReservoirQueue)) gst_object_unref(audioReservoirQueue);
+        if (audioClockSync && !GST_OBJECT_PARENT(audioClockSync)) gst_object_unref(audioClockSync);
         gst_object_unref(pipeline);
         return;
     }
 
     configureQueue(queue);
+
+    if (stableUdpAudioReservoir) {
+        // Compressed AAC is not decoded or modified. We only keep a 700 ms
+        // reserve and release parsed AAC buffers according to their original
+        // timestamps. This prevents the remuxer from seeing long audio bursts
+        // while leaving the H.264 branch completely unchanged.
+        configureQueue(audioReservoirQueue, kStableUdpAudioReservoirMax);
+        setUInt64PropertyIfPresent(
+            audioReservoirQueue, "min-threshold-time", kStableUdpAudioReservoir);
+        setIntPropertyIfPresent(audioReservoirQueue, "leaky", 0);
+
+        setBooleanPropertyIfPresent(audioClockSync, "sync", TRUE);
+        setBooleanPropertyIfPresent(audioClockSync, "sync-to-first", TRUE);
+    }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", 1, nullptr);
     }
@@ -3391,11 +3411,26 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (capsfilter) {
         gst_element_sync_state_with_parent(capsfilter);
     }
+    if (audioReservoirQueue) {
+        gst_element_sync_state_with_parent(audioReservoirQueue);
+    }
+    if (audioClockSync) {
+        gst_element_sync_state_with_parent(audioClockSync);
+    }
 
     const bool parserLinked = capsfilter
         ? gst_element_link_many(queue, parser, capsfilter, nullptr)
         : gst_element_link(queue, parser);
     if (!parserLinked) {
+        gst_object_unref(pipeline);
+        drainDynamicPad(ctx->mux, pad);
+        return;
+    }
+
+    GstElement* parserTail = capsfilter ? capsfilter : parser;
+    if (stableUdpAudioReservoir &&
+        !gst_element_link_many(parserTail, audioReservoirQueue, audioClockSync, nullptr)) {
+        std::cerr << "Stable UDP audio reservoir link failed" << std::endl;
         gst_object_unref(pipeline);
         drainDynamicPad(ctx->mux, pad);
         return;
@@ -3420,7 +3455,8 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         requestedPid = pidFromDemuxPadName(pad);
     }
 
-    GstElement* muxSourceElement = capsfilter ? capsfilter : parser;
+    GstElement* muxSourceElement =
+        stableUdpAudioReservoir ? audioClockSync : parserTail;
     GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
     GstPad* muxSinkPad = nullptr;
     const bool stableUdpPreMapped = !ctx->flvMux && usesStableUdpShaper(ctx->config) &&
@@ -3447,6 +3483,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
+                  << (stableUdpAudioReservoir
+                      ? " audio_reservoir_ms=700 audio_pacer=clocksync(sync-to-first)"
+                      : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {
