@@ -3098,6 +3098,13 @@ bool StreamManager::buildRemapPipeline(
     configureTsMux(mux, cfg);
 
     if (usesStableUdpShaper(cfg)) {
+        // GStreamer 1.20 tsdemux defaults to 700 ms of smooth-demux latency.
+        // On live passthrough UDP remux this can let the low-bitrate AAC PID
+        // arrive at mpegtsmux in large bursts while video remains continuous.
+        // Keep some jitter tolerance, but cap the demux buffering to 100 ms.
+        constexpr gint kStableUdpDemuxLatencyMs = 100;
+        setIntPropertyIfPresent(demux, "latency", kStableUdpDemuxLatencyMs);
+
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
             return false;
@@ -3111,6 +3118,7 @@ bool StreamManager::buildRemapPipeline(
                   << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
+                  << " demux_latency_ms=" << kStableUdpDemuxLatencyMs
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
