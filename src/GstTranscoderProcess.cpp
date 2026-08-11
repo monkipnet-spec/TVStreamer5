@@ -294,7 +294,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "!", "video/x-raw",
         "!", "videoconvert",
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
-        "!", "videoscale", "add-borders=true", "method=lanczos",
+        "!", "videoscale", "add-borders=false", "method=lanczos",
         "!", "videorate", "drop-only=false",
         "!", scaledVideoCaps(width, height),
         "!", "x264enc",
@@ -405,7 +405,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     });
     addQueue(args, "test_video_queue", 3000000000ULL);
     args.insert(args.end(), {
-        "!", "videoconvert", "!", "videoscale", "add-borders=true", "method=lanczos", "!", "videorate",
+        "!", "videoconvert", "!", "videoscale", "add-borders=false", "method=lanczos", "!", "videorate",
         "!", scaledVideoCaps(width, height),
         "!", "x264enc", "tune=zerolatency", "speed-preset=superfast",
         property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
