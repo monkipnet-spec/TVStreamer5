@@ -3098,20 +3098,18 @@ bool StreamManager::buildRemapPipeline(
     configureTsMux(mux, cfg);
 
     if (usesStableUdpShaper(cfg)) {
-        // GStreamer 1.20 tsdemux defaults to 700 ms of smooth-demux latency.
-        // On live passthrough UDP remux this can let the low-bitrate AAC PID
-        // arrive at mpegtsmux in large bursts while video remains continuous.
-        // Keep some jitter tolerance, but cap the demux buffering to 100 ms.
-        constexpr gint kStableUdpDemuxLatencyMs = 100;
-        constexpr guint64 kStableUdpMuxLatencyNs = 100 * GST_MSECOND;
-        setIntPropertyIfPresent(demux, "latency", kStableUdpDemuxLatencyMs);
+        // Keep tsdemux at its GStreamer 1.20 smooth-demux default. Output
+        // captures show that the video PID is continuous while AAC can arrive
+        // to the remux path in bursts separated by several hundred ms.
+        constexpr gint kStableUdpDemuxLatencyMs = 700;
 
-        // On GStreamer 1.20.x mpegtsmux is a GstAggregator and its default
-        // additional live latency is 0. The output capture shows H.264 payload
-        // continuously available while AAC is delivered in bursts. A 400 ms
-        // mux latency reduced the frequency of large AAC gaps but also created
-        // rare ~400 ms waits. Keep only 100 ms of look-ahead: enough to improve
-        // interleave without allowing the mux to hold audio for hundreds of ms.
+        // mpegtsmux is a GstAggregator. Give it enough live look-ahead to wait
+        // for temporarily late AAC and interleave it by timestamp instead of
+        // emitting a long run of video first. The measured AAC gaps were up to
+        // ~440 ms, so 700 ms leaves useful margin without touching A/V PTS.
+        constexpr guint64 kStableUdpMuxLatencyNs = 700 * GST_MSECOND;
+
+        setIntPropertyIfPresent(demux, "latency", kStableUdpDemuxLatencyMs);
         setUInt64PropertyIfPresent(mux, "latency", kStableUdpMuxLatencyNs);
 
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
@@ -3128,7 +3126,7 @@ bool StreamManager::buildRemapPipeline(
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " demux_latency_ms=" << kStableUdpDemuxLatencyMs
-                  << " mux_latency_ms=100"
+                  << " mux_latency_ms=700"
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
