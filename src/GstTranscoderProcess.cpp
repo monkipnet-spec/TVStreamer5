@@ -209,8 +209,9 @@ bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& e
 
 
 uint32_t effectiveInputServiceId(const StreamConfig& cfg) {
-    // StreamManager resolves input_service_id=0 from the PAT before launching
-    // the external transcoder. Never fall back to output service_id here.
+    // input_service_id=0 means AUTO. In AUTO mode the decoder sees the live
+    // source directly and performs its normal program selection. Never fall
+    // back to output service_id: that value is reserved for output remapping.
     return cfg.inputServiceId;
 }
 

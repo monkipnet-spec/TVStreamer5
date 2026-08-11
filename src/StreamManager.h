@@ -61,7 +61,6 @@ struct StreamState {
     StreamConfig config;
     // Runtime PAT result used only when input_service_id=0 (Auto).
     // The configured value remains 0; effective selection is kept in state->config.
-    std::vector<uint32_t> detectedInputServiceIds;
     std::atomic<uint64_t> inputBitrate{0};
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};

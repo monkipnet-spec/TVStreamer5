@@ -1,5 +1,4 @@
 #include "StreamManager.h"
-#include "MpegTsServiceDetector.h"
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
 #include "UdpInput.h"
@@ -1436,23 +1435,15 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     auto state = std::make_unique<StreamState>();
 
     StreamConfig effectiveConfig = streamConfig;
-    if (effectiveConfig.inputServiceId == 0 && MpegTsServiceDetector::supports(effectiveConfig)) {
-        const auto detection = MpegTsServiceDetector::detect(effectiveConfig, std::chrono::milliseconds(4000));
-        state->detectedInputServiceIds = detection.serviceIds;
-        if (!detection.serviceIds.empty()) {
-            effectiveConfig.inputServiceId = detection.serviceIds.front();
-            std::cerr << "Input SID auto-detected from PAT: selected="
-                      << effectiveConfig.inputServiceId << " services=";
-            for (size_t i = 0; i < detection.serviceIds.size(); ++i) {
-                if (i) std::cerr << ',';
-                std::cerr << detection.serviceIds[i];
-            }
-            std::cerr << " uri=" << effectiveConfig.inputUri << std::endl;
-        } else {
-            std::cerr << "Input SID auto-detection warning: "
-                      << (detection.error.empty() ? "no PAT service found" : detection.error)
-                      << "; continuing with automatic demux selection" << std::endl;
-        }
+    // input_service_id == 0 is true AUTO mode. Do not open/probe the live
+    // input in a second temporary pipeline before the real stream starts.
+    // A preflight PAT probe can consume/exclusively occupy SRT sources and can
+    // disturb UDP startup. The real demux/decode pipeline performs automatic
+    // program selection when SID is zero. A non-zero SID is still selected
+    // explicitly with tsdemux program-number.
+    if (effectiveConfig.inputServiceId == 0) {
+        std::cerr << "Input SID mode: AUTO (single live input, no preflight probe)"
+                  << " uri=" << effectiveConfig.inputUri << std::endl;
     }
 
     state->config = effectiveConfig;

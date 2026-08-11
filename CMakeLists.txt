@@ -34,7 +34,6 @@ add_executable(TVStreamer
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
     src/StableUdpOutput.cpp
-    src/MpegTsServiceDetector.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
     src/GstTranscoderProcess.cpp
