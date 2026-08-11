@@ -591,7 +591,10 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
                   << " service=" << config.serviceId
                   << " vpid=" << config.videoPid
                   << " apid=" << config.audioPid;
-        if (tvs::protocols::isTsOutput(tvs::protocols::outputKind(output))) {
+        const auto outputKind = tvs::protocols::outputKind(output);
+        if (outputKind == tvs::protocols::OutputKind::FifoRelay) {
+            std::cerr << " ts-relay=unpaced";
+        } else if (tvs::protocols::isTsOutput(outputKind)) {
             std::cerr << " ts-cbr-bitrate=" << tvs::protocols::muxBitrate(output);
         } else {
             std::cerr << " encoder-cbr-bitrate=" << tvs::protocols::safeVideoBitrate(output);

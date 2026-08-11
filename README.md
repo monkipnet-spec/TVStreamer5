@@ -967,3 +967,5 @@ journalctl -u tvstreamer5 -f | grep -Ei 'SRT connection monitoring|SRT caller|Tr
 For an SRT Listener with transcoding enabled, the external `gst-launch-1.0` process must terminate at an internal loopback `udpsink`; the public `srtsink` is owned by TVStreamer5 so that the normal `caller-added`/`caller-removed` subscriber monitoring callbacks are used. The startup description should therefore contain `srt-listener-relay@127.0.0.1:`. If the UI still shows `srt-listener@srt://...`, an older/partial SRT output module is deployed.
 
 The external transcoder command is now logged before process startup, and early `gst-launch-1.0` stderr is appended to the persistent web startup error so an exit code such as 255 is accompanied by the actual GStreamer error text.
+
+- Transcoded UDP is routed through the default StableUdpOutput stage via an internal FIFO.

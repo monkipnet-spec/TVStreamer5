@@ -176,6 +176,13 @@ bool usesStableUdpShaper(const StreamConfig& cfg) {
     return isUdpOutputType(outputType(cfg));
 }
 
+bool allOutputsUseStableUdp(const StreamConfig& cfg) {
+    const auto outputs = tvs::protocols::outputConfigs(cfg);
+    return !outputs.empty() && std::all_of(outputs.begin(), outputs.end(), [](const StreamConfig& output) {
+        return usesStableUdpShaper(output);
+    });
+}
+
 bool isUdpOutput(const StreamConfig& cfg) {
     const std::string type = outputType(cfg);
     return isUdpOutputType(type) || type == "rtp";
@@ -361,8 +368,11 @@ StreamConfig transcodeRelayOutputConfig(const StreamConfig& cfg) {
     relay.outputHost = tvs::protocols::transcodedFifoRelayPath(cfg);
     relay.outputPort = 0;
     relay.additionalOutputs.clear();
-    relay.cbr = true;
-    relay.targetBitrate = transcodeMuxBitrateForStats(cfg);
+    // The FIFO is an unpaced hand-off between the external encoder and the
+    // normal StableUdpOutput stage.  StableUdpOutput owns the final CBR/VBR
+    // clock, NULL stuffing, startup reservoir and UDP packetization.
+    relay.cbr = false;
+    relay.targetBitrate = 0;
     return relay;
 }
 
@@ -1367,6 +1377,46 @@ void StreamManager::monitorExternalSrtBus(const std::string& id, size_t outputIn
     (void)outputIndex;
 }
 
+GstElement* StreamManager::createTranscodedUdpRelayPipeline(StreamState* state, std::string& error) {
+    if (!state) {
+        error = "transcoded UDP relay state is null";
+        return nullptr;
+    }
+
+    const std::string fifoPath = tvs::protocols::transcodedFifoRelayPath(state->config);
+    GstElement* pipeline = gst_pipeline_new((state->config.id + "_transcoded_udp_relay").c_str());
+    GstElement* src = gst_element_factory_make("filesrc", "transcoded_udp_fifo_src");
+    GstElement* queue = gst_element_factory_make("queue", "transcoded_udp_fifo_queue");
+    if (!pipeline || !src || !queue ||
+        !addElementOrFail(pipeline, src) || !addElementOrFail(pipeline, queue)) {
+        error = "failed to create transcoded UDP FIFO relay elements";
+        if (pipeline) gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    g_object_set(src, "location", fifoPath.c_str(), nullptr);
+    configureQueue(queue, 10000000000ULL);
+    if (!gst_element_link(src, queue)) {
+        error = "failed to link transcoded UDP FIFO relay source";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    // state->config intentionally keeps transcodeEnabled=true.  The output
+    // branch therefore treats the FIFO content as an already finished SPTS and
+    // sends it directly to StableUdpOutput without another demux/remux pass.
+    if (!buildOutputBranches(state, pipeline, queue)) {
+        error = "failed to build normal UDP output after transcoding";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    std::cerr << "Transcoded UDP relay: external GStreamer encoder -> fifo://"
+              << fifoPath
+              << " -> StableUdpOutput (default UDP path)" << std::endl;
+    return pipeline;
+}
+
 bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
     if (error) error->clear();
     {
@@ -1388,6 +1438,104 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->activeInputUri = streamConfig.testPattern ? kTestPatternUri : streamConfig.inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
+
+    if (streamConfig.transcodeEnabled && allOutputsUseStableUdp(streamConfig) &&
+        GstTranscoderProcess::isAvailable()) {
+        std::string relayError;
+        if (!tvs::protocols::prepareFifoRelay(streamConfig, relayError)) {
+            state->statusMessage = "transcoded UDP relay setup failed: " + relayError;
+            if (error) *error = relayError;
+            return false;
+        }
+
+        auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
+        const StreamConfig relayConfig = transcodeRelayOutputConfig(streamConfig);
+        std::string gstError;
+        if (!gstTranscoder->start(relayConfig, gstError)) {
+            tvs::protocols::removeFifoRelay(streamConfig);
+            state->statusMessage = "gstreamer transcoder relay failed: " + gstError;
+            if (error) *error = gstError.empty() ? "GStreamer transcoder relay failed to start" : gstError;
+            return false;
+        }
+        state->gstTranscoder = std::move(gstTranscoder);
+
+        GstElement* relayPipeline = createTranscodedUdpRelayPipeline(state.get(), relayError);
+        if (!relayPipeline) {
+            state->gstTranscoder->stop();
+            state->gstTranscoder.reset();
+            tvs::protocols::removeFifoRelay(streamConfig);
+            state->statusMessage = "transcoded UDP output failed: " + relayError;
+            if (error) *error = relayError.empty() ? "failed to create transcoded UDP output" : relayError;
+            return false;
+        }
+
+        state->pipeline = relayPipeline;
+        state->bus = gst_element_get_bus(relayPipeline);
+        state->running = true;
+        state->active = true;
+        state->statusMessage = "starting transcoded UDP";
+        state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
+        state->inputBitrate = transcodeInputBitrateForStats(streamConfig);
+        state->lastInputActivity = std::chrono::steady_clock::now();
+        state->lastPrimaryRetry = state->lastInputActivity;
+        state->lastBitrateSample = state->lastInputActivity;
+        attachBitrateProbes(state.get());
+
+        const GstStateChangeReturn stateChange = gst_element_set_state(relayPipeline, GST_STATE_PLAYING);
+        if (stateChange == GST_STATE_CHANGE_FAILURE) {
+            state->running = false;
+            state->active = false;
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(relayPipeline);
+            state->pipeline = nullptr;
+            state->gstTranscoder->stop();
+            state->gstTranscoder.reset();
+            tvs::protocols::removeFifoRelay(streamConfig);
+            state->statusMessage = "transcoded UDP relay playback failed";
+            if (error) *error = "failed to start post-transcode StableUdpOutput pipeline";
+            return false;
+        }
+
+        std::cerr << "Pipeline for stream '" << streamConfig.name
+                  << "': external-transcoder -> fifo -> default-udp"
+                  << " transcode=" << streamConfig.transcodeResolution
+                  << "@" << streamConfig.transcodeVideoBitrate
+                  << " outputs=" << buildPipelineDescription(streamConfig) << std::endl;
+
+        bool duplicateStart = false;
+        {
+            std::lock_guard<std::mutex> lock(managerMutex);
+            if (streams.count(streamConfig.id)) {
+                duplicateStart = true;
+            } else {
+                streams[streamConfig.id] = std::move(state);
+                streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+            }
+        }
+        if (duplicateStart) {
+            if (state) {
+                state->running = false;
+                if (state->pipeline) gst_element_set_state(state->pipeline, GST_STATE_NULL);
+                if (state->bus) gst_object_unref(state->bus);
+                if (state->pipeline) gst_object_unref(state->pipeline);
+                if (state->gstTranscoder) state->gstTranscoder->stop();
+            }
+            tvs::protocols::removeFifoRelay(streamConfig);
+            if (error) *error = "duplicate stream start detected: " + streamConfig.id;
+            return false;
+        }
+
+        notifyStreamState(
+            streamConfig,
+            "🟢",
+            telegramText(configManager, "Поток запущен", "Stream started"),
+            telegramText(configManager, "Транскодинг -> стандартный UDP", "Transcode -> default UDP") +
+                "\nURL: " + streamConfig.inputUri);
+        return true;
+    }
 
     if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
         std::string srtRelayError;
@@ -1608,6 +1756,7 @@ bool StreamManager::stopStream(const std::string& id) {
     }
     state.outputContexts.clear();
     state.sourceContext.reset();
+    tvs::protocols::removeFifoRelay(stoppedConfig);
 
     notifyStreamState(
         stoppedConfig,
@@ -1663,6 +1812,7 @@ void StreamManager::stopAll() {
         }
         state.outputContexts.clear();
         state.sourceContext.reset();
+        tvs::protocols::removeFifoRelay(state.config);
     }
 }
 

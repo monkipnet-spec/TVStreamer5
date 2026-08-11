@@ -22,7 +22,7 @@ std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
         case OutputKind::UdpVbr:
             return {"mpegtsmux", "tsparse", "identity", "udpsink"};
         case OutputKind::FifoRelay:
-            return {"mpegtsmux", "tsparse", "identity", "filesink"};
+            return {"mpegtsmux", "filesink"};
         case OutputKind::Rtp:
             return {"mpegtsmux", "tsparse", "identity", "rtpmp2tpay", "udpsink"};
         case OutputKind::Srt:
