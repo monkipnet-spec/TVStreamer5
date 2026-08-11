@@ -176,20 +176,22 @@ bool usesStableUdpShaper(const StreamConfig& cfg) {
     return isUdpOutputType(outputType(cfg));
 }
 
-bool usesSharedStableTsRelay(const StreamConfig& cfg) {
+bool outputSupportsLocalCbrDistribution(const StreamConfig& cfg) {
     const std::string type = outputType(cfg);
-    return isUdpOutputType(type) ||
-           type == "http" ||
-           type == "hls" ||
-           type == "srt" ||
-           type == "rtp";
+    // MPEG-TS delivery protocols and the existing TS->FLV path can consume
+    // the common local CBR transport. RTSP keeps its dedicated old path.
+    return type != "rtsp";
 }
 
-bool allOutputsUseSharedStableTsRelay(const StreamConfig& cfg) {
+bool allOutputsSupportLocalCbrDistribution(const StreamConfig& cfg) {
     const auto outputs = tvs::protocols::outputConfigs(cfg);
     return !outputs.empty() && std::all_of(outputs.begin(), outputs.end(), [](const StreamConfig& output) {
-        return usesSharedStableTsRelay(output);
+        return outputSupportsLocalCbrDistribution(output);
     });
+}
+
+bool isInternalCbrInput(const StreamConfig& cfg) {
+    return toLower(cfg.inputMode) == "internal-cbr";
 }
 
 bool isUdpOutput(const StreamConfig& cfg) {
@@ -367,7 +369,8 @@ uint64_t transcodeMuxBitrateForStats(const StreamConfig& cfg) {
 uint16_t transcodeRelayPort(const StreamConfig& cfg) {
     const std::string key = cfg.id.empty() ? cfg.name : cfg.id;
     const size_t hash = std::hash<std::string>{}(key);
-    return static_cast<uint16_t>(51000 + (hash % 10000));
+    // Private localhost hand-off. It is not a user-visible UDP output.
+    return static_cast<uint16_t>(50000 + (hash % 10000));
 }
 
 StreamConfig transcodeRelayOutputConfig(const StreamConfig& cfg) {
@@ -397,27 +400,34 @@ StreamConfig transcodeRelayPipelineConfig(const StreamConfig& cfg) {
     return relay;
 }
 
-StreamConfig transcodeStableTsBridgeConfig(const StreamConfig& cfg) {
-    StreamConfig bridge = cfg;
-    bridge.outputType = "udp-cbr";
-    bridge.outputMode = "caller";
-    bridge.outputHost = "127.0.0.1";
-    bridge.outputPort = static_cast<int>(transcodeRelayPort(cfg));
-    bridge.interfaceAddress.clear();
-    bridge.cbr = true;
-    bridge.targetBitrate = tvs::protocols::muxBitrate(cfg);
-    bridge.transcodeEnabled = false;
-    bridge.remapEnabled = false;
-    bridge.additionalOutputs.clear();
-    return bridge;
+StreamConfig transcodeLocalCbrConfig(const StreamConfig& cfg) {
+    StreamConfig local = cfg;
+    local.outputType = "udp-cbr";
+    local.outputMode = "caller";
+    local.outputHost = "127.0.0.1";
+    local.outputPort = static_cast<int>(transcodeRelayPort(cfg));
+    local.interfaceAddress.clear();
+    local.additionalOutputs.clear();
+    local.cbr = true;
+    local.targetBitrate = tvs::protocols::muxBitrate(cfg);
+    local.transcodeEnabled = false;
+    local.remapEnabled = false;
+    return local;
 }
 
-StreamConfig postStableProtocolConfig(const StreamConfig& cfg) {
-    StreamConfig output = cfg;
-    output.cbr = false;
-    output.transcodeEnabled = true;
-    output.remapEnabled = false;
-    return output;
+StreamConfig transcodeDistributionConfig(const StreamConfig& cfg) {
+    StreamConfig distribution = cfg;
+    distribution.inputUri = "udp://127.0.0.1:" + std::to_string(transcodeRelayPort(cfg));
+    distribution.inputMode = "internal-cbr";
+    distribution.inputInterfaceAddress = "127.0.0.1";
+    distribution.inputInterfaceAddressConfigured = true;
+    distribution.testPattern = false;
+    distribution.transcodeEnabled = false;
+    distribution.remapEnabled = false;
+    // CBR is already physically formed by StableUdpOutput. Delivery sinks
+    // must not add a second mux/identity pacer.
+    distribution.cbr = false;
+    return distribution;
 }
 
 uint64_t initialConfiguredOutputBitrate(const StreamConfig& cfg) {
@@ -711,7 +721,7 @@ void updateOutputContinuityErrors(StreamState* state, GstBufferList* list) {
 void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilteringEnabled) {
     const std::string mode = srtOutputMode(cfg);
     const bool caller = mode == "caller";
-    const bool transcoded = cfg.transcodeEnabled;
+    const bool transcoded = cfg.transcodeEnabled || isInternalCbrInput(cfg);
     const std::string targetHost = cfg.outputHost.empty() || cfg.outputHost == "0.0.0.0" || cfg.outputHost == "::"
         ? "127.0.0.1"
         : cfg.outputHost;
@@ -1409,209 +1419,93 @@ void StreamManager::monitorExternalSrtBus(const std::string& id, size_t outputIn
     (void)outputIndex;
 }
 
-GstElement* StreamManager::createTranscodedStableTsRelayPipeline(StreamState* state, std::string& error) {
+GstElement* StreamManager::createTranscodedLocalCbrPipeline(StreamState* state, std::string& error) {
     if (!state) {
-        error = "transcoded stable TS relay state is null";
+        error = "transcoded local CBR state is null";
         return nullptr;
-    }
-
-    const auto outputs = pipelineOutputConfigs(state->config);
-    if (outputs.empty()) {
-        error = "transcoded stable TS relay has no outputs";
-        return nullptr;
-    }
-
-    std::vector<StreamConfig> directUdpOutputs;
-    std::vector<StreamConfig> postStableOutputs;
-    for (const auto& output : outputs) {
-        if (isUdpOutputType(outputType(output))) {
-            directUdpOutputs.push_back(output);
-        } else {
-            postStableOutputs.push_back(output);
-        }
     }
 
     const std::string fifoPath = tvs::protocols::transcodedFifoRelayPath(state->config);
-    GstElement* pipeline = gst_pipeline_new((state->config.id + "_transcoded_stable_ts_relay").c_str());
-    GstElement* src = gst_element_factory_make("filesrc", "transcoded_stable_fifo_src");
-    GstElement* inputQueue = gst_element_factory_make("queue", "transcoded_stable_fifo_queue");
-    GstElement* inputTee = gst_element_factory_make("tee", "transcoded_stable_input_tee");
-    if (!pipeline || !src || !inputQueue || !inputTee ||
-        !addElementOrFail(pipeline, src) ||
-        !addElementOrFail(pipeline, inputQueue) ||
-        !addElementOrFail(pipeline, inputTee)) {
-        error = "failed to create transcoded stable TS FIFO relay elements";
+    GstElement* pipeline = gst_pipeline_new((state->config.id + "_local_cbr_conditioner").c_str());
+    GstElement* src = gst_element_factory_make("filesrc", "transcoded_cbr_fifo_src");
+    GstElement* queue = gst_element_factory_make("queue", "transcoded_cbr_fifo_queue");
+    if (!pipeline || !src || !queue ||
+        !addElementOrFail(pipeline, src) || !addElementOrFail(pipeline, queue)) {
+        error = "failed to create local CBR conditioner FIFO elements";
         if (pipeline) gst_object_unref(pipeline);
         return nullptr;
     }
 
     g_object_set(src, "location", fifoPath.c_str(), nullptr);
-    configureQueue(inputQueue, 10000000000ULL);
-    if (!gst_element_link_many(src, inputQueue, inputTee, nullptr)) {
-        error = "failed to link transcoded stable TS FIFO source";
+    configureQueue(queue, 10000000000ULL);
+
+    StreamConfig localConfig = transcodeLocalCbrConfig(state->config);
+    std::string sinkError;
+    GstElement* stableSink = StableUdpOutput::createSink(
+        pipeline, localConfig, "transcoded_local_cbr_sink", sinkError);
+    if (!stableSink || !gst_element_link_many(src, queue, stableSink, nullptr)) {
+        error = sinkError.empty() ? "failed to link local StableUdpOutput conditioner" : sinkError;
         gst_object_unref(pipeline);
         return nullptr;
     }
 
-    auto linkInputBranch = [&](GstElement* branchHead) -> bool {
-        GstPad* teeSrcPad = gst_element_request_pad_simple(inputTee, "src_%u");
-        GstPad* sinkPad = gst_element_get_static_pad(branchHead, "sink");
-        if (!teeSrcPad || !sinkPad) {
-            if (teeSrcPad) gst_object_unref(teeSrcPad);
-            if (sinkPad) gst_object_unref(sinkPad);
-            return false;
-        }
-        const bool linked = gst_pad_link(teeSrcPad, sinkPad) == GST_PAD_LINK_OK;
-        gst_object_unref(teeSrcPad);
-        gst_object_unref(sinkPad);
-        return linked;
-    };
+    std::cerr << "Transcoded local CBR conditioner: fifo://" << fifoPath
+              << " -> StableUdpOutput target=" << localConfig.targetBitrate
+              << " -> udp://127.0.0.1:" << localConfig.outputPort << std::endl;
+    return pipeline;
+}
 
-    size_t directBranchIndex = 0;
-    for (const auto& output : directUdpOutputs) {
-        GstElement* branchQueue = gst_element_factory_make(
-            "queue", branchName("transcoded_direct_udp_queue", directBranchIndex).c_str());
-        if (!branchQueue || !addElementOrFail(pipeline, branchQueue)) {
-            error = "failed to create direct UDP branch queue";
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-        configureQueue(branchQueue, 10000000000ULL);
-        if (!linkInputBranch(branchQueue) ||
-            !buildOutputBranch(state, pipeline, branchQueue, output, directBranchIndex)) {
-            error = "failed to build direct StableUdpOutput branch after transcoding";
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-        ++directBranchIndex;
+GstElement* StreamManager::createTranscodedDistributionPipeline(StreamState* state, std::string& error) {
+    if (!state) {
+        error = "transcoded distribution state is null";
+        return nullptr;
     }
 
-    if (!postStableOutputs.empty()) {
-        GstElement* stableQueue = gst_element_factory_make("queue", "transcoded_common_stable_queue");
-        if (!stableQueue || !addElementOrFail(pipeline, stableQueue)) {
-            error = "failed to create common stable TS queue";
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-        configureQueue(stableQueue, 10000000000ULL);
-        if (!linkInputBranch(stableQueue)) {
-            error = "failed to link common stable TS branch";
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
+    const StreamConfig originalConfig = state->config;
+    const StreamConfig distributionConfig = transcodeDistributionConfig(originalConfig);
 
-        StreamConfig bridgeConfig = transcodeStableTsBridgeConfig(state->config);
-        std::string bridgeError;
-        GstElement* stableSink = StableUdpOutput::createSink(
-            pipeline, bridgeConfig, "transcoded_common_stable_udp_bridge", bridgeError);
-        if (!stableSink || !gst_element_link(stableQueue, stableSink)) {
-            error = bridgeError.empty()
-                ? "failed to start common StableUdpOutput bridge"
-                : bridgeError;
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-
-        const uint16_t bridgePort = static_cast<uint16_t>(bridgeConfig.outputPort);
-        GstElement* relaySrc = gst_element_factory_make("udpsrc", "transcoded_post_stable_udpsrc");
-        GstElement* relayParse = gst_element_factory_make("tsparse", "transcoded_post_stable_tsparse");
-        GstElement* relayQueue = gst_element_factory_make("queue", "transcoded_post_stable_queue");
-        if (!relaySrc || !relayParse || !relayQueue ||
-            !addElementOrFail(pipeline, relaySrc) ||
-            !addElementOrFail(pipeline, relayParse) ||
-            !addElementOrFail(pipeline, relayQueue)) {
-            error = "failed to create post-StableUdpOutput protocol relay";
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-
-        GstCaps* relayCaps = gst_caps_from_string(
-            "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
-        g_object_set(relaySrc,
-            "address", "127.0.0.1",
-            "port", static_cast<gint>(bridgePort),
-            "caps", relayCaps,
-            "buffer-size", 32 * 1024 * 1024,
-            "do-timestamp", TRUE,
-            nullptr);
-        gst_caps_unref(relayCaps);
-
-        configureTsPacketAlignment(relayParse);
-        setBooleanPropertyIfPresent(relayParse, "set-timestamps", TRUE);
-        setUInt64PropertyIfPresent(relayParse, "smoothing-latency", 200000);
-        configureQueue(relayQueue, 10000000000ULL);
-
-        if (!gst_element_link_many(relaySrc, relayParse, relayQueue, nullptr)) {
-            error = "failed to link post-StableUdpOutput protocol relay";
-            gst_object_unref(pipeline);
-            return nullptr;
-        }
-
-        if (postStableOutputs.size() == 1) {
-            const StreamConfig output = postStableProtocolConfig(postStableOutputs.front());
-            if (!buildOutputBranch(state, pipeline, relayQueue, output, directBranchIndex)) {
-                error = "failed to build protocol output from common stable TS";
-                gst_object_unref(pipeline);
-                return nullptr;
-            }
-        } else {
-            GstElement* outputTee = gst_element_factory_make("tee", "transcoded_post_stable_tee");
-            if (!outputTee || !addElementOrFail(pipeline, outputTee) ||
-                !gst_element_link(relayQueue, outputTee)) {
-                error = "failed to create post-stable protocol tee";
-                gst_object_unref(pipeline);
-                return nullptr;
-            }
-
-            for (size_t i = 0; i < postStableOutputs.size(); ++i) {
-                GstElement* branchQueue = gst_element_factory_make(
-                    "queue", branchName("transcoded_post_stable_branch", i).c_str());
-                if (!branchQueue || !addElementOrFail(pipeline, branchQueue)) {
-                    error = "failed to create post-stable protocol branch queue";
-                    gst_object_unref(pipeline);
-                    return nullptr;
-                }
-                configureQueue(branchQueue, 10000000000ULL);
-
-                GstPad* teeSrcPad = gst_element_request_pad_simple(outputTee, "src_%u");
-                GstPad* sinkPad = gst_element_get_static_pad(branchQueue, "sink");
-                if (!teeSrcPad || !sinkPad) {
-                    if (teeSrcPad) gst_object_unref(teeSrcPad);
-                    if (sinkPad) gst_object_unref(sinkPad);
-                    error = "failed to request post-stable protocol tee pad";
-                    gst_object_unref(pipeline);
-                    return nullptr;
-                }
-                const bool linked = gst_pad_link(teeSrcPad, sinkPad) == GST_PAD_LINK_OK;
-                gst_object_unref(teeSrcPad);
-                gst_object_unref(sinkPad);
-                if (!linked) {
-                    error = "failed to link post-stable protocol tee branch";
-                    gst_object_unref(pipeline);
-                    return nullptr;
-                }
-
-                const StreamConfig output = postStableProtocolConfig(postStableOutputs[i]);
-                if (!buildOutputBranch(
-                        state, pipeline, branchQueue, output, directBranchIndex + i)) {
-                    error = "failed to build protocol output from common stable TS branch";
-                    gst_object_unref(pipeline);
-                    return nullptr;
-                }
-            }
-        }
-
-        std::cerr << "Shared stable TS relay: external transcoder -> FIFO -> StableUdpOutput"
-                  << " target=" << bridgeConfig.targetBitrate
-                  << " -> udp://127.0.0.1:" << bridgePort
-                  << " -> protocol fanout=";
-        for (size_t i = 0; i < postStableOutputs.size(); ++i) {
-            if (i) std::cerr << ",";
-            std::cerr << outputType(postStableOutputs[i]);
-        }
-        std::cerr << std::endl;
+    GstElement* pipeline = gst_pipeline_new((originalConfig.id + "_protocol_distribution").c_str());
+    GstElement* src = gst_element_factory_make("udpsrc", "transcoded_local_cbr_src");
+    GstElement* queue = gst_element_factory_make("queue", "transcoded_local_cbr_input_queue");
+    if (!pipeline || !src || !queue ||
+        !addElementOrFail(pipeline, src) || !addElementOrFail(pipeline, queue)) {
+        error = "failed to create local CBR distribution source";
+        if (pipeline) gst_object_unref(pipeline);
+        return nullptr;
     }
 
+    GstCaps* caps = gst_caps_from_string(
+        "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+    g_object_set(src,
+        "address", "127.0.0.1",
+        "port", static_cast<gint>(transcodeRelayPort(originalConfig)),
+        "caps", caps,
+        "buffer-size", 32 * 1024 * 1024,
+        "do-timestamp", TRUE,
+        nullptr);
+    gst_caps_unref(caps);
+    configureQueue(queue, 10000000000ULL);
+
+    if (!gst_element_link(src, queue)) {
+        error = "failed to link local CBR distribution source";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    // buildOutputBranches reads state->config. Temporarily mark this as an
+    // already-conditioned internal TS so no branch can remux or re-shape it.
+    state->config = distributionConfig;
+    const bool outputsBuilt = buildOutputBranches(state, pipeline, queue);
+    state->config = originalConfig;
+    if (!outputsBuilt) {
+        error = "failed to build protocol outputs from local CBR transport";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    std::cerr << "Transcoded protocol distribution: udp://127.0.0.1:"
+              << transcodeRelayPort(originalConfig)
+              << " -> " << buildPipelineDescription(originalConfig) << std::endl;
     return pipeline;
 }
 
@@ -1650,12 +1544,38 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = effectiveConfig;
 
-    if (effectiveConfig.transcodeEnabled && allOutputsUseSharedStableTsRelay(effectiveConfig) &&
+    if (effectiveConfig.transcodeEnabled &&
+        allOutputsSupportLocalCbrDistribution(effectiveConfig) &&
         GstTranscoderProcess::isAvailable()) {
         std::string relayError;
         if (!tvs::protocols::prepareFifoRelay(effectiveConfig, relayError)) {
-            state->statusMessage = "transcoded UDP relay setup failed: " + relayError;
+            state->statusMessage = "transcoded local CBR setup failed: " + relayError;
             if (error) *error = relayError;
+            return false;
+        }
+
+        // Receiver/distribution is a separate pipeline from the local CBR
+        // conditioner. Keeping udpsrc and StableUdpOutput in one pipeline (v94)
+        // coupled preroll/clocks and could corrupt A/V.
+        GstElement* distributionPipeline = createTranscodedDistributionPipeline(state.get(), relayError);
+        if (!distributionPipeline) {
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            state->statusMessage = "transcoded protocol distribution failed: " + relayError;
+            if (error) *error = relayError.empty() ? "failed to create protocol distribution" : relayError;
+            return false;
+        }
+        state->pipeline = distributionPipeline;
+        state->bus = gst_element_get_bus(distributionPipeline);
+        if (gst_element_set_state(distributionPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(distributionPipeline);
+            state->pipeline = nullptr;
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            state->statusMessage = "transcoded protocol distribution playback failed";
+            if (error) *error = "failed to start protocol distribution from local CBR";
             return false;
         }
 
@@ -1663,6 +1583,13 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         const StreamConfig relayConfig = transcodeRelayOutputConfig(effectiveConfig);
         std::string gstError;
         if (!gstTranscoder->start(relayConfig, gstError)) {
+            gst_element_set_state(distributionPipeline, GST_STATE_NULL);
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(distributionPipeline);
+            state->pipeline = nullptr;
             tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "gstreamer transcoder relay failed: " + gstError;
             if (error) *error = gstError.empty() ? "GStreamer transcoder relay failed to start" : gstError;
@@ -1670,48 +1597,60 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         }
         state->gstTranscoder = std::move(gstTranscoder);
 
-        GstElement* relayPipeline = createTranscodedStableTsRelayPipeline(state.get(), relayError);
-        if (!relayPipeline) {
+        GstElement* localCbrPipeline = createTranscodedLocalCbrPipeline(state.get(), relayError);
+        if (!localCbrPipeline) {
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
+            gst_element_set_state(distributionPipeline, GST_STATE_NULL);
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(distributionPipeline);
+            state->pipeline = nullptr;
             tvs::protocols::removeFifoRelay(effectiveConfig);
-            state->statusMessage = "transcoded UDP output failed: " + relayError;
-            if (error) *error = relayError.empty() ? "failed to create transcoded UDP output" : relayError;
+            state->statusMessage = "transcoded local CBR conditioner failed: " + relayError;
+            if (error) *error = relayError.empty() ? "failed to create local CBR conditioner" : relayError;
+            return false;
+        }
+        state->localCbrPipeline = localCbrPipeline;
+        state->localCbrBus = gst_element_get_bus(localCbrPipeline);
+        if (gst_element_set_state(localCbrPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            if (state->localCbrBus) {
+                gst_object_unref(state->localCbrBus);
+                state->localCbrBus = nullptr;
+            }
+            gst_object_unref(localCbrPipeline);
+            state->localCbrPipeline = nullptr;
+            state->gstTranscoder->stop();
+            state->gstTranscoder.reset();
+            gst_element_set_state(distributionPipeline, GST_STATE_NULL);
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(distributionPipeline);
+            state->pipeline = nullptr;
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            state->statusMessage = "transcoded local CBR playback failed";
+            if (error) *error = "failed to start local StableUdpOutput conditioner";
             return false;
         }
 
-        state->pipeline = relayPipeline;
-        state->bus = gst_element_get_bus(relayPipeline);
         state->running = true;
         state->active = true;
-        state->statusMessage = "starting transcoded UDP";
-        state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
+        state->statusMessage = "transcoded CBR relay";
+        state->outputBitrate = tvs::protocols::muxBitrate(effectiveConfig);
         state->inputBitrate = transcodeInputBitrateForStats(effectiveConfig);
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
         state->lastBitrateSample = state->lastInputActivity;
         attachBitrateProbes(state.get());
 
-        const GstStateChangeReturn stateChange = gst_element_set_state(relayPipeline, GST_STATE_PLAYING);
-        if (stateChange == GST_STATE_CHANGE_FAILURE) {
-            state->running = false;
-            state->active = false;
-            if (state->bus) {
-                gst_object_unref(state->bus);
-                state->bus = nullptr;
-            }
-            gst_object_unref(relayPipeline);
-            state->pipeline = nullptr;
-            state->gstTranscoder->stop();
-            state->gstTranscoder.reset();
-            tvs::protocols::removeFifoRelay(effectiveConfig);
-            state->statusMessage = "transcoded stable TS relay playback failed";
-            if (error) *error = "failed to start post-transcode shared StableUdpOutput pipeline";
-            return false;
-        }
-
         std::cerr << "Pipeline for stream '" << streamConfig.name
-                  << "': external-transcoder -> fifo -> shared-stable-ts"
+                  << "': external-transcoder -> fifo -> LOCAL-UDP-CBR -> protocol-outputs"
+                  << " local=udp://127.0.0.1:" << transcodeRelayPort(effectiveConfig)
+                  << " cbr=" << tvs::protocols::muxBitrate(effectiveConfig)
                   << " transcode=" << streamConfig.transcodeResolution
                   << "@" << streamConfig.transcodeVideoBitrate
                   << " outputs=" << buildPipelineDescription(streamConfig) << std::endl;
@@ -1730,8 +1669,11 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             if (state) {
                 state->running = false;
                 if (state->pipeline) gst_element_set_state(state->pipeline, GST_STATE_NULL);
+                if (state->localCbrPipeline) gst_element_set_state(state->localCbrPipeline, GST_STATE_NULL);
                 if (state->bus) gst_object_unref(state->bus);
+                if (state->localCbrBus) gst_object_unref(state->localCbrBus);
                 if (state->pipeline) gst_object_unref(state->pipeline);
+                if (state->localCbrPipeline) gst_object_unref(state->localCbrPipeline);
                 if (state->gstTranscoder) state->gstTranscoder->stop();
             }
             tvs::protocols::removeFifoRelay(effectiveConfig);
@@ -1743,7 +1685,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             streamConfig,
             "🟢",
             telegramText(configManager, "Поток запущен", "Stream started"),
-            telegramText(configManager, "Транскодинг -> общий стабильный TS", "Transcode -> shared stable TS") +
+            telegramText(configManager, "Транскодинг -> локальный CBR -> протоколы", "Transcode -> local CBR -> protocols") +
                 "\nURL: " + streamConfig.inputUri);
         return true;
     }
@@ -1950,6 +1892,9 @@ bool StreamManager::stopStream(const std::string& id) {
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
     }
+    if (state.localCbrPipeline) {
+        gst_element_set_state(state.localCbrPipeline, GST_STATE_NULL);
+    }
     if (state.busThread.joinable()) {
         state.busThread.join();
     }
@@ -1961,9 +1906,17 @@ bool StreamManager::stopStream(const std::string& id) {
         gst_object_unref(state.bus);
         state.bus = nullptr;
     }
+    if (state.localCbrBus) {
+        gst_object_unref(state.localCbrBus);
+        state.localCbrBus = nullptr;
+    }
     if (state.pipeline) {
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
+    }
+    if (state.localCbrPipeline) {
+        gst_object_unref(state.localCbrPipeline);
+        state.localCbrPipeline = nullptr;
     }
     state.outputContexts.clear();
     state.sourceContext.reset();
@@ -2008,6 +1961,9 @@ void StreamManager::stopAll() {
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
+        if (state.localCbrPipeline) {
+            gst_element_set_state(state.localCbrPipeline, GST_STATE_NULL);
+        }
         if (state.busThread.joinable()) {
             state.busThread.join();
         }
@@ -2018,8 +1974,16 @@ void StreamManager::stopAll() {
         if (state.bus) {
             gst_object_unref(state.bus);
         }
+        if (state.localCbrBus) {
+            gst_object_unref(state.localCbrBus);
+            state.localCbrBus = nullptr;
+        }
         if (state.pipeline) {
             gst_object_unref(state.pipeline);
+        }
+        if (state.localCbrPipeline) {
+            gst_object_unref(state.localCbrPipeline);
+            state.localCbrPipeline = nullptr;
         }
         state.outputContexts.clear();
         state.sourceContext.reset();
@@ -3195,9 +3159,10 @@ bool StreamManager::buildOutputBranch(
     // can drop the copied audio PID or split audio/video into different programs.
     // Feed the same transcoded TS to every TS-capable protocol and only apply remap
     // to non-transcoded passthrough streams.
-    const bool transcodedInput = state && state->config.transcodeEnabled;
-    const bool stableUdpRemux = usesStableUdpShaper(outputConfig) && !transcodedInput;
-    const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !transcodedInput;
+    const bool finishedTsInput = state &&
+        (state->config.transcodeEnabled || isInternalCbrInput(state->config));
+    const bool stableUdpRemux = usesStableUdpShaper(outputConfig) && !finishedTsInput;
+    const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !finishedTsInput;
     if (needsRemux) {
         if (stableUdpRemux) {
             std::cerr << "Unified UDP: rebuilding passthrough TS as a clean single-program transport"
@@ -3446,6 +3411,35 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         return nullptr;
     }
     if (isUdpOutputType(type)) {
+        if (isInternalCbrInput(cfg)) {
+            // Already shaped by the private local StableUdpOutput. Forward the
+            // exact TS unchanged; a second shaper would rewrite PCR/timing.
+            if (!hasElementFactory("udpsink")) {
+                std::cerr << missingElementStatus("udpsink") << std::endl;
+                return nullptr;
+            }
+            GstElement* sink = gst_element_factory_make("udpsink", sinkName.c_str());
+            if (!sink || !addElementOrFail(pipeline, sink)) {
+                if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+                return nullptr;
+            }
+            const std::string host = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+            g_object_set(sink,
+                "host", host.c_str(),
+                "port", static_cast<gint>(cfg.outputPort),
+                "sync", FALSE,
+                "async", FALSE,
+                "qos", FALSE,
+                "auto-multicast", TRUE,
+                "ttl-mc", 32,
+                "buffer-size", 8 * 1024 * 1024,
+                nullptr);
+            if (!cfg.interfaceAddress.empty() && hasProperty(sink, "bind-address")) {
+                g_object_set(sink, "bind-address", cfg.interfaceAddress.c_str(), nullptr);
+            }
+            return sink;
+        }
+
         // UDP-CBR and UDP-VBR share one stable MPEG-TS reservoir/shaper. CBR
         // uses Target bitrate with NULL padding; VBR follows the measured source
         // rate with the same startup reservoir, packetization and periodic PCR.
@@ -4142,6 +4136,38 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
                         "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
                         "\nURL: " + state->activeInputUri);
+            }
+        }
+
+        if (state->localCbrBus) {
+            GstMessage* cbrMsg = gst_bus_pop_filtered(
+                state->localCbrBus,
+                static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+            if (cbrMsg) {
+                if (GST_MESSAGE_TYPE(cbrMsg) == GST_MESSAGE_ERROR) {
+                    GError* cbrError = nullptr;
+                    gchar* cbrDebug = nullptr;
+                    gst_message_parse_error(cbrMsg, &cbrError, &cbrDebug);
+                    const std::string message = cbrError ? cbrError->message : "local CBR conditioner error";
+                    if (cbrError) g_error_free(cbrError);
+                    g_free(cbrDebug);
+                    state->statusMessage = "error: local CBR conditioner: " + message;
+                    state->active = false;
+                    gst_message_unref(cbrMsg);
+                    notifyStreamState(
+                        state->config,
+                        "🔴",
+                        telegramText(configManager, "Ошибка локального CBR", "Local CBR error"),
+                        telegramText(configManager, "Причина", "Reason") + ": " + message);
+                    return;
+                }
+                if (GST_MESSAGE_TYPE(cbrMsg) == GST_MESSAGE_EOS) {
+                    state->statusMessage = "ended: local CBR conditioner";
+                    state->active = false;
+                    gst_message_unref(cbrMsg);
+                    return;
+                }
+                gst_message_unref(cbrMsg);
             }
         }
 

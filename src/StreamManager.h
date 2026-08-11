@@ -57,6 +57,10 @@ struct StreamState {
     std::string activeInputUri;
     GstElement* pipeline = nullptr;
     GstBus* bus = nullptr;
+    // Transcoded streams use a second, independent pipeline for
+    // FIFO -> StableUdpOutput -> private localhost UDP-CBR.
+    GstElement* localCbrPipeline = nullptr;
+    GstBus* localCbrBus = nullptr;
     std::thread busThread;
     StreamConfig config;
     // Runtime PAT result used only when input_service_id=0 (Auto).
@@ -136,7 +140,8 @@ private:
     static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     void monitorExternalSrtBus(const std::string& id, size_t outputIndex);
-    GstElement* createTranscodedStableTsRelayPipeline(StreamState* state, std::string& error);
+    GstElement* createTranscodedLocalCbrPipeline(StreamState* state, std::string& error);
+    GstElement* createTranscodedDistributionPipeline(StreamState* state, std::string& error);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);
