@@ -57,10 +57,6 @@ struct StreamState {
     std::string activeInputUri;
     GstElement* pipeline = nullptr;
     GstBus* bus = nullptr;
-    // For transcoded streams the stable local UDP-CBR conditioner is a second,
-    // independent pipeline. pipeline/bus remain the final protocol distributor.
-    GstElement* localCbrPipeline = nullptr;
-    GstBus* localCbrBus = nullptr;
     std::thread busThread;
     StreamConfig config;
     // Runtime PAT result used only when input_service_id=0 (Auto).
@@ -140,10 +136,7 @@ private:
     static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     void monitorExternalSrtBus(const std::string& id, size_t outputIndex);
-    GstElement* createTranscodedLocalCbrPipeline(StreamState* state, std::string& error);
-    GstElement* createTranscodedDistributionPipeline(StreamState* state, std::string& error);
-    bool buildConditionedOutputBranches(StreamState* state, GstElement* pipeline, GstElement* sourceTail);
-    bool buildConditionedOutputBranch(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
+    GstElement* createTranscodedUdpRelayPipeline(StreamState* state, std::string& error);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);
