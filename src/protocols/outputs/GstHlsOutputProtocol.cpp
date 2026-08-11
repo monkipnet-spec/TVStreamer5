@@ -74,7 +74,7 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     // every newly generated segment.
     appendHlsMux(args, cfg, spec);
     appendTsSmoother(args, "transcode_hls_ts_smoother", 500000);
-    appendCbrPacer(args, cfg, "transcode_hls_cbr_pacer");
+    appendCbrReservoir(args, cfg, "transcode_hls_cbr");
     appendOutputQueueWithTime(args, "transcode_hls_output_queue", 8000000000ULL, false);
 
     // Remove an old playlist and stale .ts files before starting a new HLS

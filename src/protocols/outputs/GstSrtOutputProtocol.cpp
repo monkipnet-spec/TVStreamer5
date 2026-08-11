@@ -7,7 +7,7 @@ namespace tvs::protocols::outputs {
 bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
     appendTsSmoother(args, "transcode_srt_ts_smoother", 500000);
-    appendCbrPacer(args, cfg, "transcode_srt_cbr_pacer");
+    appendCbrReservoir(args, cfg, "transcode_srt_cbr");
     appendOutputQueueWithTime(args, "transcode_srt_output_queue", 5000000000ULL, false);
 
     const std::string mode = srtOutputMode(cfg);
