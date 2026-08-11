@@ -31,7 +31,7 @@ constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
-constexpr guint64 kStableUdpAudioReservoir = 1200 * GST_MSECOND;
+constexpr guint64 kStableUdpAudioReservoir = 1800 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
@@ -3113,7 +3113,7 @@ bool StreamManager::buildRemapPipeline(
                   << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
-                  << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1200 : 0)
+                  << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1800 : 0)
                   << " audio_pacer=" << (udpCbrOutputEnabled(cfg) ? "clocksync" : "off")
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
@@ -3391,7 +3391,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     configureQueue(queue);
 
     if (stableUdpAudioReservoir) {
-        // Compressed AAC is not decoded or modified. We only keep a 1200 ms
+        // Compressed AAC is not decoded or modified. We only keep a 1800 ms
         // reserve and release parsed AAC buffers according to their original
         // timestamps. This prevents the remuxer from seeing long audio bursts
         // while leaving the H.264 branch completely unchanged.
@@ -3484,7 +3484,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << " pid=" << requestedPid
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
                   << (stableUdpAudioReservoir
-                      ? " audio_reservoir_ms=1200 audio_pacer=clocksync(sync-to-first)"
+                      ? " audio_reservoir_ms=1800 audio_pacer=clocksync(sync-to-first)"
                       : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
