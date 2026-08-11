@@ -35,7 +35,6 @@ struct StreamConfig {
     bool autoStart = false;
     bool remapEnabled = false;
     bool cbr = true;
-    bool wisiCompatibility = false;
     uint64_t targetBitrate = 2000000;
     bool transcodeEnabled = false;
     std::string transcodeResolution = "1920x1080";

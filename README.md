@@ -79,8 +79,8 @@ A local backup file is also supported by the normal stream path. The input inter
 The web UI currently exposes:
 
 ```text
-udp-vbr   MPEG-TS over UDP
-udp-cbr   paced/CBR MPEG-TS over UDP
+udp-vbr   reservoir-smoothed MPEG-TS over UDP, bitrate follows the source
+udp-cbr   reservoir-shaped CBR MPEG-TS over UDP at Target bitrate
 rtp       MPEG-TS over RTP/UDP
 srt       MPEG-TS over SRT listener or caller
 http      MPEG-TS over HTTP
@@ -89,6 +89,8 @@ rtsp      RTSP push to an external RTSP server
 rtmp      RTMP push
 youtube   RTMP push to YouTube Live
 ```
+
+UDP VBR and UDP CBR now use one in-process MPEG-TS output engine. Both modes rebuild passthrough input as a clean SPTS, wait for a 5-second startup reservoir with PCR priming, keep a 2.5-second working reservoir, emit 7 MPEG-TS packets per UDP datagram, and generate a periodic 20 ms PCR timeline. UDP CBR pads with PID `0x1FFF` to the configured Target bitrate. UDP VBR follows the measured source rate with a small transport headroom instead of using the Target bitrate as a fixed output rate. There is no separate compatibility switch in the UI.
 
 RTP MPEG-TS output is selectable in the web UI. It uses `rtpmp2tpay` over UDP; with MTU 1400 the payload fits 7 MPEG-TS packets (7 × 188 = 1316 bytes), which is suitable for IPTV headends.
 

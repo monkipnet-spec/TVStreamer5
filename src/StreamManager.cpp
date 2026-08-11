@@ -1,9 +1,7 @@
 #include "StreamManager.h"
 #include "TranscoderModule.h"
-#include "UdpCbrOutput.h"
-#include "WisiCbrOutput.h"
+#include "StableUdpOutput.h"
 #include "UdpInput.h"
-#include "UdpVbrOutput.h"
 #include "protocols/GstProtocolTypes.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
@@ -172,6 +170,10 @@ std::string outputType(const StreamConfig& cfg) {
 
 bool isUdpOutputType(const std::string& type) {
     return type == "udp" || type == "udp-vbr" || type == "udp-cbr";
+}
+
+bool usesStableUdpShaper(const StreamConfig& cfg) {
+    return isUdpOutputType(outputType(cfg));
 }
 
 bool isUdpOutput(const StreamConfig& cfg) {
@@ -904,15 +906,14 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    const bool wisiExternalShaper = cfg.wisiCompatibility &&
-        outputType(cfg) == "udp-cbr" && !cfg.transcodeEnabled;
-    if (cbrMuxEnabled(cfg) && !wisiExternalShaper) {
-        setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
-    } else if (wisiExternalShaper) {
-        // The WISI branch must not let mpegtsmux generate its own CBR padding.
-        // A dedicated TS shaper after the mux inserts PID 0x1FFF packets at the
-        // configured output clock and restamps PCR to the actual CBR output clock.
+    const bool externalUdpShaper = usesStableUdpShaper(cfg);
+    if (externalUdpShaper) {
+        // All UDP MPEG-TS outputs now use the same reservoir/shaper path. Keep
+        // mpegtsmux unpadded so the sender can build either strict CBR or
+        // source-rate-following VBR from one clean SPTS timeline.
         setUInt64PropertyIfPresent(mux, "bitrate", 0);
+    } else if (cbrMuxEnabled(cfg)) {
+        setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
 }
 
@@ -1714,7 +1715,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
          << " input_iface=" << (inputInterface.empty() ? "auto" : inputInterface)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
-         << " wisi=" << (cfg.wisiCompatibility ? "on" : "off")
+         << " udp_shaper=" << (usesStableUdpShaper(cfg) ? "stable" : "n/a")
          << " transcode=" << (cfg.transcodeEnabled ? cfg.transcodeResolution + "@" + std::to_string(cfg.transcodeVideoBitrate) : "off")
          << " outputs=";
     const auto outputs = outputConfigs(cfg);
@@ -2834,12 +2835,12 @@ bool StreamManager::buildOutputBranch(
     // Feed the same transcoded TS to every TS-capable protocol and only apply remap
     // to non-transcoded passthrough streams.
     const bool transcodedInput = state && state->config.transcodeEnabled;
-    const bool wisiCompatibility = outputConfig.wisiCompatibility &&
-        outputType(outputConfig) == "udp-cbr" && !transcodedInput;
-    const bool needsRemux = (outputConfig.remapEnabled || wisiCompatibility) && !transcodedInput;
+    const bool stableUdpRemux = usesStableUdpShaper(outputConfig) && !transcodedInput;
+    const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !transcodedInput;
     if (needsRemux) {
-        if (wisiCompatibility) {
-            std::cerr << "WISI compatibility: rebuilding passthrough TS as a clean single-program CBR transport"
+        if (stableUdpRemux) {
+            std::cerr << "Unified UDP: rebuilding passthrough TS as a clean single-program transport"
+                      << " mode=" << (udpCbrOutputEnabled(outputConfig) ? "CBR" : "VBR")
                       << " input_service_id=" << outputConfig.inputServiceId
                       << " service_id=" << outputConfig.serviceId
                       << " video_pid=" << outputConfig.videoPid
@@ -2933,22 +2934,18 @@ bool StreamManager::buildRemapPipeline(
     configureCbrPacer(pacer, cfg);
     configureTsMux(mux, cfg);
 
-    if (cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" && !cfg.transcodeEnabled) {
-        // WISI mode is intentionally isolated from the normal UDP-CBR path.
-        // mpegtsmux now produces only the real remuxed SPTS (bitrate=0). The
-        // dedicated WISI shaper downstream adds null packets at Target bitrate,
-        // schedules the remuxed TS from GstBuffer PTS/DTS (not PCR packet density)
-        // and restamps PCR to the actual output clock. Elementary PTS/DTS remain
-        // unchanged; no identity/datarate stage is used.
-        if (cfg.targetBitrate == 0) {
-            std::cerr << "WISI compatibility requires Target bitrate greater than zero" << std::endl;
+    if (usesStableUdpShaper(cfg)) {
+        if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
+            std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
             return false;
         }
         const uint32_t inputServiceId = cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId;
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
-        std::cerr << "WISI compatibility mux: bitrate=0 external_shaper=" << cfg.targetBitrate
+        std::cerr << "Unified UDP mux: bitrate=0 mode="
+                  << (udpCbrOutputEnabled(cfg) ? "CBR" : "VBR")
+                  << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " alignment=" << kTsPacketsPerUdpBuffer
@@ -2971,15 +2968,14 @@ bool StreamManager::buildRemapPipeline(
     context->sink = sink;
     context->config = cfg;
 
-    const bool wisiRemap = cfg.wisiCompatibility && outputType(cfg) == "udp-cbr" &&
-                           !cfg.transcodeEnabled && cfg.remapEnabled;
-    if (wisiRemap) {
+    const bool stableUdpRemap = usesStableUdpShaper(cfg) && cfg.remapEnabled;
+    if (stableUdpRemap) {
         // Configure the complete output program map before any elementary data is
         // linked into mpegtsmux. This avoids live prog-map replacement and makes
-        // WISI remapping deterministic: input SID only selects tsdemux, while
+        // UDP remapping deterministic: input SID only selects tsdemux, while
         // serviceId is the new output program number.
         if (cfg.serviceId == 0 || cfg.videoPid == 0 || cfg.audioPid == 0) {
-            std::cerr << "WISI remap requires non-zero output SID, V-PID and A-PID" << std::endl;
+            std::cerr << "UDP remap requires non-zero output SID, V-PID and A-PID" << std::endl;
             return false;
         }
 
@@ -2990,7 +2986,7 @@ bool StreamManager::buildRemapPipeline(
         if (!videoPad || !audioPad) {
             if (videoPad) gst_object_unref(videoPad);
             if (audioPad) gst_object_unref(audioPad);
-            std::cerr << "WISI remap failed to reserve output PID pads: video="
+            std::cerr << "UDP remap failed to reserve output PID pads: video="
                       << cfg.videoPid << " audio=" << cfg.audioPid << std::endl;
             return false;
         }
@@ -3008,7 +3004,7 @@ bool StreamManager::buildRemapPipeline(
         context->programMapApplied = true;
         context->videoPadName = videoPadName;
         context->audioPadName = audioPadName;
-        std::cerr << "WISI remap program map: input_sid="
+        std::cerr << "UDP remap program map: input_sid="
                   << (cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId)
                   << " output_sid=" << cfg.serviceId
                   << " video=" << videoPadName
@@ -3089,23 +3085,11 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         return nullptr;
     }
     if (isUdpOutputType(type)) {
-        if (type == "udp-cbr" && cfg.wisiCompatibility && !cfg.transcodeEnabled) {
-            // Dedicated WISI shaper. Normal UDP-CBR remains on UdpCbrOutput.
-            // The shaper adds PID 0x1FFF packets, schedules payload from source
-            // PCR, restamps PCR to the actual output clock, and uses absolute
-            // CLOCK_MONOTONIC sleeps. There is no double-pacing or busy-wait.
-            std::string error;
-            GstElement* sink = WisiCbrOutput::createSink(pipeline, cfg, sinkName, error);
-            if (!sink) {
-                std::cerr << error << std::endl;
-            }
-            return sink;
-        }
-
+        // UDP-CBR and UDP-VBR share one stable MPEG-TS reservoir/shaper. CBR
+        // uses Target bitrate with NULL padding; VBR follows the measured source
+        // rate with the same startup reservoir, packetization and periodic PCR.
         std::string error;
-        GstElement* sink = udpCbrOutputEnabled(cfg)
-            ? UdpCbrOutput::createSink(pipeline, cfg, sinkName, error)
-            : UdpVbrOutput::createSink(pipeline, cfg, sinkName, error);
+        GstElement* sink = StableUdpOutput::createSink(pipeline, cfg, sinkName, error);
         if (!sink) {
             std::cerr << error << std::endl;
         }
@@ -3255,11 +3239,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* muxSourceElement = capsfilter ? capsfilter : parser;
     GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
     GstPad* muxSinkPad = nullptr;
-    const bool wisiPreMapped = !ctx->flvMux && ctx->config.wisiCompatibility &&
-                               outputType(ctx->config) == "udp-cbr" &&
-                               !ctx->config.transcodeEnabled && ctx->config.remapEnabled &&
-                               ctx->programMapApplied;
-    if (wisiPreMapped) {
+    const bool stableUdpPreMapped = !ctx->flvMux && usesStableUdpShaper(ctx->config) &&
+                                    ctx->config.remapEnabled && ctx->programMapApplied;
+    if (stableUdpPreMapped) {
         GstPad* reservedPad = isVideo ? ctx->preallocatedVideoMuxPad : ctx->preallocatedAudioMuxPad;
         if (reservedPad) {
             muxSinkPad = GST_PAD(gst_object_ref(reservedPad));
@@ -3280,7 +3262,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         std::cerr << "remap linked " << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid
-                  << (wisiPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
+                  << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {

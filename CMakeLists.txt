@@ -33,11 +33,7 @@ add_executable(TVStreamer
     src/ConfigManager.cpp
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
-    src/UdpTsOutput.cpp
-    src/UdpVbrOutput.cpp
-    src/UdpCbrOutput.cpp
-    src/WisiCbrOutput.cpp
-    src/UdpOutput.cpp
+    src/StableUdpOutput.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
     src/GstTranscoderProcess.cpp
