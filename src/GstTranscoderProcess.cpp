@@ -207,6 +207,78 @@ bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& e
     return true;
 }
 
+
+uint32_t effectiveInputServiceId(const StreamConfig& cfg) {
+    // StreamManager resolves input_service_id=0 from the PAT before launching
+    // the external transcoder. Never fall back to output service_id here.
+    return cfg.inputServiceId;
+}
+
+bool isSidAwareMpegTsInput(const StreamConfig& cfg) {
+    const uint32_t sid = effectiveInputServiceId(cfg);
+    if (sid == 0 || cfg.testPattern) return false;
+    const std::string uri = toLower(tvs::protocols::inputUriForGstreamer(cfg));
+    // Live IPTV/SRT transport streams are the paths where automatic URI
+    // decoding can silently pick program 1 instead of the configured SID.
+    // Keep non-TS containers/adaptive inputs on uridecodebin.
+    return uri.rfind("srt://", 0) == 0 ||
+           uri.rfind("udp://", 0) == 0;
+}
+
+bool appendTranscoderDecodeInput(
+    std::vector<std::string>& args,
+    const StreamConfig& cfg,
+    std::string& error) {
+    if (!isSidAwareMpegTsInput(cfg)) {
+        tvs::protocols::appendDecodeInput(args, cfg);
+        return true;
+    }
+
+    std::vector<std::string> missing;
+    validateFactories({"urisourcebin", "tsparse", "tsdemux", "decodebin3"}, missing);
+    if (!missing.empty()) {
+        std::ostringstream ss;
+        ss << "missing SID-aware transcoder input elements";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            ss << (i == 0 ? ": " : ", ") << missing[i];
+        }
+        error = ss.str();
+        return false;
+    }
+
+    const uint32_t inputSid = effectiveInputServiceId(cfg);
+    const std::string uri = tvs::protocols::inputUriForGstreamer(cfg);
+
+    // Select the requested MPEG-TS service *before* decodebin.  The old
+    // uridecodebin-only path auto-selected the first/default program, which is
+    // why transcoding worked for SID 1 but produced no usable UDP output when
+    // Input SID was another program.  ':' asks gst-launch to link all compatible
+    // elementary pads from the selected tsdemux program into decodebin3.
+    args.insert(args.end(), {
+        "urisourcebin",
+        "name=input_uri_src",
+        "uri=" + uri,
+        "use-buffering=false",
+        "input_uri_src.", "!",
+        "queue",
+        "name=transcode_sid_input_queue",
+        "max-size-buffers=0",
+        "max-size-bytes=0",
+        "max-size-time=8000000000",
+        "!", "tsparse",
+        "!", "tsdemux",
+        "name=transcode_sid_demux",
+        "program-number=" + std::to_string(inputSid),
+        "latency=700",
+        "transcode_sid_demux.", ":", "decodebin3", "name=dec"
+    });
+
+    std::cerr << "GStreamer transcoder input selector: input_sid=" << inputSid
+              << " method=tsdemux-program-number decode=decodebin3"
+              << " uri=" << uri << std::endl;
+    return true;
+}
+
 void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec) {
     int width = 1920;
     int height = 1080;
@@ -531,7 +603,9 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
     if (baseConfig.testPattern) {
         addTestSources(args, baseConfig, outputSpec, error);
     } else {
-        tvs::protocols::appendDecodeInput(args, baseConfig);
+        if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
+            return {};
+        }
         addVideoBranch(args, baseConfig, outputSpec);
         addAudioBranch(args, baseConfig, outputSpec, error);
     }
@@ -588,6 +662,7 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         std::cerr << "GStreamer transcoder started pid=" << child.pid
                   << " output=" << description
                   << " remap=" << (config.remapEnabled ? "on" : "off")
+                  << " input_sid=" << effectiveInputServiceId(config)
                   << " service=" << config.serviceId
                   << " vpid=" << config.videoPid
                   << " apid=" << config.audioPid;

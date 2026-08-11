@@ -22,6 +22,7 @@ struct RemapContext {
     GstElement* mux = nullptr;
     GstElement* sink = nullptr;
     StreamConfig config;
+    std::vector<uint32_t> detectedInputServiceIds;
     bool videoLinked = false;
     bool audioLinked = false;
     bool flvMux = false;

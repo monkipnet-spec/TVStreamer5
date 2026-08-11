@@ -43,7 +43,7 @@ struct StreamConfig {
     uint64_t transcodeAudioBitrate = 192000;
     uint32_t audioPid = 0;
     uint32_t videoPid = 0;
-    uint32_t inputServiceId = 1;
+    uint32_t inputServiceId = 0;
     uint32_t serviceId = 1;
     std::string serviceName;
     std::string serviceProvider;

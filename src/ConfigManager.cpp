@@ -69,11 +69,11 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.audioPid = root.get("audio_pid", 0).asUInt();
     config.videoPid = root.get("video_pid", 0).asUInt();
     config.serviceId = root.get("service_id", 1).asUInt();
-    // v74 separates the source program selector from the remapped output SID.
-    // Old configurations did not have input_service_id, so preserve their exact
-    // behaviour by using the previous service_id for both sides.
+    // input_service_id=0 means automatic PAT-based service detection.
+    // Existing configurations that predate input_service_id keep their previous
+    // explicit behaviour by inheriting service_id; newly created streams use 0.
     config.inputServiceId = root.isMember("input_service_id")
-        ? root.get("input_service_id", config.serviceId).asUInt()
+        ? root.get("input_service_id", 0).asUInt()
         : config.serviceId;
     config.serviceName = root.get("service_name", "").asString();
     config.serviceProvider = root.get("service_provider", "").asString();

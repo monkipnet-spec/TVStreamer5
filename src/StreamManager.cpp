@@ -1,4 +1,5 @@
 #include "StreamManager.h"
+#include "MpegTsServiceDetector.h"
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
 #include "UdpInput.h"
@@ -1433,26 +1434,47 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     }
 
     auto state = std::make_unique<StreamState>();
-    state->config = streamConfig;
-    state->primaryInputUri = streamConfig.inputUri;
-    state->activeInputUri = streamConfig.testPattern ? kTestPatternUri : streamConfig.inputUri;
-    state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = streamConfig;
 
-    if (streamConfig.transcodeEnabled && allOutputsUseStableUdp(streamConfig) &&
+    StreamConfig effectiveConfig = streamConfig;
+    if (effectiveConfig.inputServiceId == 0 && MpegTsServiceDetector::supports(effectiveConfig)) {
+        const auto detection = MpegTsServiceDetector::detect(effectiveConfig, std::chrono::milliseconds(4000));
+        state->detectedInputServiceIds = detection.serviceIds;
+        if (!detection.serviceIds.empty()) {
+            effectiveConfig.inputServiceId = detection.serviceIds.front();
+            std::cerr << "Input SID auto-detected from PAT: selected="
+                      << effectiveConfig.inputServiceId << " services=";
+            for (size_t i = 0; i < detection.serviceIds.size(); ++i) {
+                if (i) std::cerr << ',';
+                std::cerr << detection.serviceIds[i];
+            }
+            std::cerr << " uri=" << effectiveConfig.inputUri << std::endl;
+        } else {
+            std::cerr << "Input SID auto-detection warning: "
+                      << (detection.error.empty() ? "no PAT service found" : detection.error)
+                      << "; continuing with automatic demux selection" << std::endl;
+        }
+    }
+
+    state->config = effectiveConfig;
+    state->primaryInputUri = effectiveConfig.inputUri;
+    state->activeInputUri = effectiveConfig.testPattern ? kTestPatternUri : effectiveConfig.inputUri;
+    state->sourceContext = std::make_unique<RemapContext>();
+    state->sourceContext->config = effectiveConfig;
+
+    if (effectiveConfig.transcodeEnabled && allOutputsUseStableUdp(effectiveConfig) &&
         GstTranscoderProcess::isAvailable()) {
         std::string relayError;
-        if (!tvs::protocols::prepareFifoRelay(streamConfig, relayError)) {
+        if (!tvs::protocols::prepareFifoRelay(effectiveConfig, relayError)) {
             state->statusMessage = "transcoded UDP relay setup failed: " + relayError;
             if (error) *error = relayError;
             return false;
         }
 
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
-        const StreamConfig relayConfig = transcodeRelayOutputConfig(streamConfig);
+        const StreamConfig relayConfig = transcodeRelayOutputConfig(effectiveConfig);
         std::string gstError;
         if (!gstTranscoder->start(relayConfig, gstError)) {
-            tvs::protocols::removeFifoRelay(streamConfig);
+            tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "gstreamer transcoder relay failed: " + gstError;
             if (error) *error = gstError.empty() ? "GStreamer transcoder relay failed to start" : gstError;
             return false;
@@ -1463,7 +1485,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         if (!relayPipeline) {
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
-            tvs::protocols::removeFifoRelay(streamConfig);
+            tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "transcoded UDP output failed: " + relayError;
             if (error) *error = relayError.empty() ? "failed to create transcoded UDP output" : relayError;
             return false;
@@ -1474,8 +1496,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         state->running = true;
         state->active = true;
         state->statusMessage = "starting transcoded UDP";
-        state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
-        state->inputBitrate = transcodeInputBitrateForStats(streamConfig);
+        state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
+        state->inputBitrate = transcodeInputBitrateForStats(effectiveConfig);
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
         state->lastBitrateSample = state->lastInputActivity;
@@ -1493,7 +1515,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             state->pipeline = nullptr;
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
-            tvs::protocols::removeFifoRelay(streamConfig);
+            tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "transcoded UDP relay playback failed";
             if (error) *error = "failed to start post-transcode StableUdpOutput pipeline";
             return false;
@@ -1523,7 +1545,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 if (state->pipeline) gst_object_unref(state->pipeline);
                 if (state->gstTranscoder) state->gstTranscoder->stop();
             }
-            tvs::protocols::removeFifoRelay(streamConfig);
+            tvs::protocols::removeFifoRelay(effectiveConfig);
             if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
         }
@@ -1537,7 +1559,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         return true;
     }
 
-    if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
+    if (effectiveConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
         std::string srtRelayError;
         if (!startExternalSrtOutputs(state.get(), srtRelayError)) {
             std::cerr << "Transcoded SRT output setup failed for " << streamConfig.id
@@ -1549,7 +1571,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
 
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
-        if (!gstTranscoder->start(streamConfig, gstError)) {
+        if (!gstTranscoder->start(effectiveConfig, gstError)) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
@@ -1568,8 +1590,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         state->running = true;
         state->active = true;
         state->statusMessage = "running via gstreamer";
-        state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
-        state->inputBitrate = transcodeInputBitrateForStats(streamConfig);
+        state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
+        state->inputBitrate = transcodeInputBitrateForStats(effectiveConfig);
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
         state->lastBitrateSample = state->lastInputActivity;
@@ -1617,7 +1639,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
+    state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
@@ -3089,7 +3111,7 @@ bool StreamManager::buildRemapPipeline(
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
             return false;
         }
-        const uint32_t inputServiceId = cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId;
+        const uint32_t inputServiceId = cfg.inputServiceId;
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
@@ -3155,7 +3177,7 @@ bool StreamManager::buildRemapPipeline(
         context->videoPadName = videoPadName;
         context->audioPadName = audioPadName;
         std::cerr << "UDP remap program map: input_sid="
-                  << (cfg.inputServiceId > 0 ? cfg.inputServiceId : cfg.serviceId)
+                  << cfg.inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " video=" << videoPadName
                   << " audio=" << audioPadName << std::endl;
