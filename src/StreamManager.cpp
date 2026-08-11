@@ -3103,15 +3103,15 @@ bool StreamManager::buildRemapPipeline(
         // arrive at mpegtsmux in large bursts while video remains continuous.
         // Keep some jitter tolerance, but cap the demux buffering to 100 ms.
         constexpr gint kStableUdpDemuxLatencyMs = 100;
-        constexpr guint64 kStableUdpMuxLatencyNs = 400 * GST_MSECOND;
+        constexpr guint64 kStableUdpMuxLatencyNs = 100 * GST_MSECOND;
         setIntPropertyIfPresent(demux, "latency", kStableUdpDemuxLatencyMs);
 
         // On GStreamer 1.20.x mpegtsmux is a GstAggregator and its default
         // additional live latency is 0. The output capture shows H.264 payload
-        // continuously available while AAC is delivered in bursts with gaps up
-        // to ~325 ms despite perfectly continuous AAC PTS. Give the mux enough
-        // look-ahead to wait for a temporarily late audio buffer and interleave
-        // it by timestamp instead of emitting a long run of video first.
+        // continuously available while AAC is delivered in bursts. A 400 ms
+        // mux latency reduced the frequency of large AAC gaps but also created
+        // rare ~400 ms waits. Keep only 100 ms of look-ahead: enough to improve
+        // interleave without allowing the mux to hold audio for hundreds of ms.
         setUInt64PropertyIfPresent(mux, "latency", kStableUdpMuxLatencyNs);
 
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
@@ -3128,7 +3128,7 @@ bool StreamManager::buildRemapPipeline(
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
                   << " demux_latency_ms=" << kStableUdpDemuxLatencyMs
-                  << " mux_latency_ms=400"
+                  << " mux_latency_ms=100"
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
