@@ -152,31 +152,6 @@ void addQueue(std::vector<std::string>& args, const std::string& name, uint64_t 
     });
 }
 
-constexpr uint64_t kTranscodedHttpSrtAvReservoirNs = 1500ULL * 1000000ULL;
-constexpr uint64_t kTranscodedHttpSrtAvQueueMaxNs = 6000ULL * 1000000ULL;
-
-bool usesTranscodedHttpSrtAvReservoir(const GstOutputSpec& spec) {
-    return spec.kind == tvs::protocols::OutputKind::Http ||
-           spec.kind == tvs::protocols::OutputKind::Srt;
-}
-
-void addTranscodedAvReservoirPacer(
-    std::vector<std::string>& args,
-    const std::string& name) {
-    // Do not use queue min-threshold-time here. A permanent minimum threshold
-    // can re-buffer again later when the queue level drops. Instead clocksync
-    // delays the original encoded timestamps by 1500 ms. The queue therefore
-    // builds a real A/V reserve at startup and then keeps pacing continuously
-    // without periodic refill pauses.
-    args.insert(args.end(), {
-        "clocksync",
-        "name=" + name,
-        "sync=true",
-        "sync-to-first=false",
-        "ts-offset=" + std::to_string(kTranscodedHttpSrtAvReservoirNs)
-    });
-}
-
 std::string property(const std::string& name, const std::string& value) {
     return name + "=" + value;
 }
@@ -340,15 +315,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
             : "video/x-h264,stream-format=byte-stream,alignment=au",
         "!"
     });
-    const bool avReservoir = usesTranscodedHttpSrtAvReservoir(spec);
-    addQueue(
-        args,
-        "transcode_video_mux_queue",
-        avReservoir ? kTranscodedHttpSrtAvQueueMaxNs : 3000000000ULL);
-    if (avReservoir) {
-        args.insert(args.end(), {"!"});
-        addTranscodedAvReservoirPacer(args, "transcode_video_reservoir_pacer");
-    }
+    addQueue(args, "transcode_video_mux_queue", 3000000000ULL);
     args.insert(args.end(), {"!", spec.videoPad});
 }
 
@@ -422,15 +389,7 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     }
 
     args.insert(args.end(), {"!"});
-    const bool avReservoir = usesTranscodedHttpSrtAvReservoir(spec);
-    addQueue(
-        args,
-        "transcode_audio_mux_queue",
-        avReservoir ? kTranscodedHttpSrtAvQueueMaxNs : 3000000000ULL);
-    if (avReservoir) {
-        args.insert(args.end(), {"!"});
-        addTranscodedAvReservoirPacer(args, "transcode_audio_reservoir_pacer");
-    }
+    addQueue(args, "transcode_audio_mux_queue", 3000000000ULL);
     args.insert(args.end(), {"!", spec.audioPad});
 }
 
@@ -642,13 +601,14 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
         return {};
     }
 
-    if (usesTranscodedHttpSrtAvReservoir(outputSpec)) {
-        std::cerr << "Transcoded HTTP/SRT A/V reservoir: output="
+    if (outputSpec.kind == tvs::protocols::OutputKind::Http ||
+        outputSpec.kind == tvs::protocols::OutputKind::Srt) {
+        std::cerr << "Transcoded HTTP/SRT post-mux A/V reservoir: output="
                   << tvs::protocols::normalizedOutputType(outputConfig)
                   << " reservoir_ms=1500 queue_max_ms=6000"
-                  << " pacer=clocksync-ts-offset"
-                  << " video=enabled audio=enabled"
-                  << " timestamps=preserved"
+                  << " placement=after-mpegtsmux-remap-and-cbr-pacer"
+                  << " remap_preserved="
+                  << (outputConfig.remapEnabled ? "yes" : "not-requested")
                   << std::endl;
     }
 

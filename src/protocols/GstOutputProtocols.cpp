@@ -13,7 +13,7 @@
 namespace tvs::protocols {
 
 std::vector<std::string> requiredOutputElements() {
-    return {"mpegtsmux", "tsparse", "identity", "clocksync", "udpsink", "rtpmp2tpay", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
+    return {"mpegtsmux", "tsparse", "identity", "udpsink", "rtpmp2tpay", "filesink", "srtsink", "tcpserversink", "hlssink", "flvmux", "rtmpsink", "rtspclientsink"};
 }
 
 std::vector<std::string> requiredElementsForOutput(OutputKind kind) {
