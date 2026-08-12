@@ -1,6 +1,6 @@
 # TVStreamer5 — Release 2
 
-TVStreamer5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2.**
+TVStreamer5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2 / v113.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
