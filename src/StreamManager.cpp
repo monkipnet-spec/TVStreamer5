@@ -2525,6 +2525,126 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     return ret != GST_STATE_CHANGE_FAILURE;
 }
 
+
+bool StreamManager::restartTranscodedInput(
+    StreamState* state,
+    const std::string& inputUri,
+    bool useBackup) {
+    if (!state || !state->gstTranscoder || inputUri.empty()) {
+        return false;
+    }
+
+    const bool stableUdpRelay = allOutputsUseStableUdp(state->config);
+    StreamConfig nextConfig = state->config;
+    nextConfig.inputUri = inputUri;
+    nextConfig.testPattern = false;
+
+    std::cerr << "Transcoded input switch: from=" << state->activeInputUri
+              << " to=" << inputUri
+              << " backup=" << (useBackup ? "yes" : "no")
+              << " mode=" << (stableUdpRelay ? "fifo-stable-udp" : "direct-output")
+              << std::endl;
+
+    state->gstTranscoder->stop();
+
+    if (stableUdpRelay) {
+        if (state->pipeline) {
+            gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        }
+        if (state->bus) {
+            gst_object_unref(state->bus);
+            state->bus = nullptr;
+        }
+        if (state->pipeline) {
+            gst_object_unref(state->pipeline);
+            state->pipeline = nullptr;
+        }
+    }
+
+    state->config = nextConfig;
+
+    std::string gstError;
+    const StreamConfig transcoderConfig =
+        stableUdpRelay ? transcodeRelayOutputConfig(nextConfig) : nextConfig;
+
+    if (!state->gstTranscoder->start(transcoderConfig, gstError)) {
+        state->statusMessage = "error: transcoded input restart failed: " + gstError;
+        state->active = false;
+        std::cerr << state->statusMessage << std::endl;
+        return false;
+    }
+
+    if (stableUdpRelay) {
+        std::string relayError;
+        GstElement* relayPipeline = createTranscodedUdpRelayPipeline(state, relayError);
+        if (!relayPipeline) {
+            state->gstTranscoder->stop();
+            state->statusMessage = "error: transcoded UDP relay restart failed: " + relayError;
+            state->active = false;
+            return false;
+        }
+
+        state->pipeline = relayPipeline;
+        state->bus = gst_element_get_bus(relayPipeline);
+        attachBitrateProbes(state);
+
+        if (gst_element_set_state(relayPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            state->gstTranscoder->stop();
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(relayPipeline);
+            state->pipeline = nullptr;
+            state->statusMessage = "error: transcoded UDP relay playback restart failed";
+            state->active = false;
+            return false;
+        }
+    }
+
+    state->usingBackup = useBackup;
+    state->backupAttempted = useBackup;
+    state->primaryRetryPending = !useBackup;
+    state->inputLossNotified = false;
+    state->activeInputUri = inputUri;
+    state->active = true;
+    state->statusMessage = useBackup ? "running on backup" : "running on primary";
+
+    state->inputBytes = 0;
+    state->outputBytes = 0;
+    state->inputCcErrors = 0;
+    state->inputCcErrorsDelta = 0;
+    state->outputCcErrors = 0;
+    state->outputCcErrorsDelta = 0;
+    state->inputBitrate = 0;
+    state->outputBitrate = initialConfiguredOutputBitrate(state->config);
+    state->lastInputBytesSample = 0;
+    state->lastOutputBytesSample = 0;
+    state->lastInputCcErrorsSample = 0;
+    state->lastOutputCcErrorsSample = 0;
+    state->lastInputBytesSeen = 0;
+    state->lastInputActivity = std::chrono::steady_clock::now();
+    state->lastPrimaryRetry = state->lastInputActivity;
+    state->lastBitrateSample = state->lastInputActivity;
+
+    std::cerr << "Transcoded input switch complete: active="
+              << state->activeInputUri
+              << " using_backup=" << (state->usingBackup ? "yes" : "no")
+              << std::endl;
+    return true;
+}
+
+bool StreamManager::restartActiveInput(
+    StreamState* state,
+    const std::string& inputUri,
+    bool useBackup) {
+    if (state && state->gstTranscoder) {
+        return restartTranscodedInput(state, inputUri, useBackup);
+    }
+    return restartPipelineWithInput(state, inputUri, useBackup);
+}
+
+
 GstElement* StreamManager::createPipeline(StreamState* state) {
     if (!state) {
         return nullptr;
@@ -3886,9 +4006,43 @@ void StreamManager::monitorBus(const std::string& id) {
 
     if (state->gstTranscoder && !state->pipeline) {
         auto lastSyntheticSample = std::chrono::steady_clock::now();
+
         while (state->running.load()) {
-            auto now = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+
             if (!state->gstTranscoder->isRunning()) {
+                if (!state->usingBackup && !state->config.backupInputUri.empty()) {
+                    notifyStreamState(
+                        state->config,
+                        "🟡",
+                        telegramText(configManager, "Основной поток пропал", "Primary stream lost"),
+                        telegramText(configManager, "Нет медиаданных 5 секунд", "No media data for 5 seconds") +
+                            "\n" + telegramText(configManager, "Переключаюсь на резерв", "Switching to backup") +
+                            "\nBackup: " + state->config.backupInputUri);
+
+                    if (restartTranscodedInput(state, state->config.backupInputUri, true)) {
+                        notifyStreamState(
+                            state->config,
+                            "🟠",
+                            telegramText(configManager, "Работаю с резервного источника", "Running from backup source"),
+                            telegramText(configManager, "Активный источник: резерв", "Active source: backup") +
+                                "\nURL: " + state->activeInputUri);
+                        lastSyntheticSample = std::chrono::steady_clock::now();
+                        continue;
+                    }
+                }
+
+                if (state->usingBackup &&
+                    state->config.backupFileLoop &&
+                    isBackupFileInput(state->config, state->activeInputUri)) {
+                    const std::string loopFile = state->activeInputUri;
+                    if (restartTranscodedInput(state, loopFile, true)) {
+                        state->statusMessage = "running on backup file loop";
+                        lastSyntheticSample = std::chrono::steady_clock::now();
+                        continue;
+                    }
+                }
+
                 state->statusMessage = "error: gstreamer transcoder exited";
                 state->active = false;
                 notifyStreamState(
@@ -3899,22 +4053,48 @@ void StreamManager::monitorBus(const std::string& id) {
                 return;
             }
 
-            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyntheticSample).count();
+            if (state->usingBackup &&
+                now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+                state->lastPrimaryRetry = now;
+                const std::string primaryUri = state->primaryInputUri;
+                if (!primaryUri.empty() &&
+                    probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
+                    notifyStreamState(
+                        state->config,
+                        "🟢",
+                        telegramText(configManager, "Основной поток снова доступен", "Primary stream is available again"),
+                        telegramText(configManager, "Переключаюсь на основной источник", "Switching to primary source") +
+                            "\nURL: " + primaryUri);
+                    if (restartTranscodedInput(state, primaryUri, false)) {
+                        lastSyntheticSample = std::chrono::steady_clock::now();
+                        continue;
+                    }
+                }
+            }
+
+            const auto elapsedMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastSyntheticSample).count();
             if (elapsedMs >= 1000) {
                 const double seconds = static_cast<double>(elapsedMs) / 1000.0;
                 const uint64_t inputEstimate = transcodeInputBitrateForStats(state->config);
                 const uint64_t outputEstimate = transcodeMuxBitrateForStats(state->config);
                 state->inputBitrate = inputEstimate;
                 state->outputBitrate = outputEstimate;
-                state->inputBytes.fetch_add(static_cast<uint64_t>((inputEstimate * seconds) / 8.0), std::memory_order_relaxed);
-                state->outputBytes.fetch_add(static_cast<uint64_t>((outputEstimate * seconds) / 8.0), std::memory_order_relaxed);
-                state->lastInputActivity = now;
+                state->inputBytes.fetch_add(
+                    static_cast<uint64_t>((inputEstimate * seconds) / 8.0),
+                    std::memory_order_relaxed);
+                state->outputBytes.fetch_add(
+                    static_cast<uint64_t>((outputEstimate * seconds) / 8.0),
+                    std::memory_order_relaxed);
                 state->lastBitrateSample = now;
-                state->statusMessage = "running via gstreamer";
+                state->statusMessage = state->usingBackup
+                    ? "running on backup via gstreamer"
+                    : "running via gstreamer";
                 lastSyntheticSample = now;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         return;
     }
@@ -3927,6 +4107,28 @@ void StreamManager::monitorBus(const std::string& id) {
         const auto now = std::chrono::steady_clock::now();
         if (state->gstTranscoder) {
             if (!state->gstTranscoder->isRunning()) {
+                if (!state->usingBackup &&
+                    !state->config.backupInputUri.empty() &&
+                    restartTranscodedInput(state, state->config.backupInputUri, true)) {
+                    bus = state->bus;
+                    notifyStreamState(
+                        state->config,
+                        "🟠",
+                        telegramText(configManager, "Работаю с резервного источника", "Running from backup source"),
+                        telegramText(configManager, "Активный источник: резерв", "Active source: backup") +
+                            "\nURL: " + state->activeInputUri);
+                    continue;
+                }
+
+                if (state->usingBackup &&
+                    state->config.backupFileLoop &&
+                    isBackupFileInput(state->config, state->activeInputUri) &&
+                    restartTranscodedInput(state, state->activeInputUri, true)) {
+                    bus = state->bus;
+                    state->statusMessage = "running on backup file loop";
+                    continue;
+                }
+
                 state->statusMessage = "error: gstreamer transcoder exited";
                 state->active = false;
                 notifyStreamState(
@@ -3936,9 +4138,9 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
                 return;
             }
-            // The external transcoder owns the original input socket. Treat a live process as
-            // input activity; its dedicated monitor loop updates the synthetic input counters.
-            state->lastInputActivity = now;
+            // A live gst-launch process is not proof of media activity.
+            // SRT/UDP may remain connected with zero media. The external
+            // watchdog is the real 5-second no-buffer detector.
         }
         const uint64_t currentInputBytes = state->inputBytes.load();
         if (currentInputBytes != state->lastInputBytesSeen) {
@@ -3975,7 +4177,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Нет входных данных 5 секунд", "No input data for 5 seconds") +
                         "\n" + telegramText(configManager, "Переключаюсь на резерв", "Switching to backup") +
                         "\nBackup: " + state->config.backupInputUri);
-                if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                if (restartActiveInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                     notifyStreamState(
@@ -4007,7 +4209,7 @@ void StreamManager::monitorBus(const std::string& id) {
                             telegramText(configManager, "Основной поток снова доступен", "Primary stream is available again"),
                             telegramText(configManager, "Переключаюсь с файла подмены на основной источник", "Switching from the replacement file to the primary source") +
                                 "\nURL: " + primaryUri);
-                        if (restartPipelineWithInput(state, primaryUri, false)) {
+                        if (restartActiveInput(state, primaryUri, false)) {
                             bus = state->bus;
                             state->inputLossNotified = false;
                         }
@@ -4020,7 +4222,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Основной пока недоступен", "Primary is still unavailable"),
                     telegramText(configManager, "Возвращаюсь на резервный источник", "Returning to backup source") +
                         "\nBackup: " + state->config.backupInputUri);
-                if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                if (restartActiveInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                 }
@@ -4073,7 +4275,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     // drained, which leaves the output running with a black frame.
                     const std::string loopFile = state->activeInputUri;
                     gst_message_unref(msg);
-                    if (restartPipelineWithInput(state, loopFile, true)) {
+                    if (restartActiveInput(state, loopFile, true)) {
                         bus = state->bus;
                         state->statusMessage = "running on backup file loop";
                         state->active = true;

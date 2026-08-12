@@ -291,6 +291,9 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {"dec.", "!"});
     addQueue(args, "transcode_video_queue", 8000000000ULL);
     args.insert(args.end(), {
+        "!", "watchdog",
+        "name=transcode_input_watchdog",
+        "timeout=5000",
         "!", "video/x-raw",
         "!", "videoconvert",
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
@@ -450,7 +453,7 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
 
     std::vector<std::string> required = tvs::protocols::requiredInputElements();
     const std::vector<std::string> common = {
-        "queue", "videoconvert", "deinterlace", "videoscale", "videorate",
+        "queue", "watchdog", "videoconvert", "deinterlace", "videoscale", "videorate",
         "x264enc", "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
     };
     required.insert(required.end(), common.begin(), common.end());
@@ -615,6 +618,10 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
     if (baseConfig.testPattern) {
         addTestSources(args, baseConfig, outputSpec, error);
     } else {
+        std::cerr << "Transcoder input watchdog: timeout_ms=5000"
+                  << " source=" << tvs::protocols::inputUriForGstreamer(baseConfig)
+                  << " action=exit-for-parent-failover"
+                  << std::endl;
         if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
             return {};
         }
