@@ -27,6 +27,9 @@
 
 namespace {
 
+constexpr const char* kProgramRelease = "Release 2";
+constexpr const char* kProgramVersion = "v114";
+
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
     if (queryPos == std::string::npos) {
@@ -744,6 +747,8 @@ std::string HttpServer::currentState() {
     root["language"] = configManager.config.language;
     root["telegram_token"] = configManager.config.telegramToken;
     root["telegram_chat_id"] = configManager.config.telegramChatId;
+    root["program_release"] = kProgramRelease;
+    root["program_version"] = kProgramVersion;
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
@@ -1501,6 +1506,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .about-donate{align-items:start}
 .about-donate-content{display:grid;grid-template-columns:148px minmax(0,1fr);gap:12px;align-items:center}
 .about-qr{width:148px;height:148px;display:block;background:#fff;border-radius:8px;padding:8px;box-sizing:border-box}
+.about-donate-wallet{display:flex;flex-direction:column;gap:6px;min-width:0}
+.about-donate-wallet-label{font-size:.82rem;font-weight:700;color:#9aa3b1}
 .about-donate-address{font-family:monospace;font-size:.82rem;line-height:1.45}
 @media (max-width:560px){.about-donate-content{grid-template-columns:1fr}.about-qr{width:132px;height:132px}}
 .network-table{width:100%;border-collapse:collapse;color:#d7deec;font-size:.85rem}
@@ -1577,7 +1584,7 @@ const translations = {
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     restartProgram:'Restart', restartConfirm:'Restart TVStreamer5 now?', restarting:'Restarting...',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
-    about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
+    about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', donateWallet:'Telegram Wallet', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток',
@@ -1585,7 +1592,7 @@ const translations = {
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreamer5 сейчас?', restarting:'Перезапуск...',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
-    about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
+    about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', donateWallet:'Telegram-кошелёк', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
 };
 function normalizeLanguage(value) {
@@ -2123,7 +2130,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreamer5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>Release 2 / v113</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 2'} / ${state.program_version||'v114'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2132,7 +2139,10 @@ function openAboutModal() {
           <rect width="41" height="41" fill="#fff"></rect>
           <path d="${donateQrPath}" fill="#111"></path>
         </svg>
-        <span class="about-donate-address">${donateAddress}</span>
+        <div class="about-donate-wallet">
+          <span class="about-donate-wallet-label">${t('donateWallet')}</span>
+          <span class="about-donate-address">${donateAddress}</span>
+        </div>
       </div></div>
     </div>
     <div class="modal-actions">
